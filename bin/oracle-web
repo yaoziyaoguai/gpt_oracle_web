@@ -19,16 +19,29 @@ session_dir="${ORACLE_WEB_SESSION_DIR:-$state_root/oracle-web}"
 chrome_user_data_dir="${ORACLE_WEB_CHROME_USER_DATA_DIR:-$HOME/Library/Application Support/Google/Chrome}"
 chrome_profile="${ORACLE_WEB_CHROME_PROFILE:-Default}"
 requested_model="${ORACLE_WEB_REQUEST_MODEL:-gpt-5.6-sol}"
+session_retention_hours="${ORACLE_WEB_SESSION_RETENTION_HOURS:-24}"
 
 thinking_time_configured=false
 attachment_timeout_configured=false
+retention_configured=false
 for argument in "$@"; do
   case "$argument" in
+    --browser-keep-browser|--browser-keep-browser=*|\
+    --browser-tab|--browser-tab=*|\
+    --browser-attach-running|--browser-attach-running=*|\
+    --followup|--followup=*|\
+    --browser-follow-up|--browser-follow-up=*)
+      echo "oracle-web: $argument reuses or preserves browser state; start a fresh consultation instead." >&2
+      exit 64
+      ;;
     --browser-thinking-time|--browser-thinking-time=*)
       thinking_time_configured=true
       ;;
     --browser-attachment-timeout|--browser-attachment-timeout=*)
       attachment_timeout_configured=true
+      ;;
+    --retain-hours|--retain-hours=*)
+      retention_configured=true
       ;;
   esac
 done
@@ -46,6 +59,10 @@ fi
 
 if [[ "$attachment_timeout_configured" == false ]]; then
   oracle_args+=(--browser-attachment-timeout 300s)
+fi
+
+if [[ "$retention_configured" == false ]]; then
+  oracle_args+=(--retain-hours "$session_retention_hours")
 fi
 
 oracle_args+=(

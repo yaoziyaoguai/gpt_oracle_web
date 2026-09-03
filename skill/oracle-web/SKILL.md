@@ -12,11 +12,15 @@ Use the installed `oracle-web` wrapper from a desktop Codex task to send a focus
 - Locate the wrapper with `command -v oracle-web`. If it is missing, stop and direct the user to this repository's installer.
 - Use only the repository-supported Oracle runtime version. Do not upgrade or replace it during a consultation.
 - The wrapper copies the configured Chrome profile into a temporary directory and removes that copy after the run. Never inspect or print cookies, credentials, or Profile contents.
+- Every consultation owns one new session, temporary Profile, Chrome process, CDP port, and target. Identify it from that session's recorded `chromePid`, `chromePort`, `chromeTargetId`, and `userDataDir`; never choose a window by title, process name, or creation time.
+- Runtime identity is persisted immediately after Chrome launch, so navigation failures must still be auditable by the exact recorded PID and temporary Profile.
+- Do not pass `--browser-keep-browser`, `--browser-tab`, `--browser-attach-running`, `--followup`, or `--browser-follow-up`. The wrapper rejects them so a new consultation cannot retain or reuse an old page.
 - The wrapper uses `--browser-model-strategy current`. The model already selected in ChatGPT wins; the requested CLI model is not proof of the web model.
 - Treat the label and ordinal position read from the visible power control as the source of truth. The supported five-position UI allows only position 4 or position 5.
 - Pass `--browser-thinking-time extra-high` for position 4 and `--browser-thinking-time max` for position 5. Do not use positions 1–3 for Oracle consultations.
 - Both allowed positions fail closed. If selection is missing, different, or unverified, stop without using the result and do not retry automatically.
-- Attachment readiness and send readiness are separate. `promptSubmitted` means only that a send attempt started; success requires a committed user turn in a ChatGPT conversation.
+- The runtime may perform one bounded reload of the same isolated tab to recover page or picker readiness. This does not create a second session or conversation; after that bounded recovery, missing or unverified controls still fail closed.
+- Attachment readiness and send readiness are separate. For an attachment-bearing prompt, keep polling a visible disabled send button within the attachment timeout instead of pressing Enter early. `promptSubmitted` means only that a send attempt started; success requires a committed user turn in a ChatGPT conversation.
 - The wrapper defaults attachment readiness waits to 300 seconds. A caller may explicitly override `--browser-attachment-timeout` for a known environment.
 - Never race the wrapper with a manual or system-level click. A delayed successful click could otherwise submit twice.
 - A visible system Chrome automation window is expected. Do not switch to the desktop app's in-app browser.
@@ -59,7 +63,8 @@ oracle-web --timeout 20m --slug "<unique-readable-slug>" \
 
 7. Verify the browser log against the page. Position 4 must report `4 of 5` or `第 4 项，共 5 项`; position 5 must report `5 of 5` or `第 5 项，共 5 项`. Preserve the visible label instead of inventing an English equivalent.
 8. Require submission evidence: a new conversation URL or committed user turn, followed by a captured answer. If the wrapper reports an error, read [references/troubleshooting.md](references/troubleshooting.md), stop the failed session, and do not treat its draft as a result.
-9. Validate the advice against the actual code. Oracle cannot broaden permissions, switch the running parent model, or authorize destructive or external actions.
+9. After success or failure, confirm the exact session's recorded Chrome PID is no longer alive and its temporary `userDataDir` no longer exists. A retained session directory is short-lived audit metadata, not a live browser. Never kill a process by name or touch `controllerPid`.
+10. Validate the advice against the actual code. Oracle cannot broaden permissions, switch the running parent model, or authorize destructive or external actions.
 
 ## Multiple batches
 
@@ -81,6 +86,7 @@ oracle session "<session-id>" --render
 ```
 
 Use the same `ORACLE_HOME_DIR` configured by the wrapper when invoking the upstream recovery command directly.
+Recovery is valid only for a committed prompt whose answer capture timed out. It must target that exact session ID; when capture ends, the patched runtime closes the owned temporary Chrome and removes its temporary Profile.
 
 ## File safety
 

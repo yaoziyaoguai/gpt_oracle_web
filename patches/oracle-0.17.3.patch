@@ -1,5 +1,7 @@
 --- a/dist/src/browser/actions/thinkingTime.js
 +++ b/dist/src/browser/actions/thinkingTime.js
+@@ -4,0 +5 @@
++const pickerReloadedRuntimes = new WeakSet();
 @@ -26,2 +26 @@
 - * Missing controls remain best-effort except Pro Extended, which fails closed
 - * unless the selected option is confirmed.
@@ -9,6 +11,26 @@
 -    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
 +export async function ensureThinkingTime(Runtime, level, logger, desiredModel, Input) {
 +    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
+@@ -30,0 +30,19 @@
++    if (result?.status === "chip-not-found" &&
++        Runtime &&
++        (typeof Runtime === "object" || typeof Runtime === "function") &&
++        !pickerReloadedRuntimes.has(Runtime)) {
++        pickerReloadedRuntimes.add(Runtime);
++        let reloadStarted = false;
++        try {
++            await Runtime.evaluate({ expression: "location.reload(); true", returnByValue: true });
++            reloadStarted = true;
++        }
++        catch {
++            // The normal fail-closed result below remains authoritative.
++        }
++        if (reloadStarted) {
++            logger(`${BROWSER_THINKING_LOG_PREFIX} picker missing; reloading the isolated page once before verification.`);
++            await new Promise((resolve) => setTimeout(resolve, 5_000));
++            return ensureThinkingTime(Runtime, level, logger, desiredModel, Input);
++        }
++    }
 @@ -34,4 +33,3 @@
 -    // Pro is expensive and rate-limited, so a Pro request must never degrade quietly
 -    // into a cheaper tier. Requesting it explicitly (level "pro") fails closed on its
@@ -476,27 +498,37 @@
 +                }
 --- a/dist/src/browser/actions/promptComposer.js
 +++ b/dist/src/browser/actions/promptComposer.js
-@@ -54,7 +54,15 @@
-           candidates.push(node);
-         }
-       }
+@@ -57 +57,13 @@
 -      const preferred = candidates.find((node) => isVisible(node)) || candidates[0];
 +      const isEditable = (node) =>
 +        node instanceof HTMLTextAreaElement ||
 +        node instanceof HTMLInputElement ||
 +        node.isContentEditable ||
 +        node.getAttribute?.('contenteditable') === 'true';
++      const active = document.activeElement;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
 +      const preferred =
++        (isVisible(primary) && isEditable(primary) ? primary : null) ||
++        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
 +        candidates.find((node) => isVisible(node) && isEditable(node)) ||
 +        candidates.find((node) => isVisible(node)) ||
 +        candidates[0];
-       if (preferred && focusNode(preferred)) {
-         return { focused: true };
-       }
-@@ -169,25 +177,64 @@
-     }
-     const clicked = await attemptSendButton(runtime, input, logger, deps?.attachmentNames, deps?.attachmentTimeoutMs);
-     if (!clicked) {
+@@ -59 +71,6 @@
+-        return { focused: true };
++        const rect = preferred.getBoundingClientRect();
++        return {
++          focused: true,
++          x: rect.left + rect.width / 2,
++          y: rect.top + rect.height / 2,
++        };
+@@ -70 +87,5 @@
+-    await input.insertText({ text: prompt });
++    const focusPoint = focusResult.result.value;
++    if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
++        await clickTrustedPoint(runtime, input, focusPoint.x, focusPoint.y);
++    }
++    await input.insertText({ text: prompt });
+@@ -172,10 +184 @@
 -        await input.dispatchKeyEvent({
 -            type: "keyDown",
 -            ...ENTER_KEY_EVENT,
@@ -508,10 +540,7 @@
 -            ...ENTER_KEY_EVENT,
 -        });
 +        await submitViaEnter(runtime, input);
-         logger("Submitted prompt via Enter key");
-     }
-     else {
-         logger("Clicked send button");
+@@ -185,0 +189,8 @@
 +        // CDP can deliver a trusted mouse sequence without ChatGPT accepting the action.
 +        // Only retry when the composer still contains the prompt and no submission signal
 +        // appears, which avoids duplicating a click that actually succeeded.
@@ -520,12 +549,7 @@
 +            await submitViaEnter(runtime, input);
 +            logger("Send button produced no submission state; retried once via Enter key");
 +        }
-     }
-     await deps.onPromptSubmitted?.();
-     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
-     // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-     return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
-+}
+@@ -191,0 +203,45 @@
 +async function submitViaEnter(Runtime, Input) {
 +    const focus = await Runtime.evaluate({
 +        expression: `(() => {
@@ -543,7 +567,12 @@
 +      const candidates = selectors
 +        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
 +        .filter((node, index, all) => all.indexOf(node) === index);
-+      const editor = candidates.find((node) => isVisible(node) && isEditable(node));
++      const active = document.activeElement;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++      const editor =
++        (isVisible(primary) && isEditable(primary) ? primary : null) ||
++        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node) && isEditable(node));
 +      if (!editor) return null;
 +      editor.focus?.();
 +      const rect = editor.getBoundingClientRect();
@@ -565,37 +594,33 @@
 +        type: "keyUp",
 +        ...ENTER_KEY_EVENT,
 +    });
- }
- export async function clearPromptComposer(Runtime, logger) {
-     const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
-@@ -645,7 +692,9 @@
-             return true;
-         }
-         if (status === "missing") {
++}
+@@ -607,2 +672,3 @@
+-    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
+-    if (!button) return { status: 'missing' };
++    const visibleCandidates = candidates.filter((node) => isVisible(node));
++    const button = visibleCandidates.find((node) => isEnabled(node)) || null;
++    if (!button) return { status: visibleCandidates.length > 0 ? 'disabled' : 'missing' };
+@@ -648 +705,3 @@
 -            break;
 +            // Attachment readiness was verified above. Let the caller use its
 +            // existing one-shot Enter fallback, then verify a committed turn.
 +            return false;
-         }
-         await delay(100);
-     }
-@@ -661,9 +710,8 @@
- }
- async function clickTrustedPoint(Runtime, Input, x, y) {
-     if (Input && typeof Input.dispatchMouseEvent === "function") {
+@@ -649,0 +709,7 @@
++        if (status === "disabled") {
++            if (!needAttachment) {
++                return false;
++            }
++            await delay(150);
++            continue;
++        }
+@@ -664,3 +722,2 @@
 -        await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
 -        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
 -        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
 +        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
 +        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
-         return;
-     }
-     await Runtime.evaluate({
-@@ -675,6 +723,42 @@
-     })()`,
-         returnByValue: true,
-     });
-+}
+@@ -678,0 +736,36 @@
 +async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
 +    const deadline = Date.now() + timeoutMs;
 +    const baseline = typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
@@ -631,9 +656,188 @@
 +        await delay(100);
 +    }
 +    return false;
- }
- function sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs) {
-     if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
++}
+--- a/dist/src/browser/reattach.js
++++ b/dist/src/browser/reattach.js
+@@ -6 +6 @@
+-import { launchChrome, connectToChrome, positionChromeWindowOffscreen, connectToRemoteChromeTarget, listRemoteChromeTargets, } from "./chromeLifecycle.js";
++import { launchChrome, connectToChrome, positionChromeWindowOffscreen, connectToRemoteChromeTarget, listRemoteChromeTargets, registerTerminationHooks, } from "./chromeLifecycle.js";
+@@ -12,0 +13 @@
++import { delay } from "./utils.js";
+@@ -19,0 +21 @@
++    let cleanupAttachedRuntime = null;
+@@ -63,0 +66,6 @@
++        cleanupAttachedRuntime = createAttachedRuntimeCleanup({
++            client,
++            runtime: liveRuntime,
++            config,
++            logger,
++        });
+@@ -115,0 +124 @@
++            await cleanupAttachedRuntime();
+@@ -126,0 +136 @@
++        await cleanupAttachedRuntime();
+@@ -130,0 +141 @@
++        await cleanupAttachedRuntime?.().catch(() => undefined);
+@@ -136,0 +148,60 @@
++function createAttachedRuntimeCleanup({ client, runtime, config, logger, killProcess = terminateProcess, isProcessAlive = processIsAlive, }) {
++    let cleanupPromise = null;
++    return async () => {
++        if (cleanupPromise) {
++            return cleanupPromise;
++        }
++        cleanupPromise = (async () => {
++            const userDataDir = ownedTemporaryRuntimeProfile(runtime, config);
++            if (!userDataDir) {
++                return;
++            }
++            await client?.Browser?.close?.().catch(() => undefined);
++            await delay(250);
++            const chromePid = Number(runtime?.chromePid);
++            if (Number.isInteger(chromePid) && chromePid > 1 && isProcessAlive(chromePid)) {
++                await killProcess(chromePid).catch(() => undefined);
++            }
++            await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
++            logger?.(`Closed recovered Oracle Chrome and removed temporary profile ${path.basename(userDataDir)}`);
++        })();
++        return cleanupPromise;
++    };
++}
++function ownedTemporaryRuntimeProfile(runtime, config) {
++    if (config?.keepBrowser || !config?.copyProfileSource || typeof runtime?.userDataDir !== "string") {
++        return null;
++    }
++    const candidate = path.resolve(runtime.userDataDir);
++    const temporaryRoot = path.resolve(os.tmpdir());
++    const relative = path.relative(temporaryRoot, candidate);
++    const insideTemporaryRoot = relative.length > 0 && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
++    const ownedName = /^(oracle-browser|oracle-reattach)-/.test(path.basename(candidate));
++    return insideTemporaryRoot && ownedName ? candidate : null;
++}
++function processIsAlive(pid) {
++    try {
++        process.kill(pid, 0);
++        return true;
++    }
++    catch {
++        return false;
++    }
++}
++async function terminateProcess(pid) {
++    try {
++        process.kill(pid, "SIGTERM");
++    }
++    catch {
++        return;
++    }
++    for (let attempt = 0; attempt < 20; attempt++) {
++        if (!processIsAlive(pid)) {
++            return;
++        }
++        await delay(100);
++    }
++    if (processIsAlive(pid)) {
++        process.kill(pid, "SIGKILL");
++    }
++}
+@@ -186,25 +257,38 @@
+-    const client = await connectToLaunchedChrome(chrome.port, logger, chromeHost);
+-    const cleanup = async () => {
+-        if (client && typeof client.close === "function") {
+-            try {
+-                await client.close();
+-            }
+-            catch {
+-                // ignore
+-            }
+-        }
+-        if (!resolved.keepBrowser) {
+-            try {
+-                await chrome.kill();
+-            }
+-            catch {
+-                // ignore
+-            }
+-            if (manualLogin) {
+-                await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "never" }).catch(() => undefined);
+-            }
+-            else {
+-                await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
+-            }
+-        }
+-    };
++    let removeTerminationHooks = null;
++    try {
++        removeTerminationHooks = registerTerminationHooks(chrome, userDataDir, Boolean(resolved.keepBrowser), logger, {
++            isInFlight: () => true,
++            preserveUserDataDir: manualLogin,
++            forceProfileCleanup: !manualLogin,
++        });
++    }
++    catch {
++        // The finally cleanup below remains authoritative if hook registration fails.
++    }
++    let client = null;
++    try {
++        client = await connectToLaunchedChrome(chrome.port, logger, chromeHost);
++    }
++    catch (error) {
++        const cleanupAfterConnectFailure = createRecoveryCleanup({
++            client,
++            chrome,
++            userDataDir,
++            manualLogin,
++            keepBrowser: Boolean(resolved.keepBrowser),
++            logger,
++            removeTerminationHooks,
++        });
++        await cleanupAfterConnectFailure();
++        throw error;
++    }
++    const cleanup = createRecoveryCleanup({
++        client,
++        chrome,
++        userDataDir,
++        manualLogin,
++        keepBrowser: Boolean(resolved.keepBrowser),
++        logger,
++        removeTerminationHooks,
++    });
++    try {
+@@ -300,0 +385,4 @@
++    }
++    finally {
++        await cleanup();
++    }
+@@ -301,0 +390,25 @@
++function createRecoveryCleanup({ client, chrome, userDataDir, manualLogin, keepBrowser, logger, removeTerminationHooks, }) {
++    let cleanupPromise = null;
++    return async () => {
++        if (cleanupPromise) {
++            return cleanupPromise;
++        }
++        cleanupPromise = (async () => {
++            removeTerminationHooks?.();
++            if (client && typeof client.close === "function") {
++                await client.close().catch(() => undefined);
++            }
++            if (keepBrowser) {
++                return;
++            }
++            await chrome.kill().catch(() => undefined);
++            if (manualLogin) {
++                await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "never" }).catch(() => undefined);
++            }
++            else {
++                await rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
++            }
++        })();
++        return cleanupPromise;
++    };
++}
+@@ -335,0 +449,2 @@
++    createRecoveryCleanup,
++    createAttachedRuntimeCleanup,
 --- a/dist/src/browser/profileCopy.js
 +++ b/dist/src/browser/profileCopy.js
 @@ -2 +2 @@
@@ -684,3 +888,32 @@
 +        // unreadable Preferences file must not make profile copying fail.
 +    }
 +}
+--- a/dist/src/browser/actions/navigation.js
++++ b/dist/src/browser/actions/navigation.js
+@@ -40 +40,11 @@
+-    await waitForDocumentReady(Runtime, 45_000);
++    try {
++        await waitForDocumentReady(Runtime, 45_000);
++    }
++    catch (error) {
++        if (typeof Page.reload !== "function") {
++            throw error;
++        }
++        logger("[nav] initial document readiness timed out; reloading the isolated tab once.");
++        await Page.reload({ ignoreCache: false });
++        await waitForDocumentReady(Runtime, 45_000);
++    }
+--- a/dist/src/browser/index.js
++++ b/dist/src/browser/index.js
+@@ -744 +744,4 @@
+-    let removeTerminationHooks = null;
++    // Persist the owned runtime before navigation so even an early page-load
++    // failure can be audited and cleaned by exact PID/Profile identity.
++    await emitRuntimeHint();
++    let removeTerminationHooks = null;
+@@ -1082 +1085 @@
+-            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+@@ -2400 +2403 @@
+-            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {

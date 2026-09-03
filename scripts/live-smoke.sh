@@ -31,14 +31,30 @@ trap 'rm -rf "$test_root"' EXIT
 probe_file="$test_root/oracle-web-live-probe.txt"
 printf '%s\n' 'Harmless oracle-web attachment probe.' > "$probe_file"
 slug="oracle-web-live-$(date +%Y%m%d-%H%M%S)-$$"
+oracle_args=(
+  --force
+  --timeout 5m
+  --slug "$slug"
+  --browser-thinking-time "$level"
+  --browser-attachment-timeout 300s
+  --browser-attachments always
+  -p 'Read the harmless attachment. Reply with exactly ORACLE-WEB-LIVE-OK and nothing else.'
+  --file "$probe_file"
+)
+if [[ "${ORACLE_WEB_LIVE_VERBOSE:-}" == "1" ]]; then
+  oracle_args+=(--verbose)
+fi
 
-output="$($wrapper --force --timeout 5m --slug "$slug" \
-  --browser-thinking-time "$level" \
-  --browser-attachment-timeout 300s \
-  --browser-attachments always \
-  -p 'Read the harmless attachment. Reply with exactly ORACLE-WEB-LIVE-OK and nothing else.' \
-  --file "$probe_file" 2>&1)"
+set +e
+output="$($wrapper "${oracle_args[@]}" 2>&1)"
+oracle_status=$?
+set -e
 printf '%s\n' "$output"
+
+if [[ "$oracle_status" -ne 0 ]]; then
+  echo "Live Oracle invocation failed with exit $oracle_status" >&2
+  exit "$oracle_status"
+fi
 
 grep -Eq "$expected_position" <<< "$output" || {
   echo "Live test did not verify the expected five-position control" >&2

@@ -11,11 +11,13 @@
 - 根据任务复杂度在网页五档强度中的第 4、5 档之间自动选择。
 - 只相信网页实际显示的标签和位置，不把 CLI 请求值冒充为网页模型证据。
 - 强度无法确认时 fail closed，禁止静默降级后继续发送。
+- 页面首次未进入 ready state 时，只在同一个隔离 tab 内做一次有界 reload；仍不可验证就 fail closed。
 - 把网页版限定为 planner/reviewer，把实现、测试和最终判断留给当前 Codex。
 - 隔离多批咨询，避免把第二批材料串进第一批会话。
 - 修复附件已完成却被误判为仍在上传的问题。
 - 修复发送按钮事件未被页面接受、草稿存在却没有真正提交的问题。
 - 用新会话和 committed user turn 验证发送成功，而不是只看 `promptSubmitted`。
+- 为每次咨询绑定独立的 session、Chrome PID、CDP port、target ID 和临时 Profile；Chrome 启动后立即记录 identity，无论成功、失败、超时或恢复结束都只清理这组资源。
 - 把本地修改保存为可校验、可回滚的版本化 patch，避免只存在于 Homebrew Cellar。
 
 ## 它不是什么
@@ -35,15 +37,18 @@ Codex Desktop
   ▼
 oracle-web wrapper
   │ 固定 browser engine / current model strategy
-  │ 复制已登录 Chrome Profile 到临时目录
+  │ 创建唯一 session，复制已登录 Chrome Profile 到临时目录
   ▼
 patched @steipete/oracle 0.17.3
+  │ 启动即记录 Chrome PID / CDP port / target ID / userDataDir
   │ 验证五档强度、附件状态、发送动作和 committed turn
   ▼
 ChatGPT Web ──返回规划/审查/执行建议──▶ 当前 Codex 实现并验证
+  │
+  └── finally：关闭本次 Chrome，删除本次临时 Profile
 ```
 
-临时 Chrome 窗口是正常现象。wrapper 退出后，上游 runtime 会关闭隔离窗口并清理临时 Profile。
+临时 Chrome 窗口是正常现象。wrapper 不靠窗口标题或创建时间猜测归属，而是使用本次 runtime identity 精确关联。退出后 runtime 会关闭隔离窗口并清理临时 Profile；session 元数据只用于短期恢复和排障，不是仍在运行的网页。
 
 ## 仓库结构
 
@@ -161,13 +166,14 @@ export PATH="$HOME/.local/bin:$PATH"
 
 wrapper 不写入个人绝对路径。需要时在启动 Codex 的环境中设置：
 
-wrapper 默认传入 `--browser-attachment-timeout 300s`；调用者显式提供该参数时，以调用者的值为准且不会重复添加。
+wrapper 默认传入 `--browser-attachment-timeout 300s` 和 `--retain-hours 24`；调用者显式提供对应参数时，以调用者的值为准且不会重复添加。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `ORACLE_WEB_CHROME_USER_DATA_DIR` | `$HOME/Library/Application Support/Google/Chrome` | Chrome user-data 根目录 |
 | `ORACLE_WEB_CHROME_PROFILE` | `Default` | 要复制的已登录 Profile 名称 |
 | `ORACLE_WEB_SESSION_DIR` | `${XDG_STATE_HOME:-$HOME/.local/state}/oracle-web` | Oracle session 与 artifacts |
+| `ORACLE_WEB_SESSION_RETENTION_HOURS` | `24` | 每次启动前清理超过该时长的 session 审计记录 |
 | `ORACLE_WEB_REQUEST_MODEL` | `gpt-5.6-sol` | CLI 请求标识；不是网页实际模型证明 |
 | `ORACLE_WEB_ORACLE_BIN` | `command -v oracle` | 上游 CLI 路径 |
 
@@ -218,7 +224,7 @@ oracle-web --timeout 20m \
   --file "src/recovery/**"
 ```
 
-每次独立咨询都应使用新的 slug。不要用 `--followup`、旧 conversation URL 或另一个 batch 的 session 发送新材料。
+每次独立咨询都应使用新的 slug。wrapper 会拒绝 `--browser-keep-browser`、`--browser-tab`、`--browser-attach-running`、`--followup` 和 `--browser-follow-up`，防止保留或复用旧网页。已确认提交后若只差回答捕获，按 Skill 使用上游 `oracle session <session-id>` 恢复同一会话；恢复完成也会清理它拥有的临时 Chrome。
 
 ## 强度、模型与 subagent 的边界
 
@@ -262,8 +268,9 @@ oracle-web --timeout 20m \
 
 - 本项目不会读取或打印 Cookie 内容。
 - 不要把临时目录加入仓库、压缩包或错误报告。
-- wrapper 正常结束或失败时都会要求 runtime 清理临时副本。
-- 如果系统崩溃导致遗留，只能在确认其确实是隔离的 `oracle-browser-*` 目录后处理，不能删除正常 Chrome Profile。
+- wrapper 正常结束、失败、超时或收到终止信号时都会要求 runtime 清理临时副本；恢复路径同样使用 `finally` 收尾。
+- 清理优先调用本次 CDP client 的 `Browser.close()`；必要时只向 session 记录的 `chromePid` 发信号。代码不使用按名称批量杀进程的命令，也不操作 `controllerPid`。
+- 删除目录前必须同时确认 copy-profile 模式、系统临时目录边界以及 `oracle-browser-*` / `oracle-reattach-*` 名称。正常 Chrome Profile 和 Codex 进程不在清理范围内。
 
 ### 公开仓库保证
 
@@ -271,14 +278,17 @@ oracle-web --timeout 20m \
 
 ## Runtime patch 做了什么
 
-`patches/oracle-0.17.3.patch` 只支持上游 `0.17.3`，覆盖四个明确边界：
+`patches/oracle-0.17.3.patch` 只支持上游 `0.17.3`，覆盖七个明确边界：
 
 1. **Thinking time**：识别当前五档 power slider，通过真实 CDP pointer/keyboard 事件选择第 4、5 档，并对未验证选择 fail closed。
-2. **Attachment readiness**：在 prompt 尚未写入时，不再把发送按钮因空编辑器而 disabled 误判为附件上传未完成。
-3. **Prompt submission**：补全 trusted mouse button 状态；只有未出现 submission signal 时才单次 Enter 兜底，并要求 committed turn。
-4. **Copied Profile reliability**：把临时副本标记为正常退出；`rsync exit 23` 只有在已复制 Cookie 数据库时才允许进入后续登录验证，否则仍然 fail closed。
+2. **Page readiness**：首次文档 readiness 超时只 reload 当前隔离 tab 一次；能力控件缺失时也只对当前页做一次 bounded reload，之后仍然 fail closed。
+3. **Early runtime identity**：Chrome 启动后、首次导航前就持久化 PID、port 和 `userDataDir`，使早期失败也能按精确身份审计。
+4. **Attachment readiness**：在 prompt 尚未写入时，不再把发送按钮因空编辑器而 disabled 误判为附件上传未完成；prompt 写入后，带附件的 disabled 发送按钮会在 300 秒窗口内继续轮询。
+5. **Prompt submission**：始终优先真实 `#prompt-textarea`，先用 trusted CDP click 激活编辑器再写入；只有未出现 submission signal 时才单次 Enter 兜底，并要求 committed turn。
+6. **Recovery lifecycle**：新开的 recovery Chrome 在连接失败或后续任意异常时都经幂等 `finally` 清理；附着到已有临时 runtime 后按精确 identity 关闭和删除，不复用或猜测别的窗口。
+7. **Copied Profile reliability**：把临时副本标记为正常退出；`rsync exit 23` 只有在已复制 Cookie 数据库时才允许进入后续登录验证，否则仍然 fail closed。
 
-安装器先检查四个原始文件 SHA-256。只有全部处于已知 pristine 状态时才应用 patch；全部处于已知 patched 状态时幂等退出；mixed 或 unknown 状态一律停止。
+安装器先检查七个原始文件 SHA-256。只有全部处于已知 pristine 状态时才应用 patch；全部处于已知 patched 状态时幂等退出；mixed 或 unknown 状态一律停止。
 
 ## 验证与测试
 
@@ -298,6 +308,8 @@ oracle-web --timeout 20m \
 
 - 下载准确版本 `@steipete/oracle@0.17.3` 到临时目录，或使用 `ORACLE_TEST_PACKAGE_ROOT` 指定的副本。
 - 安装 patch、wrapper 和 Skill。
+- 模拟双编辑器 DOM，确认写入和 Enter 始终落在真实 `#prompt-textarea`。
+- 验证 recovery cleanup 幂等、只使用记录的 Chrome PID、拒绝普通 Profile，并禁止批量进程清理命令。
 - 验证第二次安装幂等。
 - 使用 fake Oracle 检查 wrapper 参数，不接触 ChatGPT。
 - 卸载并验证 runtime 精确恢复 pristine 状态。
@@ -325,9 +337,10 @@ ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ./scripts/live-smoke.sh
 完整决策规则见 [`skill/oracle-web/references/troubleshooting.md`](skill/oracle-web/references/troubleshooting.md)。常见含义：
 
 - `rsync failed copying Chrome profile`：Profile 复制阶段失败，没有证据表明内容已发送。
-- `Page did not reach ready state in time`：输入框未就绪，强度和提交都未验证。
+- `Page did not reach ready state in time`：同一隔离 tab 的一次 reload 后仍未就绪，强度和提交都未验证。
 - `selection unverified`：强度不可信，必须停止且不能使用结果。
 - `Attachments did not finish uploading before timeout`：附件完成状态没有得到证明。
+- `attachment-send-not-ready`：附件卡片存在，但发送按钮在 300 秒窗口内始终没有变为 enabled；没有提交。
 - `prompt-commit-timeout`：尝试过发送，但没有 committed user turn；`promptSubmitted=true` 仍不能算成功。
 
 不要在 wrapper 运行时人工抢点发送按钮。安全恢复只适用于“已确认提交、但等待回答超时”的同一个 session。
