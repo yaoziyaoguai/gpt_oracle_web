@@ -1,0 +1,686 @@
+--- a/dist/src/browser/actions/thinkingTime.js
++++ b/dist/src/browser/actions/thinkingTime.js
+@@ -26,2 +26 @@
+- * Missing controls remain best-effort except Pro Extended, which fails closed
+- * unless the selected option is confirmed.
++ * High-effort targets fail closed unless the selected option is confirmed.
+@@ -29,2 +28,2 @@
+-export async function ensureThinkingTime(Runtime, level, logger, desiredModel) {
+-    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
++export async function ensureThinkingTime(Runtime, level, logger, desiredModel, Input) {
++    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
+@@ -34,4 +33,3 @@
+-    // Pro is expensive and rate-limited, so a Pro request must never degrade quietly
+-    // into a cheaper tier. Requesting it explicitly (level "pro") fails closed on its
+-    // own, independently of the legacy Pro-model + "extended" combination.
+-    const strictProEffort = level === "pro" ||
++    // Every effort tier used by the local oracle-web workflow must be verified
++    // before submission; never continue on an unknown fourth or fifth position.
++    const strictTopEffort = level === "extra-high" || level === "max" || level === "pro" || level === "ultra" ||
+@@ -38,0 +37,9 @@
++    const strictTarget = level === "extra-high"
++        ? "position 4"
++        : level === "max"
++            ? "position 5"
++            : level === "pro"
++                ? "Pro"
++                : level === "ultra"
++                    ? "Ultra"
++                    : "Pro Extended";
+@@ -59,3 +66,2 @@
+-            if (strictProEffort) {
+-                const target = level === "pro" ? "Pro" : "Pro Extended";
+-                throw new Error(`${message}; refusing to submit without confirmed ${target}.`);
++            if (strictTopEffort) {
++                throw new Error(`${message}; refusing to submit without confirmed ${strictTarget}.`);
+@@ -75,3 +81,2 @@
+-            if (strictProEffort) {
+-                const target = level === "pro" ? "Pro" : "Pro Extended";
+-                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${target}.`);
++            if (strictTopEffort) {
++                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${strictTarget}.`);
+@@ -87 +92 @@
+- * @param level - The thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'pro', or 'heavy'
++ * @param level - The thinking time intensity, including current max/ultra and legacy pro/heavy labels
+@@ -89 +94 @@
+-export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel) {
++export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel, Input) {
+@@ -91 +96 @@
+-        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
++        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
+@@ -125,7 +130,149 @@
+-async function evaluateThinkingTimeSelection(Runtime, level, desiredModel) {
+-    const outcome = await Runtime.evaluate({
+-        expression: buildThinkingTimeExpression(level, desiredModel),
+-        awaitPromise: true,
+-        returnByValue: true,
+-    });
+-    return outcome.result?.value;
++async function evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input) {
++    let lastResult;
++    for (let attempt = 0; attempt < 16; attempt += 1) {
++        const outcome = await Runtime.evaluate({
++            expression: buildThinkingTimeExpression(level, desiredModel),
++            awaitPromise: true,
++            returnByValue: true,
++        });
++        lastResult = outcome.result?.value;
++        if (lastResult?.status !== "slider-key-required" &&
++            lastResult?.status !== "slider-click-required" &&
++            lastResult?.status !== "slider-drag-required" &&
++            lastResult?.status !== "slider-hover-required") {
++            return lastResult;
++        }
++        if (!Input || typeof Input.dispatchKeyEvent !== "function") {
++            return {
++                ...lastResult,
++                status: "selection-unverified",
++                sliderInputAvailable: false,
++            };
++        }
++        if (lastResult.status === "slider-click-required" ||
++            lastResult.status === "slider-drag-required" ||
++            lastResult.status === "slider-hover-required") {
++            const x = Number(lastResult.x);
++            const y = Number(lastResult.y);
++            if (!Number.isFinite(x) || !Number.isFinite(y)) {
++                return { ...lastResult, status: "selection-unverified" };
++            }
++            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y: y - 20 });
++            await new Promise((resolve) => setTimeout(resolve, 100));
++            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
++            if (lastResult.status === "slider-click-required") {
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x,
++                    y,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x,
++                    y,
++                    button: "left",
++                    clickCount: 1,
++                });
++            }
++            else if (lastResult.status === "slider-drag-required") {
++                const targetX = Number(lastResult.clickX);
++                const targetY = Number(lastResult.clickY);
++                if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
++                    return { ...lastResult, status: "selection-unverified" };
++                }
++                // ChatGPT's slider ignores a drag until its visual thumb has first
++                // received a standalone trusted click. Activate the thumb, then
++                // start a separate drag to the requested stop.
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x,
++                    y,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x,
++                    y,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await new Promise((resolve) => setTimeout(resolve, 150));
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x,
++                    y,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseMoved",
++                    x: (x + targetX) / 2,
++                    y: (y + targetY) / 2,
++                    button: "left",
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseMoved",
++                    x: targetX,
++                    y: targetY,
++                    button: "left",
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x: targetX,
++                    y: targetY,
++                    button: "left",
++                    clickCount: 1,
++                });
++            }
++            else {
++                // The compact power row has zero height until it receives a real
++                // pointer interaction. Click its activation strip first; the next
++                // probe observes the expanded 32px control and can click the thumb
++                // before starting a separate drag.
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x,
++                    y,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x,
++                    y,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await new Promise((resolve) => setTimeout(resolve, 1000));
++            }
++        }
++        else {
++            const requestedKey = lastResult.key;
++            const key = requestedKey === "ArrowLeft" || requestedKey === "ArrowDown"
++                ? requestedKey
++                : "ArrowRight";
++            const virtualKeyCode = key === "ArrowLeft" ? 37 : key === "ArrowDown" ? 40 : 39;
++            await Input.dispatchKeyEvent({
++                type: "keyDown",
++                key,
++                code: key,
++                windowsVirtualKeyCode: virtualKeyCode,
++                nativeVirtualKeyCode: virtualKeyCode,
++            });
++            await Input.dispatchKeyEvent({
++                type: "keyUp",
++                key,
++                code: key,
++                windowsVirtualKeyCode: virtualKeyCode,
++                nativeVirtualKeyCode: virtualKeyCode,
++            });
++        }
++        await new Promise((resolve) => setTimeout(resolve, lastResult.status === "slider-hover-required" ? 500 : 200));
++    }
++    return {
++        ...lastResult,
++        status: "selection-unverified",
++    };
+@@ -139,0 +287 @@
++    const manualUltraPauseMsLiteral = JSON.stringify(Math.max(0, Number.parseInt(process.env.ORACLE_ULTRA_MANUAL_PAUSE_MS ?? "0", 10) || 0));
+@@ -148,0 +297 @@
++    const MANUAL_ULTRA_PAUSE_MS = ${manualUltraPauseMsLiteral};
+@@ -155,0 +305,2 @@
++      max: ['max'],
++      ultra: ['ultra', '超高'],
+@@ -297,0 +449 @@
++      let style = null;
+@@ -301,0 +454,2 @@
++            x: Math.round(r.left),
++            y: Math.round(r.top),
+@@ -306,0 +461,9 @@
++        const computed = window.getComputedStyle?.(el);
++        if (computed) {
++          style = {
++            display: computed.display,
++            visibility: computed.visibility,
++            opacity: computed.opacity,
++            pointerEvents: computed.pointerEvents,
++          };
++        }
+@@ -317,0 +481 @@
++        tabIndex: typeof el.tabIndex === 'number' ? el.tabIndex : null,
+@@ -319,0 +484 @@
++        style,
+@@ -348,0 +514,17 @@
++        let sliderProbe = null;
++        try {
++          const effortMenu = findVisibleEffortMenu(null);
++          const sliderView = findPowerSliderView(effortMenu);
++          const sliderControl = findPowerSliderControl(effortMenu, sliderView);
++          const sliderRect = sliderControl?.getBoundingClientRect?.();
++          if (sliderRect && sliderRect.width > 0) {
++            const probeX = sliderRect.right - Math.min(24, sliderRect.width * 0.1);
++            const probeY = sliderRect.top + (sliderRect.height > 0 ? sliderRect.height / 2 : 16);
++            sliderProbe = {
++              control: describeNode(sliderControl),
++              hitTarget: describeNode(document.elementFromPoint(probeX, probeY)),
++              x: Math.round(probeX),
++              y: Math.round(probeY),
++            };
++          }
++        } catch {}
+@@ -351,0 +534,2 @@
++          sliderProbe,
++          activeElement: describeNode(document.activeElement),
+@@ -687,0 +872 @@
++    const SIMPLE_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-simple-view"]';
+@@ -700 +885 @@
+-      'effort', 'aufwand', '强度', '努力', '推論レベル',
++      'effort', 'power', 'aufwand', '强度', '能力', '努力', '推論レベル',
+@@ -703,0 +889,174 @@
++    const SLIDER_LEVEL_INDEX = {
++      light: 1,
++      standard: 2,
++      extended: 3,
++      'extra-high': 4,
++      max: 5,
++      ultra: 6,
++    };
++    const parseSliderPosition = (value) => {
++      const text = String(value ?? '').replace(/\\s+/g, ' ').trim();
++      const english = text.match(/(?:item\\s*)?(\\d+)\\s+of\\s+(\\d+)/i);
++      if (english) return { index: Number(english[1]), total: Number(english[2]), text };
++      const chinese = text.match(/第\\s*(\\d+)\\s*项\\s*[，,]?\\s*共\\s*(\\d+)\\s*项/);
++      if (chinese) return { index: Number(chinese[1]), total: Number(chinese[2]), text };
++      return null;
++    };
++    const findPowerSliderView = (menu) => {
++      const scoped = menu?.querySelector?.(SIMPLE_VIEW_SELECTOR);
++      if (isVisible(scoped)) return scoped;
++      const global = document.querySelector(SIMPLE_VIEW_SELECTOR);
++      return isVisible(global) ? global : null;
++    };
++    const findPowerSliderControl = (menu, view) => {
++      const direct = view?.querySelector?.('[role="slider"], input[type="range"], [tabindex]');
++      if (isVisible(direct)) return direct;
++      // In the current Intelligence picker the zero-height Power row is a
++      // sibling of the simple view, not its descendant. Search the whole menu
++      // first so the outer CDP loop can activate it before the thumb appears.
++      const scope = menu || view?.parentElement || document;
++      let mountedKeyboardTarget = null;
++      for (const item of scope.querySelectorAll('[role="slider"], input[type="range"], [role="menuitem"]')) {
++        if (!containsAny(nodeLabel(item), EFFORT_WORDS)) continue;
++        if (isVisible(item)) return item;
++        // The current UI mounts a zero-height role=menuitem labelled "Power" as
++        // the slider's keyboard target. It has no visual box by design but owns
++        // the arrow-key handler, so presence is sufficient once the view exists.
++        mountedKeyboardTarget ||= item;
++      }
++      return mountedKeyboardTarget;
++    };
++    const readPowerSliderState = (menu) => {
++      const view = findPowerSliderView(menu);
++      if (!view) return null;
++      const control = findPowerSliderControl(menu, view);
++      if (control) {
++        const now = Number(control.getAttribute?.('aria-valuenow') ?? control.value);
++        const min = Number(control.getAttribute?.('aria-valuemin') ?? control.min);
++        const max = Number(control.getAttribute?.('aria-valuemax') ?? control.max);
++        if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
++          return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
++        }
++      }
++      const parsed = parseSliderPosition(view.textContent ?? view.getAttribute?.('aria-label'));
++      return parsed ? { ...parsed, view, control } : null;
++    };
++    const selectEffortFromPowerSlider = async (menu) => {
++      const targetIndex = SLIDER_LEVEL_INDEX[TARGET_LEVEL];
++      if (!targetIndex || !menu) return null;
++      // The simple slider view and its position text render before the keyboard
++      // target becomes visible. Wait for that target instead of treating the
++      // temporarily zero-height Power menu item as an unsupported layout.
++      if (!findPowerSliderView(menu)) return null;
++      if (
++        TARGET_LEVEL === 'ultra' &&
++        MANUAL_ULTRA_PAUSE_MS > 0 &&
++        !window.__oracleUltraManualPauseCompleted
++      ) {
++        window.__oracleUltraManualPauseCompleted = true;
++        await sleep(MANUAL_ULTRA_PAUSE_MS);
++        if (!isVisible(menu?.querySelector?.(SIMPLE_VIEW_SELECTOR))) {
++          menu = findVisibleEffortMenu(null) || menu;
++        }
++      }
++      let state = null;
++      const readyDeadline = performance.now() + MAX_WAIT_MS;
++      while (performance.now() < readyDeadline) {
++        // Keep the menu that actually owns the slider. A global scan can return
++        // an inner Radix collection root whose aggregate text looks identical
++        // but which does not contain the simple slider view.
++        const currentMenu = isVisible(menu?.querySelector?.(SIMPLE_VIEW_SELECTOR))
++          ? menu
++          : (findVisibleEffortMenu(null) || menu);
++        const candidate = readPowerSliderState(currentMenu);
++        if (candidate && candidate.total >= targetIndex) {
++          const control = candidate.control || findPowerSliderControl(currentMenu, candidate.view);
++          if (candidate.index === targetIndex || control) {
++            state = { ...candidate, control };
++            menu = currentMenu;
++            break;
++          }
++        }
++        await sleep(100);
++      }
++      if (!state) {
++        return failure('selection-unverified', {
++          requestedSliderPosition: String(targetIndex) + '/6',
++          sliderControlReady: false,
++        });
++      }
++      const initialIndex = state.index;
++      if (state.index === targetIndex) {
++        closeOpenMenus();
++        return { status: 'already-selected', label: state.text || TARGET_LEVEL };
++      }
++      let control = state.control || findPowerSliderControl(menu, state.view);
++      if (!control) {
++        return failure('selection-unverified', {
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderControlReady: false,
++        });
++      }
++      // The visual slider expands only under a trusted pointer hover. Runtime
++      // mouse events do not trigger it, so ask the outer CDP loop to move the
++      // real pointer over the compact view first, then click the requested stop.
++      if (isVisible(control)) {
++        const rect = control.getBoundingClientRect();
++        const inset = Math.min(24, rect.width * 0.1);
++        const usableWidth = Math.max(1, rect.width - (2 * inset));
++        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++        const targetRatio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
++        return {
++          status: 'slider-drag-required',
++          x: rect.left + inset + (usableWidth * currentRatio),
++          y: rect.top + (rect.height / 2),
++          clickX: rect.left + inset + (usableWidth * targetRatio),
++          clickY: rect.top + (rect.height / 2),
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++          diagnostic: collectPickerDiagnostic(),
++        };
++      }
++      const activeElement = document.activeElement;
++      const powerHasFocus = activeElement === control;
++      const pointerAttempts = Number(window.__oraclePowerSliderPointerAttempts ?? 0);
++      const controlRect = control.getBoundingClientRect?.();
++      if (controlRect && controlRect.width > 0 && !powerHasFocus && pointerAttempts < 2) {
++        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
++        const inset = Math.min(24, controlRect.width * 0.1);
++        const usableWidth = Math.max(1, controlRect.width - (2 * inset));
++        const ratio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
++        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++        return {
++          status: 'slider-hover-required',
++          x: controlRect.left + (controlRect.width / 2),
++          y: controlRect.top + 1,
++          clickX: controlRect.left + inset + (usableWidth * ratio),
++          clickY: controlRect.top + 16,
++          dragStartX: controlRect.left + inset + (usableWidth * currentRatio),
++          dragStartY: controlRect.top + 16,
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          diagnostic: collectPickerDiagnostic(),
++        };
++      }
++      if (!powerHasFocus && !menu.contains?.(activeElement)) {
++        try { menu.focus?.({ preventScroll: true }); } catch {}
++      }
++      return {
++        status: 'slider-key-required',
++        // Radix keeps focus on the menu root when it opens and redirects direct
++        // script focus calls. Trusted ArrowDown events follow its roving-focus
++        // order to the Power row; only then do horizontal keys adjust the slider.
++        key: powerHasFocus
++          ? (state.index < targetIndex ? 'ArrowRight' : 'ArrowLeft')
++          : 'ArrowDown',
++        sliderPosition: String(state.index) + '/' + String(state.total),
++        requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++        sliderFocused: powerHasFocus,
++        initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++        diagnostic: collectPickerDiagnostic(),
++      };
++    };
+@@ -857,0 +1217,6 @@
++        SLIDER_LEVEL_INDEX[TARGET_LEVEL] &&
++        isVisible(document.querySelector(INTELLIGENCE_MENU_SELECTOR))
++      ) {
++        return true;
++      }
++      if (
+@@ -922,0 +1288,4 @@
++          const powerSliderResult = await selectEffortFromPowerSlider(menu);
++          if (powerSliderResult) {
++            return powerSliderResult;
++          }
+@@ -1037,2 +1406,10 @@
+-      dispatchClickSequence(modelBtn);
+-      await sleep(INITIAL_WAIT_MS);
++      // The slider only mounts its interactive thumb after a trusted click on
++      // the composer pill. Ask the outer CDP loop to perform that click instead
++      // of opening this picker with synthetic DOM events.
++      const rect = modelBtn.getBoundingClientRect();
++      return {
++        status: 'slider-click-required',
++        x: rect.left + (rect.width / 2),
++        y: rect.top + (rect.height / 2),
++        purpose: 'open-effort-picker',
++      };
+@@ -1040,0 +1418,5 @@
++    const powerSliderResult = await selectEffortFromPowerSlider(findVisibleEffortMenu(modelBtn));
++    if (powerSliderResult) {
++      return powerSliderResult;
++    }
++
+--- a/dist/src/browser/actions/attachments.js
++++ b/dist/src/browser/actions/attachments.js
+@@ -1463,2 +1463,6 @@
+-                // Don't treat disabled button as complete - wait for it to become 'ready'.
+-                // The spinner detection is unreliable, so a disabled button likely means upload is in progress.
++                // 附件上传发生在 prompt 写入之前；此时发送按钮会因为编辑器为空而保持 disabled。
++                // 文件名已稳定匹配且页面明确没有上传状态时，附件阶段已经完成，发送按钮应由后续
++                // prompt 提交阶段单独校验。否则会把“空编辑器”误判为“仍在上传”。
++                if (stable && !value.uploading && (value.filesAttached || fileCountSatisfied)) {
++                    return;
++                }
+--- a/dist/src/browser/actions/promptComposer.js
++++ b/dist/src/browser/actions/promptComposer.js
+@@ -54,7 +54,15 @@
+           candidates.push(node);
+         }
+       }
+-      const preferred = candidates.find((node) => isVisible(node)) || candidates[0];
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const preferred =
++        candidates.find((node) => isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node)) ||
++        candidates[0];
+       if (preferred && focusNode(preferred)) {
+         return { focused: true };
+       }
+@@ -169,25 +177,64 @@
+     }
+     const clicked = await attemptSendButton(runtime, input, logger, deps?.attachmentNames, deps?.attachmentTimeoutMs);
+     if (!clicked) {
+-        await input.dispatchKeyEvent({
+-            type: "keyDown",
+-            ...ENTER_KEY_EVENT,
+-            text: ENTER_KEY_TEXT,
+-            unmodifiedText: ENTER_KEY_TEXT,
+-        });
+-        await input.dispatchKeyEvent({
+-            type: "keyUp",
+-            ...ENTER_KEY_EVENT,
+-        });
++        await submitViaEnter(runtime, input);
+         logger("Submitted prompt via Enter key");
+     }
+     else {
+         logger("Clicked send button");
++        // CDP can deliver a trusted mouse sequence without ChatGPT accepting the action.
++        // Only retry when the composer still contains the prompt and no submission signal
++        // appears, which avoids duplicating a click that actually succeeded.
++        const clickStartedSubmission = await waitForSubmissionStart(runtime, deps.baselineTurns ?? undefined, 3_000);
++        if (!clickStartedSubmission) {
++            await submitViaEnter(runtime, input);
++            logger("Send button produced no submission state; retried once via Enter key");
++        }
+     }
+     await deps.onPromptSubmitted?.();
+     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
+     // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
+     return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
++}
++async function submitViaEnter(Runtime, Input) {
++    const focus = await Runtime.evaluate({
++        expression: `(() => {
++      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const isVisible = (node) => {
++        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++        const rect = node.getBoundingClientRect();
++        return rect.width > 0 && rect.height > 0;
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const candidates = selectors
++        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++        .filter((node, index, all) => all.indexOf(node) === index);
++      const editor = candidates.find((node) => isVisible(node) && isEditable(node));
++      if (!editor) return null;
++      editor.focus?.();
++      const rect = editor.getBoundingClientRect();
++      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
++    })()`,
++        returnByValue: true,
++    });
++    const point = focus.result?.value;
++    if (point && typeof point.x === "number" && typeof point.y === "number") {
++        await clickTrustedPoint(Runtime, Input, point.x, point.y);
++    }
++    await Input.dispatchKeyEvent({
++        type: "keyDown",
++        ...ENTER_KEY_EVENT,
++        text: ENTER_KEY_TEXT,
++        unmodifiedText: ENTER_KEY_TEXT,
++    });
++    await Input.dispatchKeyEvent({
++        type: "keyUp",
++        ...ENTER_KEY_EVENT,
++    });
+ }
+ export async function clearPromptComposer(Runtime, logger) {
+     const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
+@@ -645,7 +692,9 @@
+             return true;
+         }
+         if (status === "missing") {
+-            break;
++            // Attachment readiness was verified above. Let the caller use its
++            // existing one-shot Enter fallback, then verify a committed turn.
++            return false;
+         }
+         await delay(100);
+     }
+@@ -661,9 +710,8 @@
+ }
+ async function clickTrustedPoint(Runtime, Input, x, y) {
+     if (Input && typeof Input.dispatchMouseEvent === "function") {
+-        await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+-        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
+-        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
++        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
++        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+         return;
+     }
+     await Runtime.evaluate({
+@@ -675,6 +723,42 @@
+     })()`,
+         returnByValue: true,
+     });
++}
++async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
++    const deadline = Date.now() + timeoutMs;
++    const baseline = typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
++        ? Math.max(0, Math.floor(baselineTurns))
++        : -1;
++    const expression = `(() => {
++    const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++    const isVisible = (node) => {
++      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++      const rect = node.getBoundingClientRect();
++      return rect.width > 0 && rect.height > 0;
++    };
++    const readValue = (node) => {
++      if (!node) return '';
++      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) return node.value ?? '';
++      return node.innerText ?? node.textContent ?? '';
++    };
++    const inputs = selectors
++      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++      .filter((node, index, all) => all.indexOf(node) === index && isVisible(node));
++    const composerEmpty = inputs.length > 0 && inputs.every((node) => !String(readValue(node)).trim());
++    const turnsCount = ${buildConversationTurnCountExpression()};
++    const hasNewTurn = ${JSON.stringify(baseline)} >= 0 && turnsCount > ${JSON.stringify(baseline)};
++    const stopVisible = Boolean(document.querySelector(${JSON.stringify(STOP_BUTTON_SELECTOR)}));
++    const inConversation = /\\/c\\//.test(location.href);
++    return { started: composerEmpty || hasNewTurn || stopVisible || inConversation };
++  })()`;
++    while (Date.now() < deadline) {
++        const { result } = await Runtime.evaluate({ expression, returnByValue: true });
++        if (result?.value?.started) {
++            return true;
++        }
++        await delay(100);
++    }
++    return false;
+ }
+ function sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs) {
+     if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
+--- a/dist/src/browser/profileCopy.js
++++ b/dist/src/browser/profileCopy.js
+@@ -2 +2 @@
+-import { cp, mkdir, readFile, rm } from "node:fs/promises";
++import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+@@ -55 +55 @@
+-        await new Promise((resolve, reject) => {
++        const rsyncExitCode = await new Promise((resolve, reject) => {
+@@ -58,3 +58 @@
+-            child.on("close", (code) => code === 0 || code === 24
+-                ? resolve()
+-                : reject(new Error(`rsync failed copying Chrome profile (exit ${code})`)));
++            child.on("close", (code) => resolve(code));
+@@ -61,0 +60,8 @@
++        const partialCopyHasSessionMaterial = rsyncExitCode === 23 && (await hasCopiedCookieDatabase(destProfile));
++        if (rsyncExitCode !== 0 && rsyncExitCode !== 24 && !partialCopyHasSessionMaterial) {
++            throw new Error(`rsync failed copying Chrome profile (exit ${rsyncExitCode})`);
++        }
++        // A live Chrome profile commonly records exit_type=Crashed while it is
++        // running. The throwaway copy must not inherit that stale session marker,
++        // or every Oracle window opens with a misleading restore-pages bubble.
++        await markCopiedProfileExitedCleanly(destProfile);
+@@ -70,0 +77,27 @@
++async function hasCopiedCookieDatabase(profileDir) {
++    for (const relativePath of [path.join("Network", "Cookies"), "Cookies"]) {
++        try {
++            await access(path.join(profileDir, relativePath));
++            return true;
++        }
++        catch {
++            // Continue checking legacy and current Chrome cookie locations.
++        }
++    }
++    return false;
++}
++async function markCopiedProfileExitedCleanly(profileDir) {
++    const preferencesPath = path.join(profileDir, "Preferences");
++    try {
++        const raw = await readFile(preferencesPath, "utf8");
++        const preferences = JSON.parse(raw);
++        preferences.profile ||= {};
++        preferences.profile.exit_type = "Normal";
++        preferences.profile.exited_cleanly = true;
++        await writeFile(preferencesPath, JSON.stringify(preferences));
++    }
++    catch {
++        // The launch flag also suppresses the bubble; a missing or temporarily
++        // unreadable Preferences file must not make profile copying fail.
++    }
++}

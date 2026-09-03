@@ -1,0 +1,4 @@
+interface:
+  display_name: "Oracle Web"
+  short_description: "通过已登录的外部 Chrome 获取高强度规划与代码审查"
+  default_prompt: "使用 $oracle-web 审查当前复杂任务，并给出可验证、可执行的建议。"

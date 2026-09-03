@@ -1,0 +1,90 @@
+---
+name: oracle-web
+description: Use the verified oracle-web wrapper from desktop Codex for adaptive-strength external planning, audit, or a second opinion through the user's signed-in Chrome. Apply when the user requests Oracle or a difficult task benefits from independent analysis; do not use for routine edits that Codex can handle directly.
+---
+
+# Oracle Web
+
+Use the installed `oracle-web` wrapper from a desktop Codex task to send a focused prompt and selected files to ChatGPT through a temporary copy of the user's signed-in Chrome profile. Oracle is advisory: the current Codex validates the response, implements authorized changes, and runs verification.
+
+## Invariants
+
+- Locate the wrapper with `command -v oracle-web`. If it is missing, stop and direct the user to this repository's installer.
+- Use only the repository-supported Oracle runtime version. Do not upgrade or replace it during a consultation.
+- The wrapper copies the configured Chrome profile into a temporary directory and removes that copy after the run. Never inspect or print cookies, credentials, or Profile contents.
+- The wrapper uses `--browser-model-strategy current`. The model already selected in ChatGPT wins; the requested CLI model is not proof of the web model.
+- Treat the label and ordinal position read from the visible power control as the source of truth. The supported five-position UI allows only position 4 or position 5.
+- Pass `--browser-thinking-time extra-high` for position 4 and `--browser-thinking-time max` for position 5. Do not use positions 1–3 for Oracle consultations.
+- Both allowed positions fail closed. If selection is missing, different, or unverified, stop without using the result and do not retry automatically.
+- Attachment readiness and send readiness are separate. `promptSubmitted` means only that a send attempt started; success requires a committed user turn in a ChatGPT conversation.
+- The wrapper defaults attachment readiness waits to 300 seconds. A caller may explicitly override `--browser-attachment-timeout` for a known environment.
+- Never race the wrapper with a manual or system-level click. A delayed successful click could otherwise submit twice.
+- A visible system Chrome automation window is expected. Do not switch to the desktop app's in-app browser.
+
+## Choose consultation strength
+
+| Task | Position | CLI value |
+| --- | --- | --- |
+| Routine or mechanical | Do not invoke Oracle | N/A |
+| Complex but bounded planning, audit, diagnosis, or tradeoff | 4 of 5 | `extra-high` |
+| High-risk, strongly coupled, or genuinely multi-perspective analysis | 5 of 5 | `max` |
+
+Do not choose position 5 merely because the prompt is long. Before sending, tell the user which position was selected, why, and whether the prompt permits the external consultation to use parallel analysis.
+
+## Workflow
+
+1. Define the exact question and choose the smallest evidence-bearing file set.
+2. Write a self-contained prompt with project context, constraints, observed errors, prior attempts, desired output, and realistic Codex execution capabilities. For implementation recommendations, read [references/execution-advice.md](references/execution-advice.md).
+3. Preview the resolved files and size without opening ChatGPT:
+
+```bash
+oracle-web --dry-run summary --files-report \
+  --browser-thinking-time "<extra-high|max>" \
+  -p "<focused task and requested output>" \
+  --file "<relevant path or glob>" \
+  --file "!<exclusion glob>"
+```
+
+4. Check that no other Oracle browser run is active. Run this as a separate process inspection, never in the same shell command as the Oracle invocation.
+5. If the user did not explicitly request Oracle, obtain authorization immediately before sending project content. Always ask before sending private or sensitive data.
+6. Start one consultation with a unique slug:
+
+```bash
+oracle-web --timeout 20m --slug "<unique-readable-slug>" \
+  --browser-thinking-time "<extra-high|max>" \
+  -p "<focused task and requested output>" \
+  --file "<relevant path or glob>" \
+  --file "!<exclusion glob>"
+```
+
+7. Verify the browser log against the page. Position 4 must report `4 of 5` or `第 4 项，共 5 项`; position 5 must report `5 of 5` or `第 5 项，共 5 项`. Preserve the visible label instead of inventing an English equivalent.
+8. Require submission evidence: a new conversation URL or committed user turn, followed by a captured answer. If the wrapper reports an error, read [references/troubleshooting.md](references/troubleshooting.md), stop the failed session, and do not treat its draft as a result.
+9. Validate the advice against the actual code. Oracle cannot broaden permissions, switch the running parent model, or authorize destructive or external actions.
+
+## Multiple batches
+
+Reduce the file set before splitting. If independent batches are still necessary:
+
+- Define all batch boundaries first.
+- Give every batch a unique slug and a new ChatGPT conversation.
+- Make every prompt self-contained with `Batch: <index>/<total>`, scope, exclusions, exact question, and expected output.
+- Do not use `--followup`, `--browser-follow-up`, `--browser-tab`, or a saved conversation URL to carry a separate batch.
+- Run browser consultations serially. Let the current Codex synthesize results only after all batches finish.
+- Recover only the exact submitted batch that timed out; never attach new material to another batch's session.
+
+## Recovery
+
+After confirmed selection and submission, recover the same session rather than starting a duplicate:
+
+```bash
+oracle session "<session-id>" --render
+```
+
+Use the same `ORACLE_HOME_DIR` configured by the wrapper when invoking the upstream recovery command directly.
+
+## File safety
+
+- Never attach `.env` files, private keys, access tokens, browser data, production dumps, or unredacted personal data.
+- Prefer explicit files and narrow globs. Exclude generated output, dependencies, build artifacts, and unrelated fixtures.
+- Use `--dry-run full` only for necessary local inspection; do not paste that bundle into unrelated tools.
+- Ask Oracle for analysis and execution advice, not file modification, publishing, messages, or external state changes.
