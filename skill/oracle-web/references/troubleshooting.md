@@ -9,6 +9,9 @@ Use the session metadata and concise browser log as evidence. Do not print promp
 - `selection unverified` or a different slider position: fail closed. Stop and do not use any answer.
 - `Attachments did not finish uploading before timeout`: attachment readiness was not proven. A visible draft card alone is not a submitted message.
 - `attachment-send-not-ready`: attachment UI appeared, but the visible send button never became enabled within the configured attachment timeout. No committed turn was proven.
+- `Failed to set stable Chrome window bounds`: the owned window could not be restored to `1280x720`; no critical UI action should continue.
+- `trusted-target-mismatch`: the point under the pointer was not the re-located composer or send control. No pointer click was sent.
+- `trusted-target-resized`: the viewport kept changing across three fresh probes. Old coordinates were discarded and no pointer click was sent.
 - `prompt-commit-timeout`: a send action was attempted but no committed user turn appeared. `promptSubmitted=true` is not success.
 
 ## Safe checks
@@ -19,3 +22,5 @@ Use the session metadata and concise browser log as evidence. Do not print promp
 4. If selection or submission was not confirmed, stop. Do not click the browser manually and do not automatically create another session.
 5. If submission was confirmed and only response capture timed out, recover that exact session with the same configured `ORACLE_HOME_DIR`. Recovery cleanup is scoped to that session's recorded temporary browser identity.
 6. Run `scripts/verify.sh` from the repository when installation drift is suspected.
+
+Covering the Oracle window with another application is not a cleanup or target-identity problem, and the runtime does not use `document.visibilityState` as click evidence. Restoring the window from a minimized state or stopping an active resize can unblock Chrome compositing; retry policy still follows the main Skill.

@@ -5,6 +5,8 @@ readonly ORACLE_WEB_COMMON_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}
 readonly ORACLE_WEB_REPO_ROOT="$(CDPATH= cd -- "$ORACLE_WEB_COMMON_DIR/../.." && pwd)"
 readonly ORACLE_WEB_PATCH_FILE="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.patch"
 readonly ORACLE_WEB_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.sha256"
+readonly ORACLE_WEB_F0EA8D6_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-f0ea8d6.patch"
+readonly ORACLE_WEB_F0EA8D6_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-f0ea8d6.sha256"
 
 oracle_web_die() {
   echo "gpt-oracle-web: $*" >&2
@@ -94,6 +96,7 @@ oracle_web_validate_oracle_root() {
 
 oracle_web_patch_state() {
   local oracle_root="$1"
+  local manifest="${2:-$ORACLE_WEB_HASH_MANIFEST}"
   local pristine patched relative actual
   local pristine_count=0
   local patched_count=0
@@ -115,7 +118,7 @@ oracle_web_patch_state() {
       printf '%s\n' "unknown"
       return
     fi
-  done < "$ORACLE_WEB_HASH_MANIFEST"
+  done < "$manifest"
 
   if [[ "$total" -gt 0 && "$pristine_count" -eq "$total" ]]; then
     printf '%s\n' "pristine"

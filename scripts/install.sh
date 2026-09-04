@@ -82,6 +82,17 @@ if [[ "$force" == true && ("$wrapper_conflict" == true || "$skill_conflict" == t
 fi
 
 patch_state="$(oracle_web_patch_state "$oracle_root")"
+if [[ "$patch_state" == "unknown" && \
+      -f "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" && \
+      -f "$ORACLE_WEB_F0EA8D6_HASH_MANIFEST" && \
+      "$(oracle_web_patch_state "$oracle_root" "$ORACLE_WEB_F0EA8D6_HASH_MANIFEST")" == "patched" ]]; then
+  patch -C -f -p1 -d "$oracle_root" -i "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" >/dev/null
+  patch -f -p1 -d "$oracle_root" -i "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" >/dev/null
+  patch_state="$(oracle_web_patch_state "$oracle_root")"
+  [[ "$patch_state" == "patched" ]] || \
+    oracle_web_die "upgrade from managed revision f0ea8d6 did not reach the current patched state"
+  echo "Upgraded Oracle runtime from managed revision f0ea8d6"
+fi
 case "$patch_state" in
   pristine)
     patch -C -f -p1 -d "$oracle_root" -i "$ORACLE_WEB_PATCH_FILE" >/dev/null

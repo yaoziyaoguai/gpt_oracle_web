@@ -27,6 +27,15 @@ export ORACLE_WEB_STATE_DIR="$test_root/state"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "legacy runtime unexpectedly matched the current manifest"
+[[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_F0EA8D6_HASH_MANIFEST")" == "patched" ]] || \
+  oracle_web_die "legacy runtime did not match the f0ea8d6 manifest"
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 node -e '
   const fs = require("node:fs");
   const source = fs.readFileSync(process.argv[1], "utf8");
@@ -34,18 +43,70 @@ node -e '
   const firstRuntimeHint = source.indexOf("await emitRuntimeHint();", launchReady);
   const hookRegistration = source.indexOf("registerTerminationHooks(chrome", launchReady);
   const firstNavigation = source.indexOf("navigateToChatGPT(Page", launchReady);
+  const stableWindow = source.indexOf("await stabilizeChromeWindow(client, logger);", launchReady);
+  const stableWindowCalls = source.match(/await (?:raceWithDisconnect\()?stabilizeChromeWindow\(client, logger\)/g) ?? [];
   if (
     launchReady < 0 ||
     firstRuntimeHint < launchReady ||
     firstRuntimeHint > hookRegistration ||
-    firstRuntimeHint > firstNavigation
+    firstRuntimeHint > firstNavigation ||
+    stableWindow < launchReady ||
+    stableWindow > firstNavigation ||
+    stableWindowCalls.length !== 3
   ) {
-    throw new Error("owned runtime identity is not persisted before hooks/navigation");
+    throw new Error("runtime identity/window bounds are not established before navigation");
   }
   const inputAwareCalls = source.match(/ensureThinkingTime\(Runtime, thinkingTime, logger, thinkingTargetModel, Input\)/g) ?? [];
   if (inputAwareCalls.length !== 2) {
     throw new Error(`local and remote thinking-time flows did not both receive CDP Input: ${inputAwareCalls.length}`);
   }
+' "$test_root/package/dist/src/browser/index.js"
+
+node -e '
+  const fs = require("node:fs");
+  (async () => {
+    const source = fs.readFileSync(process.argv[1], "utf8");
+    const start = source.indexOf("async function stabilizeChromeWindow");
+    const end = source.indexOf("async function enableFocusEmulation", start);
+    if (start < 0 || end < 0) throw new Error("stable Chrome window helper is missing");
+    const implementation = source.slice(start, end);
+    const stabilizeChromeWindow = new Function(
+      `${implementation}; return stabilizeChromeWindow;`,
+    )();
+    const calls = [];
+    const client = {
+      Browser: {
+        getWindowForTarget: async () => ({ windowId: 7 }),
+        setWindowBounds: async ({ bounds }) => calls.push(bounds),
+        getWindowBounds: async () => ({
+          bounds: { width: 1280, height: 720, windowState: "normal" },
+        }),
+      },
+    };
+    await stabilizeChromeWindow(client, () => {});
+    if (
+      calls.length !== 2 ||
+      calls[0].windowState !== "normal" ||
+      calls[1].width !== 1280 ||
+      calls[1].height !== 720
+    ) {
+      throw new Error(`Chrome bounds were not normalized and fixed: ${JSON.stringify(calls)}`);
+    }
+    let failure = null;
+    try {
+      await stabilizeChromeWindow({
+        Browser: {
+          getWindowForTarget: async () => ({ windowId: 9 }),
+          setWindowBounds: async () => { throw new Error("denied"); },
+        },
+      }, () => {});
+    } catch (error) {
+      failure = error;
+    }
+    if (!failure || !/stable Chrome window bounds.*denied/i.test(failure.message)) {
+      throw new Error(`window-bounds failure was not explicit: ${failure?.message ?? "none"}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/index.js"
 
 node -e '
@@ -75,6 +136,94 @@ node -e '
     await module.ensureThinkingTime(runtime, "max", logger, null, {});
     if (!reloaded || evaluations !== 3) {
       throw new Error(`missing picker was not recovered by one bounded reload: reloaded=${reloaded}, evaluations=${evaluations}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/thinkingTime.js"
+
+node -e '
+  const fs = require("node:fs");
+  (async () => {
+    const source = fs.readFileSync(process.argv[1], "utf8");
+    const start = source.indexOf("function isThinkingPointerAction");
+    const end = source.indexOf("function buildThinkingTimeExpression", start);
+    if (start < 0 || end < 0) throw new Error("thinking pointer refresh helpers are missing");
+    const implementation = source.slice(start, end);
+    const evaluateThinkingTimeSelection = new Function(
+      "buildThinkingTimeExpression",
+      `${implementation}; return evaluateThinkingTimeSelection;`,
+    )(() => "probe") ;
+    const viewportBefore = {
+      width: 1000, height: 700, visualWidth: 1000, visualHeight: 700,
+      visualOffsetLeft: 0, visualOffsetTop: 0,
+    };
+    const viewportAfter = { ...viewportBefore, width: 1200, visualWidth: 1200 };
+    const pointer = (x, viewport, hitTargetMatches = true) => ({
+      status: "slider-click-required",
+      purpose: "focus-power-slider",
+      x,
+      y: 90,
+      viewport,
+      hitTargetMatches,
+    });
+    const responses = [
+      pointer(10, viewportBefore),
+      pointer(60, viewportAfter),
+      pointer(70, viewportAfter),
+      pointer(80, viewportAfter),
+      pointer(90, viewportAfter),
+      { status: "already-selected", label: "第 4 项，共 5 项" },
+    ];
+    const events = [];
+    const result = await evaluateThinkingTimeSelection({
+      evaluate: async () => ({ result: { value: responses.shift() } }),
+    }, "extra-high", null, {
+      dispatchMouseEvent: async (event) => events.push(event),
+      dispatchKeyEvent: async (event) => events.push(event),
+    });
+    const presses = events.filter((event) => event.type === "mousePressed");
+    if (result?.status !== "already-selected" || presses.length !== 1 || presses[0].x !== 90) {
+      throw new Error(`thinking click reused stale coordinates: result=${result?.status}, events=${JSON.stringify(events)}`);
+    }
+
+    const blockedEvents = [];
+    const blockedResponses = [pointer(20, viewportBefore), pointer(20, viewportBefore, false)];
+    const blocked = await evaluateThinkingTimeSelection({
+      evaluate: async () => ({ result: { value: blockedResponses.shift() } }),
+    }, "extra-high", null, {
+      dispatchMouseEvent: async (event) => blockedEvents.push(event),
+      dispatchKeyEvent: async (event) => blockedEvents.push(event),
+    });
+    if (blocked?.status !== "selection-unverified" || blockedEvents.length !== 0) {
+      throw new Error(`unverified thinking target received input: ${JSON.stringify(blockedEvents)}`);
+    }
+
+    const noPointer = await evaluateThinkingTimeSelection({
+      evaluate: async () => ({ result: { value: pointer(20, viewportBefore) } }),
+    }, "extra-high", null, {
+      dispatchKeyEvent: async () => {},
+    });
+    if (noPointer?.status !== "selection-unverified" || noPointer?.sliderPointerAvailable !== false) {
+      throw new Error("thinking pointer fallback did not fail closed when CDP pointer input was unavailable");
+    }
+
+    const keyEvents = [];
+    const keyResponses = [
+      { status: "slider-key-required", key: "ArrowRight" },
+      { status: "switched", label: "第 5 项，共 5 项" },
+    ];
+    const keyed = await evaluateThinkingTimeSelection({
+      evaluate: async () => ({ result: { value: keyResponses.shift() } }),
+    }, "max", null, {
+      dispatchMouseEvent: async (event) => keyEvents.push(event),
+      dispatchKeyEvent: async (event) => keyEvents.push(event),
+    });
+    if (
+      keyed?.status !== "switched" ||
+      keyEvents.length !== 2 ||
+      keyEvents.some((event) => event.key !== "ArrowRight") ||
+      keyEvents.some((event) => event.type !== "keyDown" && event.type !== "keyUp")
+    ) {
+      throw new Error(`ARIA slider keyboard path was not preserved: ${JSON.stringify(keyEvents)}`);
     }
   })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/actions/thinkingTime.js"
@@ -172,6 +321,98 @@ node -e '
     await submitPrompt({ runtime, input, baselineTurns: 0 }, "probe", () => {});
     if (events.join(",") !== "trusted-click,insertText") {
       throw new Error(`prompt insertion was not preceded by one trusted composer click: ${events.join(",")}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/promptComposer.js"
+
+node -e '
+  const fs = require("node:fs");
+  (async () => {
+    const source = fs.readFileSync(process.argv[1], "utf8");
+    const start = source.indexOf("function buildTrustedPointExpression");
+    const end = source.indexOf("async function waitForSubmissionStart", start);
+    if (start < 0 || end < 0) throw new Error("trusted target helpers are missing");
+    const implementation = source.slice(start, end);
+    if (
+      !implementation.includes("document.elementFromPoint") ||
+      implementation.includes("visibilityState") ||
+      implementation.includes(".click()")
+    ) {
+      throw new Error("trusted click must use DOM hit testing and CDP input without depending on tab visibility");
+    }
+    const clickTrustedPoint = new Function(
+      "INPUT_SELECTORS",
+      "SEND_BUTTON_SELECTORS",
+      "PROMPT_PRIMARY_SELECTOR",
+      "BrowserAutomationError",
+      `${implementation}; return clickTrustedPoint;`,
+    )(
+      ["#prompt-textarea"],
+      ["button[data-testid=send-button]"],
+      "#prompt-textarea",
+      class BrowserAutomationError extends Error {},
+    );
+    const viewportBefore = {
+      width: 1000, height: 700, visualWidth: 1000, visualHeight: 700,
+      visualOffsetLeft: 0, visualOffsetTop: 0,
+    };
+    const viewportAfter = { ...viewportBefore, width: 1200, visualWidth: 1200 };
+    let evaluations = 0;
+    const runtime = {
+      evaluate: async () => ({
+        result: {
+          value: ++evaluations === 1
+            ? { status: "point", kind: "send", x: 20, y: 30, viewport: viewportAfter }
+            : { status: "point", kind: "send", x: 80, y: 90, viewport: viewportAfter },
+        },
+      }),
+    };
+    const events = [];
+    const input = {
+      dispatchMouseEvent: async (event) => events.push(event),
+    };
+    await clickTrustedPoint(runtime, input, {
+      status: "point", kind: "send", x: 10, y: 10, viewport: viewportBefore,
+    });
+    if (
+      evaluations !== 2 ||
+      events.length !== 2 ||
+      events.some((event) => event.x !== 80 || event.y !== 90)
+    ) {
+      throw new Error(`stale coordinates were not discarded after resize: evaluations=${evaluations}, events=${JSON.stringify(events)}`);
+    }
+    const blockedEvents = [];
+    let blocked = null;
+    try {
+      await clickTrustedPoint({
+        evaluate: async () => ({ result: { value: {
+          status: "target-mismatch", kind: "send", x: 20, y: 30, viewport: viewportBefore,
+        } } }),
+      }, {
+        dispatchMouseEvent: async (event) => blockedEvents.push(event),
+      }, {
+        status: "point", kind: "send", x: 20, y: 30, viewport: viewportBefore,
+      });
+    } catch (error) {
+      blocked = error;
+    }
+    if (!blocked || blockedEvents.length !== 0 || !/hit testing/i.test(blocked.message)) {
+      throw new Error(`mismatched hit target was clicked or not reported: ${blocked?.message ?? "none"}`);
+    }
+    let unavailable = null;
+    try {
+      await clickTrustedPoint({
+        evaluate: async () => ({ result: { value: {
+          status: "point", kind: "composer", x: 20, y: 30, viewport: viewportBefore,
+        } } }),
+      }, {}, {
+        status: "point", kind: "composer", x: 20, y: 30, viewport: viewportBefore,
+      });
+    } catch (error) {
+      unavailable = error;
+    }
+    if (!unavailable || !/requires CDP pointer input/i.test(unavailable.message)) {
+      throw new Error(`missing trusted input did not fail closed: ${unavailable?.message ?? "none"}`);
     }
   })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/actions/promptComposer.js"
@@ -301,13 +542,12 @@ node -e '
 
 node -e '
   const fs = require("node:fs");
+  const vm = require("node:vm");
   (async () => {
       const source = fs.readFileSync(process.argv[1], "utf8");
       const enterStart = source.indexOf("async function submitViaEnter");
       const enterEnd = source.indexOf("export async function clearPromptComposer", enterStart);
-      const clickStart = source.indexOf("async function clickTrustedPoint");
-      const clickEnd = source.indexOf("async function waitForSubmissionStart", clickStart);
-      if ([enterStart, enterEnd, clickStart, clickEnd].some((index) => index < 0)) {
+      if ([enterStart, enterEnd].some((index) => index < 0)) {
         throw new Error("Enter fallback source not found");
       }
       const factory = new Function(
@@ -315,13 +555,18 @@ node -e '
         "PROMPT_PRIMARY_SELECTOR",
         "ENTER_KEY_EVENT",
         "ENTER_KEY_TEXT",
-        `${source.slice(enterStart, enterEnd)}; ${source.slice(clickStart, clickEnd)}; return submitViaEnter;`,
+        "clickTrustedPoint",
+        `${source.slice(enterStart, enterEnd)}; return submitViaEnter;`,
       );
       const submitViaEnter = factory(
         ["#prompt-textarea", "textarea"],
         "#prompt-textarea",
         { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
         "\\r",
+        async (_runtime, _input, point) => {
+          events.push(`mousePressed:${point.x}`);
+          events.push(`mouseReleased:${point.x}`);
+        },
       );
       const events = [];
       let focused = null;
@@ -363,6 +608,11 @@ node -e '
                 document,
                 HTMLTextAreaElement: FakeTextarea,
                 HTMLInputElement: class {},
+                window: {
+                  innerWidth: 1280,
+                  innerHeight: 720,
+                  visualViewport: null,
+                },
               }),
             },
           };

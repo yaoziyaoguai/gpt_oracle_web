@@ -1,17 +1,462 @@
---- a/dist/src/browser/actions/thinkingTime.js
-+++ b/dist/src/browser/actions/thinkingTime.js
-@@ -4,0 +5 @@
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/attachments.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/attachments.js
+--- a/dist/src/browser/actions/attachments.js	1985-10-26 16:15:00
++++ b/dist/src/browser/actions/attachments.js	2026-09-04 08:58:12
+@@ -1460,8 +1460,12 @@
+                 if (stable && value.state === "ready") {
+                     return;
+                 }
+-                // Don't treat disabled button as complete - wait for it to become 'ready'.
+-                // The spinner detection is unreliable, so a disabled button likely means upload is in progress.
++                // 附件上传发生在 prompt 写入之前；此时发送按钮会因为编辑器为空而保持 disabled。
++                // 文件名已稳定匹配且页面明确没有上传状态时，附件阶段已经完成，发送按钮应由后续
++                // prompt 提交阶段单独校验。否则会把“空编辑器”误判为“仍在上传”。
++                if (stable && !value.uploading && (value.filesAttached || fileCountSatisfied)) {
++                    return;
++                }
+                 if (value.state === "missing" && (value.filesAttached || fileCountSatisfied)) {
+                     return;
+                 }
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/navigation.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/navigation.js
+--- a/dist/src/browser/actions/navigation.js	1985-10-26 16:15:00
++++ b/dist/src/browser/actions/navigation.js	2026-09-04 08:58:12
+@@ -37,7 +37,17 @@
+ export async function navigateToChatGPT(Page, Runtime, url, logger) {
+     logger(`Navigating to ${url}`);
+     await Page.navigate({ url });
+-    await waitForDocumentReady(Runtime, 45_000);
++    try {
++        await waitForDocumentReady(Runtime, 45_000);
++    }
++    catch (error) {
++        if (typeof Page.reload !== "function") {
++            throw error;
++        }
++        logger("[nav] initial document readiness timed out; reloading the isolated tab once.");
++        await Page.reload({ ignoreCache: false });
++        await waitForDocumentReady(Runtime, 45_000);
++    }
+ }
+ async function dismissBlockingUi(Runtime, logger) {
+     const outcome = await Runtime.evaluate({
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/promptComposer.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/promptComposer.js
+--- a/dist/src/browser/actions/promptComposer.js	1985-10-26 16:15:00
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-04 09:21:11
+@@ -54,9 +54,35 @@
+           candidates.push(node);
+         }
+       }
+-      const preferred = candidates.find((node) => isVisible(node)) || candidates[0];
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const active = document.activeElement;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++      const preferred =
++        (isVisible(primary) && isEditable(primary) ? primary : null) ||
++        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node)) ||
++        candidates[0];
+       if (preferred && focusNode(preferred)) {
+-        return { focused: true };
++        const rect = preferred.getBoundingClientRect();
++        return {
++          focused: true,
++          kind: 'composer',
++          x: rect.left + rect.width / 2,
++          y: rect.top + rect.height / 2,
++          viewport: {
++            width: window.innerWidth,
++            height: window.innerHeight,
++            visualWidth: window.visualViewport?.width ?? window.innerWidth,
++            visualHeight: window.visualViewport?.height ?? window.innerHeight,
++            visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++            visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++          },
++        };
+       }
+       return { focused: false };
+     })()`,
+@@ -67,6 +93,10 @@
+         await logDomFailure(runtime, logger, "focus-textarea");
+         throw new Error("Failed to focus prompt textarea");
+     }
++    const focusPoint = focusResult.result.value;
++    if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
++        await clickTrustedPoint(runtime, input, focusPoint);
++    }
+     await input.insertText({ text: prompt });
+     // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
+     // before the send button becomes enabled; give it a short breather to avoid races.
+@@ -169,26 +199,82 @@
+     }
+     const clicked = await attemptSendButton(runtime, input, logger, deps?.attachmentNames, deps?.attachmentTimeoutMs);
+     if (!clicked) {
+-        await input.dispatchKeyEvent({
+-            type: "keyDown",
+-            ...ENTER_KEY_EVENT,
+-            text: ENTER_KEY_TEXT,
+-            unmodifiedText: ENTER_KEY_TEXT,
+-        });
+-        await input.dispatchKeyEvent({
+-            type: "keyUp",
+-            ...ENTER_KEY_EVENT,
+-        });
++        await submitViaEnter(runtime, input);
+         logger("Submitted prompt via Enter key");
+     }
+     else {
+         logger("Clicked send button");
++        // CDP can deliver a trusted mouse sequence without ChatGPT accepting the action.
++        // Only retry when the composer still contains the prompt and no submission signal
++        // appears, which avoids duplicating a click that actually succeeded.
++        const clickStartedSubmission = await waitForSubmissionStart(runtime, deps.baselineTurns ?? undefined, 3_000);
++        if (!clickStartedSubmission) {
++            await submitViaEnter(runtime, input);
++            logger("Send button produced no submission state; retried once via Enter key");
++        }
+     }
+     await deps.onPromptSubmitted?.();
+     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
+     // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
+     return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
+ }
++async function submitViaEnter(Runtime, Input) {
++    const focus = await Runtime.evaluate({
++        expression: `(() => {
++      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const isVisible = (node) => {
++        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++        const rect = node.getBoundingClientRect();
++        return rect.width > 0 && rect.height > 0;
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const candidates = selectors
++        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++        .filter((node, index, all) => all.indexOf(node) === index);
++      const active = document.activeElement;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++      const editor =
++        (isVisible(primary) && isEditable(primary) ? primary : null) ||
++        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node) && isEditable(node));
++      if (!editor) return null;
++      editor.focus?.();
++      const rect = editor.getBoundingClientRect();
++      return {
++        kind: 'composer',
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport: {
++          width: window.innerWidth,
++          height: window.innerHeight,
++          visualWidth: window.visualViewport?.width ?? window.innerWidth,
++          visualHeight: window.visualViewport?.height ?? window.innerHeight,
++          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++        },
++      };
++    })()`,
++        returnByValue: true,
++    });
++    const point = focus.result?.value;
++    if (point && typeof point.x === "number" && typeof point.y === "number") {
++        await clickTrustedPoint(Runtime, Input, point);
++    }
++    await Input.dispatchKeyEvent({
++        type: "keyDown",
++        ...ENTER_KEY_EVENT,
++        text: ENTER_KEY_TEXT,
++        unmodifiedText: ENTER_KEY_TEXT,
++    });
++    await Input.dispatchKeyEvent({
++        type: "keyUp",
++        ...ENTER_KEY_EVENT,
++    });
++}
+ export async function clearPromptComposer(Runtime, logger) {
+     const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
+     const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
+@@ -579,7 +665,6 @@
+ async function attemptSendButton(Runtime, Input, _logger, attachmentNames, attachmentTimeoutMs) {
+     const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
+     const script = `(() => {
+-    ${buildClickDispatcher()}
+     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
+     const isVisible = (node) => {
+       if (!(node instanceof HTMLElement)) return false;
+@@ -604,16 +689,28 @@
+     for (const selector of selectors) {
+       candidates.push(...Array.from(document.querySelectorAll(selector)));
+     }
+-    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
+-    if (!button) return { status: 'missing' };
++    const visibleCandidates = candidates.filter((node) => isVisible(node));
++    const button = visibleCandidates.find((node) => isEnabled(node)) || null;
++    if (!button) return { status: visibleCandidates.length > 0 ? 'disabled' : 'missing' };
+     button.scrollIntoView({ block: 'center', inline: 'center' });
+     const rect = button.getBoundingClientRect();
+     if (rect.width > 0 && rect.height > 0) {
+-      return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
++      return {
++        status: 'point',
++        kind: 'send',
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport: {
++          width: window.innerWidth,
++          height: window.innerHeight,
++          visualWidth: window.visualViewport?.width ?? window.innerWidth,
++          visualHeight: window.visualViewport?.height ?? window.innerHeight,
++          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++        },
++      };
+     }
+-    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
+-    dispatchClickSequence(button);
+-    return { status: 'clicked' };
++    return { status: 'missing' };
+   })()`;
+     // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
+     // settle slowly for multi-file uploads, but plain text sends should keep the
+@@ -638,15 +735,21 @@
+             typeof value === "object" &&
+             typeof value.x === "number" &&
+             typeof value.y === "number") {
+-            await clickTrustedPoint(Runtime, Input, value.x, value.y);
++            await clickTrustedPoint(Runtime, Input, value);
+             return true;
+         }
+-        if (status === "clicked") {
+-            return true;
+-        }
+         if (status === "missing") {
+-            break;
++            // Attachment readiness was verified above. Let the caller use its
++            // existing one-shot Enter fallback, then verify a committed turn.
++            return false;
+         }
++        if (status === "disabled") {
++            if (!needAttachment) {
++                return false;
++            }
++            await delay(150);
++            continue;
++        }
+         await delay(100);
+     }
+     if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
+@@ -659,22 +762,167 @@
+     }
+     return false;
+ }
+-async function clickTrustedPoint(Runtime, Input, x, y) {
+-    if (Input && typeof Input.dispatchMouseEvent === "function") {
+-        await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+-        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
+-        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
++function buildTrustedPointExpression(kind) {
++    return `(() => {
++      const kind = ${JSON.stringify(kind)};
++      const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const sendSelectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
++      const isVisible = (node) => {
++        if (!(node instanceof HTMLElement)) return false;
++        const rect = node.getBoundingClientRect();
++        if (rect.width <= 0 || rect.height <= 0) return false;
++        const style = window.getComputedStyle(node);
++        return style.display !== 'none' && style.visibility !== 'hidden';
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const isEnabled = (node) => {
++        const style = window.getComputedStyle(node);
++        return !(
++          node.hasAttribute('disabled') ||
++          node.getAttribute('aria-disabled') === 'true' ||
++          node.getAttribute('data-disabled') === 'true' ||
++          style.pointerEvents === 'none'
++        );
++      };
++      let target = null;
++      if (kind === 'composer') {
++        const candidates = inputSelectors
++          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++          .filter((node, index, all) => all.indexOf(node) === index);
++        const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++        target =
++          (isVisible(primary) && isEditable(primary) ? primary : null) ||
++          candidates.find((node) => node === document.activeElement && isVisible(node) && isEditable(node)) ||
++          candidates.find((node) => isVisible(node) && isEditable(node)) ||
++          null;
++      } else if (kind === 'send') {
++        const candidates = sendSelectors
++          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++          .filter((node, index, all) => all.indexOf(node) === index);
++        target = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
++        target?.scrollIntoView?.({ block: 'center', inline: 'center' });
++      }
++      if (!target) return { status: 'missing', kind };
++      const rect = target.getBoundingClientRect();
++      const x = rect.left + rect.width / 2;
++      const y = rect.top + rect.height / 2;
++      const hit = document.elementFromPoint(x, y);
++      const viewport = {
++        width: window.innerWidth,
++        height: window.innerHeight,
++        visualWidth: window.visualViewport?.width ?? window.innerWidth,
++        visualHeight: window.visualViewport?.height ?? window.innerHeight,
++        visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++        visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++      };
++      if (!(hit instanceof Node) || !(target === hit || target.contains(hit))) {
++        return { status: 'target-mismatch', kind, x, y, viewport };
++      }
++      return { status: 'point', kind, x, y, viewport };
++    })()`;
++}
++function sameViewport(left, right) {
++    if (!left || !right)
++        return false;
++    return left.width === right.width &&
++        left.height === right.height &&
++        left.visualWidth === right.visualWidth &&
++        left.visualHeight === right.visualHeight &&
++        left.visualOffsetLeft === right.visualOffsetLeft &&
++        left.visualOffsetTop === right.visualOffsetTop;
++}
++async function clickTrustedPoint(Runtime, Input, target) {
++    let expectedViewport = target?.viewport;
++    const kind = target?.kind;
++    if (kind !== "composer" && kind !== "send") {
++        throw new BrowserAutomationError("Trusted click target was not identified.", {
++            stage: "submit-prompt",
++            code: "trusted-target-unidentified",
++        });
++    }
++    for (let attempt = 0; attempt < 3; attempt += 1) {
++        const { result } = await Runtime.evaluate({
++            expression: buildTrustedPointExpression(kind),
++            returnByValue: true,
++        });
++        const point = result?.value;
++        if (point?.status !== "point") {
++            throw new BrowserAutomationError(`Trusted ${kind} target failed hit testing (${point?.status ?? "unknown"}).`, {
++                stage: "submit-prompt",
++                code: "trusted-target-mismatch",
++                kind,
++                status: point?.status ?? "unknown",
++            });
++        }
++        if (!sameViewport(expectedViewport, point.viewport)) {
++            expectedViewport = point.viewport;
++            continue;
++        }
++        const x = Number(point.x);
++        const y = Number(point.y);
++        if (!Number.isFinite(x) || !Number.isFinite(y)) {
++            throw new BrowserAutomationError(`Trusted ${kind} target returned invalid coordinates.`, {
++                stage: "submit-prompt",
++                code: "trusted-target-invalid-point",
++                kind,
++            });
++        }
++        if (!Input || typeof Input.dispatchMouseEvent !== "function") {
++            throw new BrowserAutomationError(`Trusted ${kind} target requires CDP pointer input.`, {
++                stage: "submit-prompt",
++                code: "trusted-input-unavailable",
++                kind,
++            });
++        }
++        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
++        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+         return;
+     }
+-    await Runtime.evaluate({
+-        expression: `(() => {
+-      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+-      if (!(el instanceof HTMLElement)) return false;
+-      el.click();
+-      return true;
+-    })()`,
+-        returnByValue: true,
++    throw new BrowserAutomationError(`Trusted ${kind} target kept moving after a window resize.`, {
++        stage: "submit-prompt",
++        code: "trusted-target-resized",
++        kind,
+     });
++}
++async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
++    const deadline = Date.now() + timeoutMs;
++    const baseline = typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
++        ? Math.max(0, Math.floor(baselineTurns))
++        : -1;
++    const expression = `(() => {
++    const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++    const isVisible = (node) => {
++      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++      const rect = node.getBoundingClientRect();
++      return rect.width > 0 && rect.height > 0;
++    };
++    const readValue = (node) => {
++      if (!node) return '';
++      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) return node.value ?? '';
++      return node.innerText ?? node.textContent ?? '';
++    };
++    const inputs = selectors
++      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++      .filter((node, index, all) => all.indexOf(node) === index && isVisible(node));
++    const composerEmpty = inputs.length > 0 && inputs.every((node) => !String(readValue(node)).trim());
++    const turnsCount = ${buildConversationTurnCountExpression()};
++    const hasNewTurn = ${JSON.stringify(baseline)} >= 0 && turnsCount > ${JSON.stringify(baseline)};
++    const stopVisible = Boolean(document.querySelector(${JSON.stringify(STOP_BUTTON_SELECTOR)}));
++    const inConversation = /\\/c\\//.test(location.href);
++    return { started: composerEmpty || hasNewTurn || stopVisible || inConversation };
++  })()`;
++    while (Date.now() < deadline) {
++        const { result } = await Runtime.evaluate({ expression, returnByValue: true });
++        if (result?.value?.started) {
++            return true;
++        }
++        await delay(100);
++    }
++    return false;
+ }
+ function sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs) {
+     if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/thinkingTime.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/thinkingTime.js
+--- a/dist/src/browser/actions/thinkingTime.js	1985-10-26 16:15:00
++++ b/dist/src/browser/actions/thinkingTime.js	2026-09-04 09:21:04
+@@ -2,6 +2,7 @@
+ import { logDomFailure } from "../domDebug.js";
+ import { buildClickDispatcher } from "./domEvents.js";
+ const BROWSER_THINKING_LOG_PREFIX = "[browser] Thinking time:";
 +const pickerReloadedRuntimes = new WeakSet();
-@@ -26,2 +26 @@
+ function formatBrowserThinkingLog(message) {
+     return `${BROWSER_THINKING_LOG_PREFIX} ${message.replace(/^Thinking time:\s*/, "")}`;
+ }
+@@ -23,19 +24,45 @@
+ /**
+  * Selects a thinking-time level in ChatGPT's composer.
+  *
 - * Missing controls remain best-effort except Pro Extended, which fails closed
 - * unless the selected option is confirmed.
 + * High-effort targets fail closed unless the selected option is confirmed.
-@@ -29,2 +28,2 @@
+  */
 -export async function ensureThinkingTime(Runtime, level, logger, desiredModel) {
 -    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
 +export async function ensureThinkingTime(Runtime, level, logger, desiredModel, Input) {
 +    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
-@@ -30,0 +30,19 @@
 +    if (result?.status === "chip-not-found" &&
 +        Runtime &&
 +        (typeof Runtime === "object" || typeof Runtime === "function") &&
@@ -31,7 +476,9 @@
 +            return ensureThinkingTime(Runtime, level, logger, desiredModel, Input);
 +        }
 +    }
-@@ -34,4 +33,3 @@
+     const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
+     const targetModelKind = inferThinkingTargetModelKind(desiredModel);
+     const observedModelKind = result && "modelKind" in result ? result.modelKind : null;
 -    // Pro is expensive and rate-limited, so a Pro request must never degrade quietly
 -    // into a cheaper tier. Requesting it explicitly (level "pro") fails closed on its
 -    // own, independently of the legacy Pro-model + "extended" combination.
@@ -39,7 +486,7 @@
 +    // Every effort tier used by the local oracle-web workflow must be verified
 +    // before submission; never continue on an unknown fourth or fifth position.
 +    const strictTopEffort = level === "extra-high" || level === "max" || level === "pro" || level === "ultra" ||
-@@ -38,0 +37,9 @@
+         ((targetModelKind === "pro" || observedModelKind === "pro") && level === "extended");
 +    const strictTarget = level === "extra-high"
 +        ? "position 4"
 +        : level === "max"
@@ -49,35 +496,88 @@
 +                : level === "ultra"
 +                    ? "Ultra"
 +                    : "Pro Extended";
-@@ -59,3 +66,2 @@
+     switch (result?.status) {
+         case "already-selected":
+             logger(formatBrowserThinkingLog(`${result.label ?? capitalizedLevel} (already selected)`));
+@@ -56,9 +83,8 @@
+                     ? ` for ${targetModelKind}`
+                     : "";
+             const message = `Thinking time: ${result.status.replaceAll("-", " ")}${kindHint} (requested ${capitalizedLevel})`;
 -            if (strictProEffort) {
 -                const target = level === "pro" ? "Pro" : "Pro Extended";
 -                throw new Error(`${message}; refusing to submit without confirmed ${target}.`);
 +            if (strictTopEffort) {
 +                throw new Error(`${message}; refusing to submit without confirmed ${strictTarget}.`);
-@@ -75,3 +81,2 @@
+             }
+             // "selection-unverified" is the one status here that already dispatched a
+             // click, so the effort may or may not have moved. Every other status left
+@@ -72,9 +98,8 @@
+         default: {
+             await logDomFailure(Runtime, logger, "thinking-time-unknown");
+             logPickerDiagnostic(result, logger);
 -            if (strictProEffort) {
 -                const target = level === "pro" ? "Pro" : "Pro Extended";
 -                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${target}.`);
 +            if (strictTopEffort) {
 +                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${strictTarget}.`);
-@@ -87 +92 @@
+             }
+             logger(formatBrowserThinkingLog(`unknown outcome selecting ${capitalizedLevel}; continuing with ChatGPT default.`));
+             return;
+@@ -84,11 +109,11 @@
+ /**
+  * Best-effort selection of a thinking time level in ChatGPT's composer pill menu.
+  * Safe by default: if the pill/menu/option isn't present, we continue without throwing.
 - * @param level - The thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'pro', or 'heavy'
 + * @param level - The thinking time intensity, including current max/ultra and legacy pro/heavy labels
-@@ -89 +94 @@
+  */
 -export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel) {
 +export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel, Input) {
-@@ -91 +96 @@
+     try {
 -        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
 +        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
-@@ -125,7 +130,149 @@
+         const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
+         switch (result?.status) {
+             case "already-selected":
+@@ -122,14 +147,243 @@
+         return false;
+     }
+ }
 -async function evaluateThinkingTimeSelection(Runtime, level, desiredModel) {
--    const outcome = await Runtime.evaluate({
--        expression: buildThinkingTimeExpression(level, desiredModel),
--        awaitPromise: true,
--        returnByValue: true,
--    });
++function isThinkingPointerAction(result) {
++    return result?.status === "slider-click-required" ||
++        result?.status === "slider-drag-required" ||
++        result?.status === "slider-hover-required";
++}
++function sameThinkingViewport(left, right) {
++    if (!left || !right)
++        return false;
++    return left.width === right.width &&
++        left.height === right.height &&
++        left.visualWidth === right.visualWidth &&
++        left.visualHeight === right.visualHeight &&
++        left.visualOffsetLeft === right.visualOffsetLeft &&
++        left.visualOffsetTop === right.visualOffsetTop;
++}
++async function refreshThinkingPointerAction(Runtime, level, desiredModel, previous) {
+     const outcome = await Runtime.evaluate({
+         expression: buildThinkingTimeExpression(level, desiredModel),
+         awaitPromise: true,
+         returnByValue: true,
+     });
 -    return outcome.result?.value;
++    const current = outcome.result?.value;
++    if (!isThinkingPointerAction(current) ||
++        current.status !== previous.status ||
++        current.purpose !== previous.purpose ||
++        !sameThinkingViewport(previous.viewport, current.viewport)) {
++        return { status: "retry", result: current };
++    }
++    if (current.hitTargetMatches !== true ||
++        (current.status === "slider-drag-required" && current.destinationHitTargetMatches !== true)) {
++        return { status: "blocked", result: current };
++    }
++    return { status: "ready", result: current };
+ }
 +async function evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input) {
 +    let lastResult;
 +    for (let attempt = 0; attempt < 16; attempt += 1) {
@@ -87,10 +587,7 @@
 +            returnByValue: true,
 +        });
 +        lastResult = outcome.result?.value;
-+        if (lastResult?.status !== "slider-key-required" &&
-+            lastResult?.status !== "slider-click-required" &&
-+            lastResult?.status !== "slider-drag-required" &&
-+            lastResult?.status !== "slider-hover-required") {
++        if (lastResult?.status !== "slider-key-required" && !isThinkingPointerAction(lastResult)) {
 +            return lastResult;
 +        }
 +        if (!Input || typeof Input.dispatchKeyEvent !== "function") {
@@ -100,80 +597,136 @@
 +                sliderInputAvailable: false,
 +            };
 +        }
-+        if (lastResult.status === "slider-click-required" ||
-+            lastResult.status === "slider-drag-required" ||
-+            lastResult.status === "slider-hover-required") {
-+            const x = Number(lastResult.x);
-+            const y = Number(lastResult.y);
++        if (isThinkingPointerAction(lastResult)) {
++            if (typeof Input.dispatchMouseEvent !== "function") {
++                return {
++                    ...lastResult,
++                    status: "selection-unverified",
++                    sliderPointerAvailable: false,
++                };
++            }
++            let refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, lastResult);
++            if (refreshed.status === "retry") {
++                lastResult = refreshed.result;
++                continue;
++            }
++            if (refreshed.status === "blocked") {
++                return {
++                    ...refreshed.result,
++                    status: "selection-unverified",
++                    pointerTargetVerified: false,
++                };
++            }
++            let action = refreshed.result;
++            const x = Number(action.x);
++            const y = Number(action.y);
 +            if (!Number.isFinite(x) || !Number.isFinite(y)) {
-+                return { ...lastResult, status: "selection-unverified" };
++                return { ...action, status: "selection-unverified" };
 +            }
 +            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y: y - 20 });
 +            await new Promise((resolve) => setTimeout(resolve, 100));
 +            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
-+            if (lastResult.status === "slider-click-required") {
++            refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
++            if (refreshed.status === "retry") {
++                lastResult = refreshed.result;
++                continue;
++            }
++            if (refreshed.status === "blocked") {
++                return {
++                    ...refreshed.result,
++                    status: "selection-unverified",
++                    pointerTargetVerified: false,
++                };
++            }
++            action = refreshed.result;
++            const actionX = Number(action.x);
++            const actionY = Number(action.y);
++            if (!Number.isFinite(actionX) || !Number.isFinite(actionY)) {
++                return { ...action, status: "selection-unverified" };
++            }
++            if (action.status === "slider-click-required") {
 +                await Input.dispatchMouseEvent({
 +                    type: "mousePressed",
-+                    x,
-+                    y,
++                    x: actionX,
++                    y: actionY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
 +                await Input.dispatchMouseEvent({
 +                    type: "mouseReleased",
-+                    x,
-+                    y,
++                    x: actionX,
++                    y: actionY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
 +            }
-+            else if (lastResult.status === "slider-drag-required") {
-+                const targetX = Number(lastResult.clickX);
-+                const targetY = Number(lastResult.clickY);
++            else if (action.status === "slider-drag-required") {
++                const targetX = Number(action.clickX);
++                const targetY = Number(action.clickY);
 +                if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
-+                    return { ...lastResult, status: "selection-unverified" };
++                    return { ...action, status: "selection-unverified" };
 +                }
 +                // ChatGPT's slider ignores a drag until its visual thumb has first
 +                // received a standalone trusted click. Activate the thumb, then
 +                // start a separate drag to the requested stop.
 +                await Input.dispatchMouseEvent({
 +                    type: "mousePressed",
-+                    x,
-+                    y,
++                    x: actionX,
++                    y: actionY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
 +                await Input.dispatchMouseEvent({
 +                    type: "mouseReleased",
-+                    x,
-+                    y,
++                    x: actionX,
++                    y: actionY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
 +                await new Promise((resolve) => setTimeout(resolve, 150));
++                refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
++                if (refreshed.status !== "ready") {
++                    lastResult = refreshed.result;
++                    if (refreshed.status === "blocked") {
++                        return {
++                            ...refreshed.result,
++                            status: "selection-unverified",
++                            pointerTargetVerified: false,
++                        };
++                    }
++                    continue;
++                }
++                action = refreshed.result;
++                const dragStartX = Number(action.x);
++                const dragStartY = Number(action.y);
++                const dragTargetX = Number(action.clickX);
++                const dragTargetY = Number(action.clickY);
++                if (![dragStartX, dragStartY, dragTargetX, dragTargetY].every(Number.isFinite)) {
++                    return { ...action, status: "selection-unverified" };
++                }
 +                await Input.dispatchMouseEvent({
 +                    type: "mousePressed",
-+                    x,
-+                    y,
++                    x: dragStartX,
++                    y: dragStartY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
 +                await Input.dispatchMouseEvent({
 +                    type: "mouseMoved",
-+                    x: (x + targetX) / 2,
-+                    y: (y + targetY) / 2,
++                    x: (dragStartX + dragTargetX) / 2,
++                    y: (dragStartY + dragTargetY) / 2,
 +                    button: "left",
 +                });
 +                await Input.dispatchMouseEvent({
 +                    type: "mouseMoved",
-+                    x: targetX,
-+                    y: targetY,
++                    x: dragTargetX,
++                    y: dragTargetY,
 +                    button: "left",
 +                });
 +                await Input.dispatchMouseEvent({
 +                    type: "mouseReleased",
-+                    x: targetX,
-+                    y: targetY,
++                    x: dragTargetX,
++                    y: dragTargetY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
@@ -185,15 +738,15 @@
 +                // before starting a separate drag.
 +                await Input.dispatchMouseEvent({
 +                    type: "mousePressed",
-+                    x,
-+                    y,
++                    x: actionX,
++                    y: actionY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
 +                await Input.dispatchMouseEvent({
 +                    type: "mouseReleased",
-+                    x,
-+                    y,
++                    x: actionX,
++                    y: actionY,
 +                    button: "left",
 +                    clickCount: 1,
 +                });
@@ -221,25 +774,92 @@
 +                nativeVirtualKeyCode: virtualKeyCode,
 +            });
 +        }
-+        await new Promise((resolve) => setTimeout(resolve, lastResult.status === "slider-hover-required" ? 500 : 200));
++        await new Promise((resolve) => setTimeout(resolve, lastResult?.status === "slider-hover-required" ? 500 : 200));
 +    }
 +    return {
 +        ...lastResult,
 +        status: "selection-unverified",
 +    };
-@@ -139,0 +287 @@
++}
+ function buildThinkingTimeExpression(level, desiredModel) {
+     const menuContainerLiteral = JSON.stringify(MENU_CONTAINER_SELECTOR);
+     const menuItemLiteral = JSON.stringify(MENU_ITEM_SELECTOR);
+@@ -137,6 +391,7 @@
+     const targetLevelLiteral = JSON.stringify(level.toLowerCase());
+     const targetModelKindLiteral = JSON.stringify(inferThinkingTargetModelKind(desiredModel));
+     const targetIsGpt56ModelLiteral = JSON.stringify(/(?:^|[^0-9])5[._ -]6(?:[^0-9]|$)/i.test(desiredModel ?? ""));
 +    const manualUltraPauseMsLiteral = JSON.stringify(Math.max(0, Number.parseInt(process.env.ORACLE_ULTRA_MANUAL_PAUSE_MS ?? "0", 10) || 0));
-@@ -148,0 +297 @@
+     return `(async () => {
+     ${buildClickDispatcher()}
+
+@@ -146,6 +401,7 @@
+     const TARGET_LEVEL = ${targetLevelLiteral};
+     const TARGET_MODEL_KIND = ${targetModelKindLiteral};
+     const TARGET_IS_GPT56_MODEL = ${targetIsGpt56ModelLiteral};
 +    const MANUAL_ULTRA_PAUSE_MS = ${manualUltraPauseMsLiteral};
-@@ -155,0 +305,2 @@
+
+     // Multilingual matchers: English level token + observed German/Japanese/Chinese variants.
+     const LEVEL_TOKENS = {
+@@ -153,6 +409,8 @@
+       standard: ['standard', 'medium', 'mittel', '中程度', '标准', '中'],
+       extended: ['extended', 'high', 'hoch', 'erweitert', '高い', '扩展', '深度', '加强', '高'],
+       'extra-high': ['extra high', 'sehr hoch', '非常に高い', '极高'],
 +      max: ['max'],
 +      ultra: ['ultra', '超高'],
-@@ -297,0 +449 @@
+       heavy: ['heavy', 'schwer', '重度', '加重'],
+     };
+     // Pro is a tier you can request, but it is also a MODEL name, so it must never
+@@ -171,6 +429,34 @@
+     const INTELLIGENCE_WAIT_MS = 2500;
+
+     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++    const viewportSnapshot = () => ({
++      width: window.innerWidth,
++      height: window.innerHeight,
++      visualWidth: window.visualViewport?.width ?? window.innerWidth,
++      visualHeight: window.visualViewport?.height ?? window.innerHeight,
++      visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++      visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++    });
++    const pointerRequest = (status, target, x, y, extra = {}) => {
++      const hit = document.elementFromPoint(x, y);
++      const destinationX = Number(extra.clickX);
++      const destinationY = Number(extra.clickY);
++      const destinationHit = Number.isFinite(destinationX) && Number.isFinite(destinationY)
++        ? document.elementFromPoint(destinationX, destinationY)
++        : null;
++      return {
++        status,
++        x,
++        y,
++        ...extra,
++        viewport: viewportSnapshot(),
++        hitTargetMatches: Boolean(hit && (target === hit || target?.contains?.(hit))),
++        destinationHitTargetMatches:
++          destinationHit === null
++            ? null
++            : Boolean(destinationHit && (target === destinationHit || target?.contains?.(destinationHit))),
++      };
++    };
+     // Keep CJK characters, including Japanese kana, so localized labels survive
+     // normalization before being matched against LEVEL_TOKENS and picker controls.
+     const normalize = (value) => (value || '')
+@@ -295,15 +581,27 @@
+     const describeNode = (el) => {
+       if (!el || typeof el.getAttribute !== 'function') return null;
+       let rect = null;
 +      let style = null;
-@@ -301,0 +454,2 @@
+       try {
+         const r = el.getBoundingClientRect?.();
+         if (r) {
+           rect = {
 +            x: Math.round(r.left),
 +            y: Math.round(r.top),
-@@ -306,0 +461,9 @@
+             w: Math.round(r.width),
+             h: Math.round(r.height),
+             visible: r.width > 0 && r.height > 0,
+           };
+         }
 +        const computed = window.getComputedStyle?.(el);
 +        if (computed) {
 +          style = {
@@ -249,11 +869,24 @@
 +            pointerEvents: computed.pointerEvents,
 +          };
 +        }
-@@ -317,0 +481 @@
+       } catch {}
+       return {
+         tag: el.tagName || null,
+@@ -315,8 +613,10 @@
+         ariaSelected: el.getAttribute('aria-selected'),
+         ariaHaspopup: el.getAttribute('aria-haspopup'),
+         dataState: el.getAttribute('data-state'),
 +        tabIndex: typeof el.tabIndex === 'number' ? el.tabIndex : null,
-@@ -319,0 +484 @@
+         text: redactDiagnosticText(el.textContent, 80),
+         rect,
 +        style,
-@@ -348,0 +514,17 @@
+       };
+     };
+     const describeMenu = (menu) => {
+@@ -346,9 +646,28 @@
+           isVisible,
+         );
+         const modelBtn = findModelButton();
 +        let sliderProbe = null;
 +        try {
 +          const effortMenu = findVisibleEffortMenu(null);
@@ -271,15 +904,31 @@
 +            };
 +          }
 +        } catch {}
-@@ -351,0 +534,2 @@
+         return {
+           targetModelKind: TARGET_MODEL_KIND,
+           targetLevel: TARGET_LEVEL,
 +          sliderProbe,
 +          activeElement: describeNode(document.activeElement),
-@@ -687,0 +872 @@
+           modelButton: describeNode(modelBtn),
+           composerButtons: composerButtons.slice(0, 12).map(describeNode),
+           trailingCount: trailings.length,
+@@ -685,6 +1004,7 @@
+     // (simple view) plus an "Advanced" view holding two submenu openers: Model and
+     // Effort. The tier rows only exist inside the Effort submenu, so the flat scan
+     // of the top-level menu finds nothing and we must expand and descend.
 +    const SIMPLE_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-simple-view"]';
-@@ -700 +885 @@
+     const ADVANCED_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-advanced-view"]';
+     const SUBMENU_OPENER_SELECTOR = '[role="menuitem"][aria-haspopup="menu"]';
+     const nodeLabel = (node) =>
+@@ -697,10 +1017,223 @@
+       'avanzado', 'avancado', 'avance',
+     ];
+     const EFFORT_WORDS = [
 -      'effort', 'aufwand', '强度', '努力', '推論レベル',
 +      'effort', 'power', 'aufwand', '强度', '能力', '努力', '推論レベル',
-@@ -703,0 +889,174 @@
+       'esfuerzo', 'esforco', 'sforzo', 'inspanning', 'wysilek',
+     ];
+     const containsAny = (label, words) => words.some((word) => label.includes(word));
 +    const SLIDER_LEVEL_INDEX = {
 +      light: 1,
 +      standard: 2,
@@ -392,294 +1041,372 @@
 +          sliderControlReady: false,
 +        });
 +      }
-+      // The visual slider expands only under a trusted pointer hover. Runtime
-+      // mouse events do not trigger it, so ask the outer CDP loop to move the
-+      // real pointer over the compact view first, then click the requested stop.
++      const activeElement = document.activeElement;
++      const powerHasFocus = activeElement === control;
++      const pointerAttempts = Number(window.__oraclePowerSliderPointerAttempts ?? 0);
++      const keyboardFocusAttempts = Number(window.__oraclePowerSliderKeyboardFocusAttempts ?? 0);
++      const controlRect = control.getBoundingClientRect?.();
++      if (powerHasFocus) {
++        return {
++          status: 'slider-key-required',
++          key: state.index < targetIndex ? 'ArrowRight' : 'ArrowLeft',
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderFocused: true,
++          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++          diagnostic: collectPickerDiagnostic(),
++        };
++      }
++      if (keyboardFocusAttempts < 4) {
++        window.__oraclePowerSliderKeyboardFocusAttempts = keyboardFocusAttempts + 1;
++        if (!menu.contains?.(activeElement)) {
++          try { menu.focus?.({ preventScroll: true }); } catch {}
++        }
++        return {
++          status: 'slider-key-required',
++          key: 'ArrowDown',
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderFocused: false,
++          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++          diagnostic: collectPickerDiagnostic(),
++        };
++      }
++      // Prefer the slider's ARIA/keyboard path. A trusted click is used only to
++      // focus the current thumb after the menu's roving-focus keys did not land;
++      // the next probe sends an arrow key.
++      if (isVisible(control) && pointerAttempts < 2) {
++        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
++        const rect = control.getBoundingClientRect();
++        const inset = Math.min(24, rect.width * 0.1);
++        const usableWidth = Math.max(1, rect.width - (2 * inset));
++        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++        return pointerRequest(
++          'slider-click-required',
++          control,
++          rect.left + inset + (usableWidth * currentRatio),
++          rect.top + (rect.height / 2),
++          {
++            purpose: 'focus-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
++      }
++      // Some picker versions refuse focus even after trusted clicks. Keep one
++      // verified drag fallback, with both endpoints hit-tested against the slider.
 +      if (isVisible(control)) {
 +        const rect = control.getBoundingClientRect();
 +        const inset = Math.min(24, rect.width * 0.1);
 +        const usableWidth = Math.max(1, rect.width - (2 * inset));
 +        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
 +        const targetRatio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
-+        return {
-+          status: 'slider-drag-required',
-+          x: rect.left + inset + (usableWidth * currentRatio),
-+          y: rect.top + (rect.height / 2),
-+          clickX: rect.left + inset + (usableWidth * targetRatio),
-+          clickY: rect.top + (rect.height / 2),
-+          sliderPosition: String(state.index) + '/' + String(state.total),
-+          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
-+          diagnostic: collectPickerDiagnostic(),
-+        };
++        return pointerRequest(
++          'slider-drag-required',
++          control,
++          rect.left + inset + (usableWidth * currentRatio),
++          rect.top + (rect.height / 2),
++          {
++            clickX: rect.left + inset + (usableWidth * targetRatio),
++            clickY: rect.top + (rect.height / 2),
++            purpose: 'drag-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
 +      }
-+      const activeElement = document.activeElement;
-+      const powerHasFocus = activeElement === control;
-+      const pointerAttempts = Number(window.__oraclePowerSliderPointerAttempts ?? 0);
-+      const controlRect = control.getBoundingClientRect?.();
 +      if (controlRect && controlRect.width > 0 && !powerHasFocus && pointerAttempts < 2) {
 +        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
-+        const inset = Math.min(24, controlRect.width * 0.1);
-+        const usableWidth = Math.max(1, controlRect.width - (2 * inset));
-+        const ratio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
-+        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
-+        return {
-+          status: 'slider-hover-required',
-+          x: controlRect.left + (controlRect.width / 2),
-+          y: controlRect.top + 1,
-+          clickX: controlRect.left + inset + (usableWidth * ratio),
-+          clickY: controlRect.top + 16,
-+          dragStartX: controlRect.left + inset + (usableWidth * currentRatio),
-+          dragStartY: controlRect.top + 16,
-+          sliderPosition: String(state.index) + '/' + String(state.total),
-+          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+          diagnostic: collectPickerDiagnostic(),
-+        };
++        const viewRect = state.view.getBoundingClientRect();
++        return pointerRequest(
++          'slider-hover-required',
++          state.view,
++          viewRect.left + (viewRect.width / 2),
++          viewRect.top + (viewRect.height / 2),
++          {
++            purpose: 'activate-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
 +      }
-+      if (!powerHasFocus && !menu.contains?.(activeElement)) {
-+        try { menu.focus?.({ preventScroll: true }); } catch {}
-+      }
-+      return {
-+        status: 'slider-key-required',
-+        // Radix keeps focus on the menu root when it opens and redirects direct
-+        // script focus calls. Trusted ArrowDown events follow its roving-focus
-+        // order to the Power row; only then do horizontal keys adjust the slider.
-+        key: powerHasFocus
-+          ? (state.index < targetIndex ? 'ArrowRight' : 'ArrowLeft')
-+          : 'ArrowDown',
++      return failure('selection-unverified', {
 +        sliderPosition: String(state.index) + '/' + String(state.total),
 +        requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+        sliderFocused: powerHasFocus,
-+        initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++        sliderFocused: false,
 +        diagnostic: collectPickerDiagnostic(),
-+      };
++      });
 +    };
-@@ -857,0 +1217,6 @@
+     const findAdvancedToggle = (menu) => {
+       for (const item of (menu || document).querySelectorAll('[role="menuitem"]')) {
+         if (!isVisible(item)) continue;
+@@ -855,6 +1388,12 @@
+     };
+     const legacyEffortOwnerIsReady = () => {
+       if (
 +        SLIDER_LEVEL_INDEX[TARGET_LEVEL] &&
 +        isVisible(document.querySelector(INTELLIGENCE_MENU_SELECTOR))
 +      ) {
 +        return true;
 +      }
 +      if (
-@@ -922,0 +1288,4 @@
+         TARGET_MODEL_KIND === 'pro' &&
+         TARGET_LEVEL === 'extended' &&
+         isVisible(document.querySelector(INTELLIGENCE_MENU_SELECTOR))
+@@ -920,6 +1459,10 @@
+       while (performance.now() < deadline) {
+         const menu = findVisibleEffortMenu(composerEffortPill);
+         if (menu) {
 +          const powerSliderResult = await selectEffortFromPowerSlider(menu);
 +          if (powerSliderResult) {
 +            return powerSliderResult;
 +          }
-@@ -1037,2 +1406,10 @@
+           const proEffortResult = await selectProEffortFromSubmenu();
+           if (proEffortResult) {
+             return proEffortResult;
+@@ -1034,8 +1577,22 @@
+       modelBtn.getAttribute('aria-expanded') !== 'true' &&
+       !legacyEffortOwnerIsReady()
+     ) {
 -      dispatchClickSequence(modelBtn);
 -      await sleep(INITIAL_WAIT_MS);
 +      // The slider only mounts its interactive thumb after a trusted click on
 +      // the composer pill. Ask the outer CDP loop to perform that click instead
 +      // of opening this picker with synthetic DOM events.
 +      const rect = modelBtn.getBoundingClientRect();
-+      return {
-+        status: 'slider-click-required',
-+        x: rect.left + (rect.width / 2),
-+        y: rect.top + (rect.height / 2),
-+        purpose: 'open-effort-picker',
-+      };
-@@ -1040,0 +1418,5 @@
++      return pointerRequest(
++        'slider-click-required',
++        modelBtn,
++        rect.left + (rect.width / 2),
++        rect.top + (rect.height / 2),
++        { purpose: 'open-effort-picker' },
++      );
++    }
++
 +    const powerSliderResult = await selectEffortFromPowerSlider(findVisibleEffortMenu(modelBtn));
 +    if (powerSliderResult) {
 +      return powerSliderResult;
-+    }
-+
---- a/dist/src/browser/actions/attachments.js
-+++ b/dist/src/browser/actions/attachments.js
-@@ -1463,2 +1463,6 @@
--                // Don't treat disabled button as complete - wait for it to become 'ready'.
--                // The spinner detection is unreliable, so a disabled button likely means upload is in progress.
-+                // 附件上传发生在 prompt 写入之前；此时发送按钮会因为编辑器为空而保持 disabled。
-+                // 文件名已稳定匹配且页面明确没有上传状态时，附件阶段已经完成，发送按钮应由后续
-+                // prompt 提交阶段单独校验。否则会把“空编辑器”误判为“仍在上传”。
-+                if (stable && !value.uploading && (value.filesAttached || fileCountSatisfied)) {
-+                    return;
-+                }
---- a/dist/src/browser/actions/promptComposer.js
-+++ b/dist/src/browser/actions/promptComposer.js
-@@ -57 +57,13 @@
--      const preferred = candidates.find((node) => isVisible(node)) || candidates[0];
-+      const isEditable = (node) =>
-+        node instanceof HTMLTextAreaElement ||
-+        node instanceof HTMLInputElement ||
-+        node.isContentEditable ||
-+        node.getAttribute?.('contenteditable') === 'true';
-+      const active = document.activeElement;
-+      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
-+      const preferred =
-+        (isVisible(primary) && isEditable(primary) ? primary : null) ||
-+        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
-+        candidates.find((node) => isVisible(node) && isEditable(node)) ||
-+        candidates.find((node) => isVisible(node)) ||
-+        candidates[0];
-@@ -59 +71,6 @@
--        return { focused: true };
-+        const rect = preferred.getBoundingClientRect();
-+        return {
-+          focused: true,
-+          x: rect.left + rect.width / 2,
-+          y: rect.top + rect.height / 2,
-+        };
-@@ -70 +87,5 @@
--    await input.insertText({ text: prompt });
-+    const focusPoint = focusResult.result.value;
-+    if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
-+        await clickTrustedPoint(runtime, input, focusPoint.x, focusPoint.y);
-+    }
-+    await input.insertText({ text: prompt });
-@@ -172,10 +184 @@
--        await input.dispatchKeyEvent({
--            type: "keyDown",
--            ...ENTER_KEY_EVENT,
--            text: ENTER_KEY_TEXT,
--            unmodifiedText: ENTER_KEY_TEXT,
--        });
--        await input.dispatchKeyEvent({
--            type: "keyUp",
--            ...ENTER_KEY_EVENT,
--        });
-+        await submitViaEnter(runtime, input);
-@@ -185,0 +189,8 @@
-+        // CDP can deliver a trusted mouse sequence without ChatGPT accepting the action.
-+        // Only retry when the composer still contains the prompt and no submission signal
-+        // appears, which avoids duplicating a click that actually succeeded.
-+        const clickStartedSubmission = await waitForSubmissionStart(runtime, deps.baselineTurns ?? undefined, 3_000);
-+        if (!clickStartedSubmission) {
-+            await submitViaEnter(runtime, input);
-+            logger("Send button produced no submission state; retried once via Enter key");
+     }
+
+     // ---------- COMPATIBILITY UI: unified "Intelligence" effort picker ----------
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/index.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/index.js
+--- a/dist/src/browser/index.js	1985-10-26 16:15:00
++++ b/dist/src/browser/index.js	2026-09-04 09:12:04
+@@ -296,6 +296,31 @@
+  * window swallows the click while the automation still believes it clicked.
+  * Soft-fails: focus emulation is an optimization, never a hard requirement.
+  */
++async function stabilizeChromeWindow(client, logger) {
++    const width = 1280;
++    const height = 720;
++    try {
++        const { windowId } = await client.Browser.getWindowForTarget();
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { windowState: "normal" },
++        });
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { width, height },
++        });
++        const observed = await client.Browser.getWindowBounds({ windowId });
++        const bounds = observed?.bounds;
++        if (bounds?.windowState !== "normal" || bounds.width !== width || bounds.height !== height) {
++            throw new Error(`observed ${bounds?.width ?? "?"}x${bounds?.height ?? "?"} (${bounds?.windowState ?? "unknown"})`);
 +        }
-@@ -191,0 +203,45 @@
-+async function submitViaEnter(Runtime, Input) {
-+    const focus = await Runtime.evaluate({
-+        expression: `(() => {
-+      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
-+      const isVisible = (node) => {
-+        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-+        const rect = node.getBoundingClientRect();
-+        return rect.width > 0 && rect.height > 0;
-+      };
-+      const isEditable = (node) =>
-+        node instanceof HTMLTextAreaElement ||
-+        node instanceof HTMLInputElement ||
-+        node.isContentEditable ||
-+        node.getAttribute?.('contenteditable') === 'true';
-+      const candidates = selectors
-+        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-+        .filter((node, index, all) => all.indexOf(node) === index);
-+      const active = document.activeElement;
-+      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
-+      const editor =
-+        (isVisible(primary) && isEditable(primary) ? primary : null) ||
-+        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
-+        candidates.find((node) => isVisible(node) && isEditable(node));
-+      if (!editor) return null;
-+      editor.focus?.();
-+      const rect = editor.getBoundingClientRect();
-+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-+    })()`,
-+        returnByValue: true,
-+    });
-+    const point = focus.result?.value;
-+    if (point && typeof point.x === "number" && typeof point.y === "number") {
-+        await clickTrustedPoint(Runtime, Input, point.x, point.y);
++        logger(`Chrome window fixed at ${width}x${height}`);
 +    }
-+    await Input.dispatchKeyEvent({
-+        type: "keyDown",
-+        ...ENTER_KEY_EVENT,
-+        text: ENTER_KEY_TEXT,
-+        unmodifiedText: ENTER_KEY_TEXT,
-+    });
-+    await Input.dispatchKeyEvent({
-+        type: "keyUp",
-+        ...ENTER_KEY_EVENT,
-+    });
++    catch (error) {
++        const message = error instanceof Error ? error.message : String(error);
++        throw new Error(`Failed to set stable Chrome window bounds: ${message}`);
++    }
 +}
-@@ -607,2 +672,3 @@
--    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
--    if (!button) return { status: 'missing' };
-+    const visibleCandidates = candidates.filter((node) => isVisible(node));
-+    const button = visibleCandidates.find((node) => isEnabled(node)) || null;
-+    if (!button) return { status: visibleCandidates.length > 0 ? 'disabled' : 'missing' };
-@@ -648 +705,3 @@
--            break;
-+            // Attachment readiness was verified above. Let the caller use its
-+            // existing one-shot Enter fallback, then verify a committed turn.
-+            return false;
-@@ -649,0 +709,7 @@
-+        if (status === "disabled") {
-+            if (!needAttachment) {
-+                return false;
-+            }
-+            await delay(150);
-+            continue;
+ async function enableFocusEmulation(client, logger, label) {
+     try {
+         await client.Emulation.setFocusEmulationEnabled({ enabled: true });
+@@ -741,6 +766,9 @@
+             chromePort: chrome.port,
+         });
+     }
++    // Persist the owned runtime before navigation so even an early page-load
++    // failure can be audited and cleaned by exact PID/Profile identity.
++    await emitRuntimeHint();
+     let removeTerminationHooks = null;
+     try {
+         removeTerminationHooks = registerTerminationHooks(chrome, userDataDir, effectiveKeepBrowser, logger, {
+@@ -853,6 +881,7 @@
+             domainEnablers.push(DOM.enable());
+         }
+         await Promise.all(domainEnablers);
++        await stabilizeChromeWindow(client, logger);
+         if (!config.headless && config.hideWindow) {
+             await positionChromeWindowOffscreen(client, logger);
+         }
+@@ -1078,8 +1107,9 @@
+         // Handle thinking time selection if specified. Deep Research owns its own effort flow.
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {
+@@ -1107,6 +1137,7 @@
+             await handle.release().catch(() => undefined);
+         };
+         const submitOnce = async (prompt, submissionAttachments) => {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+             const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
+             const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
+@@ -2397,7 +2428,7 @@
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/profileCopy.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/profileCopy.js
+--- a/dist/src/browser/profileCopy.js	1985-10-26 16:15:00
++++ b/dist/src/browser/profileCopy.js	2026-09-04 08:58:12
+@@ -1,5 +1,5 @@
+ import { spawn } from "node:child_process";
+-import { cp, mkdir, readFile, rm } from "node:fs/promises";
++import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+ import path from "node:path";
+ /**
+  * Cache/derived subdirectories that bloat the copy and carry no signed-in-session
+@@ -52,13 +52,19 @@
+             args.push("--exclude", exclude);
+         }
+         args.push(`${srcProfile}/`, `${destProfile}/`);
+-        await new Promise((resolve, reject) => {
++        const rsyncExitCode = await new Promise((resolve, reject) => {
+             const child = spawn("rsync", args, { stdio: "ignore" });
+             child.on("error", (err) => reject(new Error(`--copy-profile requires rsync on PATH (spawn failed): ${err.message}`)));
+-            child.on("close", (code) => code === 0 || code === 24
+-                ? resolve()
+-                : reject(new Error(`rsync failed copying Chrome profile (exit ${code})`)));
++            child.on("close", (code) => resolve(code));
+         });
++        const partialCopyHasSessionMaterial = rsyncExitCode === 23 && (await hasCopiedCookieDatabase(destProfile));
++        if (rsyncExitCode !== 0 && rsyncExitCode !== 24 && !partialCopyHasSessionMaterial) {
++            throw new Error(`rsync failed copying Chrome profile (exit ${rsyncExitCode})`);
 +        }
-@@ -664,3 +722,2 @@
--        await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
--        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
--        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-+        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
-+        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
-@@ -678,0 +736,36 @@
-+async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
-+    const deadline = Date.now() + timeoutMs;
-+    const baseline = typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
-+        ? Math.max(0, Math.floor(baselineTurns))
-+        : -1;
-+    const expression = `(() => {
-+    const selectors = ${JSON.stringify(INPUT_SELECTORS)};
-+    const isVisible = (node) => {
-+      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-+      const rect = node.getBoundingClientRect();
-+      return rect.width > 0 && rect.height > 0;
-+    };
-+    const readValue = (node) => {
-+      if (!node) return '';
-+      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) return node.value ?? '';
-+      return node.innerText ?? node.textContent ?? '';
-+    };
-+    const inputs = selectors
-+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-+      .filter((node, index, all) => all.indexOf(node) === index && isVisible(node));
-+    const composerEmpty = inputs.length > 0 && inputs.every((node) => !String(readValue(node)).trim());
-+    const turnsCount = ${buildConversationTurnCountExpression()};
-+    const hasNewTurn = ${JSON.stringify(baseline)} >= 0 && turnsCount > ${JSON.stringify(baseline)};
-+    const stopVisible = Boolean(document.querySelector(${JSON.stringify(STOP_BUTTON_SELECTOR)}));
-+    const inConversation = /\\/c\\//.test(location.href);
-+    return { started: composerEmpty || hasNewTurn || stopVisible || inConversation };
-+  })()`;
-+    while (Date.now() < deadline) {
-+        const { result } = await Runtime.evaluate({ expression, returnByValue: true });
-+        if (result?.value?.started) {
++        // A live Chrome profile commonly records exit_type=Crashed while it is
++        // running. The throwaway copy must not inherit that stale session marker,
++        // or every Oracle window opens with a misleading restore-pages bubble.
++        await markCopiedProfileExitedCleanly(destProfile);
+         return profileDirectory;
+     }
+     catch (error) {
+@@ -66,6 +72,33 @@
+         // session-bearing copies before surfacing setup failures.
+         await rm(destDir, { recursive: true, force: true }).catch(() => undefined);
+         throw error;
++    }
++}
++async function hasCopiedCookieDatabase(profileDir) {
++    for (const relativePath of [path.join("Network", "Cookies"), "Cookies"]) {
++        try {
++            await access(path.join(profileDir, relativePath));
 +            return true;
 +        }
-+        await delay(100);
++        catch {
++            // Continue checking legacy and current Chrome cookie locations.
++        }
 +    }
 +    return false;
 +}
---- a/dist/src/browser/reattach.js
-+++ b/dist/src/browser/reattach.js
-@@ -6 +6 @@
++async function markCopiedProfileExitedCleanly(profileDir) {
++    const preferencesPath = path.join(profileDir, "Preferences");
++    try {
++        const raw = await readFile(preferencesPath, "utf8");
++        const preferences = JSON.parse(raw);
++        preferences.profile ||= {};
++        preferences.profile.exit_type = "Normal";
++        preferences.profile.exited_cleanly = true;
++        await writeFile(preferencesPath, JSON.stringify(preferences));
++    }
++    catch {
++        // The launch flag also suppresses the bubble; a missing or temporarily
++        // unreadable Preferences file must not make profile copying fail.
+     }
+ }
+ function resolveChromeProfileDirectory(srcUserDataDir, localState, requestedProfile) {
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/reattach.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/reattach.js
+--- a/dist/src/browser/reattach.js	1985-10-26 16:15:00
++++ b/dist/src/browser/reattach.js	2026-09-04 08:58:12
+@@ -3,13 +3,14 @@
+ import path from "node:path";
+ import { mkdtemp, mkdir, rm } from "node:fs/promises";
+ import { waitForAssistantResponse, captureAssistantMarkdown, navigateToChatGPT, ensureNotBlocked, ensureLoggedIn, ensurePromptReady, waitForResumedConversationHydration, } from "./pageActions.js";
 -import { launchChrome, connectToChrome, positionChromeWindowOffscreen, connectToRemoteChromeTarget, listRemoteChromeTargets, } from "./chromeLifecycle.js";
 +import { launchChrome, connectToChrome, positionChromeWindowOffscreen, connectToRemoteChromeTarget, listRemoteChromeTargets, registerTerminationHooks, } from "./chromeLifecycle.js";
-@@ -12,0 +13 @@
+ import { resolveBrowserConfig } from "./config.js";
+ import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
+ import { CHATGPT_URL } from "./constants.js";
+ import { buildConversationTurnListExpression } from "./conversationTurns.js";
+ import { cleanupStaleProfileState } from "./profileState.js";
+ import { readDevToolsActivePortInfo } from "./detect.js";
 +import { delay } from "./utils.js";
-@@ -19,0 +21 @@
+ import { pickTarget, extractConversationIdFromUrl, buildConversationUrl, withTimeout, openConversationFromSidebar, openConversationFromSidebarWithRetry, waitForLocationChange, readConversationTurnIndex, buildPromptEchoMatcher, recoverPromptEcho, alignPromptEchoMarkdown, } from "./reattachHelpers.js";
+ import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
+ import { shouldSyncBrowserCookies } from "./policies.js";
+@@ -17,6 +18,7 @@
+     const recoverSession = deps.recoverSession ??
+         (async (runtimeMeta, configMeta) => resumeBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, deps));
+     let closeAttachedConnection = null;
 +    let cleanupAttachedRuntime = null;
-@@ -63,0 +66,6 @@
+     const closeAttached = async () => {
+         const close = closeAttachedConnection;
+         closeAttachedConnection = null;
+@@ -61,6 +63,12 @@
+             })();
+         closeAttachedConnection = () => connection.close();
+         const client = connection.client;
 +        cleanupAttachedRuntime = createAttachedRuntimeCleanup({
 +            client,
 +            runtime: liveRuntime,
 +            config,
 +            logger,
 +        });
-@@ -115,0 +124 @@
+         const { Runtime, DOM, Page } = client;
+         if (Runtime?.enable) {
+             await Runtime.enable();
+@@ -113,6 +121,7 @@
+             const researchResult = await withTimeout(waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
+                 requireScopedTargetOwner: true,
+             }), timeoutMs + 5_000, "Reattach Deep Research response timed out");
 +            await cleanupAttachedRuntime();
-@@ -126,0 +136 @@
+             await closeAttached();
+             return {
+                 answerText: researchResult.text,
+@@ -124,16 +133,78 @@
+         const recovered = await recoverPromptEcho(Runtime, answer, promptEcho, logger, minTurnIndex, timeoutMs);
+         const markdown = (await withTimeout(captureMarkdown(Runtime, recovered.meta, logger), 15_000, "Reattach markdown capture timed out")) ?? recovered.text;
+         const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 +        await cleanupAttachedRuntime();
-@@ -130,0 +141 @@
+         await closeAttached();
+         return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
+     }
+     catch (error) {
 +        await cleanupAttachedRuntime?.().catch(() => undefined);
-@@ -136,0 +148,60 @@
+         await closeAttached();
+         const message = error instanceof Error ? error.message : String(error);
+         logger(`Existing Chrome reattach failed (${message}); reopening browser to locate the session.`);
+         return recoverSession(runtime, config);
+     }
+ }
 +function createAttachedRuntimeCleanup({ client, runtime, config, logger, killProcess = terminateProcess, isProcessAlive = processIsAlive, }) {
 +    let cleanupPromise = null;
 +    return async () => {
@@ -740,7 +1467,13 @@
 +        process.kill(pid, "SIGKILL");
 +    }
 +}
-@@ -186,25 +257,38 @@
+ async function refreshAttachRuntime(runtime) {
+     if (!runtime.chromeProfileRoot) {
+         return runtime;
+@@ -183,31 +254,44 @@
+     const chromeHost = chrome && typeof chrome === "object" && "host" in chrome && typeof chrome.host === "string"
+         ? chrome.host
+         : "127.0.0.1";
 -    const client = await connectToLaunchedChrome(chrome.port, logger, chromeHost);
 -    const cleanup = async () => {
 -        if (client && typeof client.close === "function") {
@@ -804,12 +1537,18 @@
 +        removeTerminationHooks,
 +    });
 +    try {
-@@ -300,0 +385,4 @@
+     const { Network, Page, Runtime, DOM, Target } = client;
+     if (Runtime?.enable) {
+         await Runtime.enable();
+@@ -298,7 +382,36 @@
+     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
+     await cleanup();
+     return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
 +    }
 +    finally {
 +        await cleanup();
 +    }
-@@ -301,0 +390,25 @@
+ }
 +function createRecoveryCleanup({ client, chrome, userDataDir, manualLogin, keepBrowser, logger, removeTerminationHooks, }) {
 +    let cleanupPromise = null;
 +    return async () => {
@@ -835,85 +1574,13 @@
 +        return cleanupPromise;
 +    };
 +}
-@@ -335,0 +449,2 @@
+ async function readPromptPreviewTurnIndex(Runtime, promptPreview) {
+     const preview = promptPreview?.trim();
+     if (!preview) {
+@@ -333,4 +446,6 @@
+     buildConversationUrl,
+     openConversationFromSidebar,
+     readPromptPreviewTurnIndex,
 +    createRecoveryCleanup,
 +    createAttachedRuntimeCleanup,
---- a/dist/src/browser/profileCopy.js
-+++ b/dist/src/browser/profileCopy.js
-@@ -2 +2 @@
--import { cp, mkdir, readFile, rm } from "node:fs/promises";
-+import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-@@ -55 +55 @@
--        await new Promise((resolve, reject) => {
-+        const rsyncExitCode = await new Promise((resolve, reject) => {
-@@ -58,3 +58 @@
--            child.on("close", (code) => code === 0 || code === 24
--                ? resolve()
--                : reject(new Error(`rsync failed copying Chrome profile (exit ${code})`)));
-+            child.on("close", (code) => resolve(code));
-@@ -61,0 +60,8 @@
-+        const partialCopyHasSessionMaterial = rsyncExitCode === 23 && (await hasCopiedCookieDatabase(destProfile));
-+        if (rsyncExitCode !== 0 && rsyncExitCode !== 24 && !partialCopyHasSessionMaterial) {
-+            throw new Error(`rsync failed copying Chrome profile (exit ${rsyncExitCode})`);
-+        }
-+        // A live Chrome profile commonly records exit_type=Crashed while it is
-+        // running. The throwaway copy must not inherit that stale session marker,
-+        // or every Oracle window opens with a misleading restore-pages bubble.
-+        await markCopiedProfileExitedCleanly(destProfile);
-@@ -70,0 +77,27 @@
-+async function hasCopiedCookieDatabase(profileDir) {
-+    for (const relativePath of [path.join("Network", "Cookies"), "Cookies"]) {
-+        try {
-+            await access(path.join(profileDir, relativePath));
-+            return true;
-+        }
-+        catch {
-+            // Continue checking legacy and current Chrome cookie locations.
-+        }
-+    }
-+    return false;
-+}
-+async function markCopiedProfileExitedCleanly(profileDir) {
-+    const preferencesPath = path.join(profileDir, "Preferences");
-+    try {
-+        const raw = await readFile(preferencesPath, "utf8");
-+        const preferences = JSON.parse(raw);
-+        preferences.profile ||= {};
-+        preferences.profile.exit_type = "Normal";
-+        preferences.profile.exited_cleanly = true;
-+        await writeFile(preferencesPath, JSON.stringify(preferences));
-+    }
-+    catch {
-+        // The launch flag also suppresses the bubble; a missing or temporarily
-+        // unreadable Preferences file must not make profile copying fail.
-+    }
-+}
---- a/dist/src/browser/actions/navigation.js
-+++ b/dist/src/browser/actions/navigation.js
-@@ -40 +40,11 @@
--    await waitForDocumentReady(Runtime, 45_000);
-+    try {
-+        await waitForDocumentReady(Runtime, 45_000);
-+    }
-+    catch (error) {
-+        if (typeof Page.reload !== "function") {
-+            throw error;
-+        }
-+        logger("[nav] initial document readiness timed out; reloading the isolated tab once.");
-+        await Page.reload({ ignoreCache: false });
-+        await waitForDocumentReady(Runtime, 45_000);
-+    }
---- a/dist/src/browser/index.js
-+++ b/dist/src/browser/index.js
-@@ -744 +744,4 @@
--    let removeTerminationHooks = null;
-+    // Persist the owned runtime before navigation so even an early page-load
-+    // failure can be audited and cleaned by exact PID/Profile identity.
-+    await emitRuntimeHint();
-+    let removeTerminationHooks = null;
-@@ -1082 +1085 @@
--            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
-+            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
-@@ -2400 +2403 @@
--            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
-+            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+ };

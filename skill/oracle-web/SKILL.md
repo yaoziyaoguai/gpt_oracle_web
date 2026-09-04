@@ -24,6 +24,9 @@ Use the installed `oracle-web` wrapper from a desktop Codex task to send a focus
 - The wrapper defaults attachment readiness waits to 300 seconds. A caller may explicitly override `--browser-attachment-timeout` for a known environment.
 - Never race the wrapper with a manual or system-level click. A delayed successful click could otherwise submit twice.
 - A visible system Chrome automation window is expected. Do not switch to the desktop app's in-app browser.
+- Prompt insertion and file attachment use CDP text/DOM operations. The runtime uses the visible power control's ARIA state and keyboard events first; pointer events are a verified fallback, not screenshot-coordinate automation.
+- The runtime fixes its owned Chrome window at `1280x720` before critical interaction. If the viewport changes, it discards the old point, re-locates the target, and requires `elementFromPoint` to hit that target before sending pointer input.
+- Another application covering the Oracle window does not invalidate the DOM target. Do not minimize the Oracle Chrome or keep resizing it during selection/submission; Chrome can throttle or stop compositing, in which case the run must fail closed.
 
 ## Choose consultation strength
 

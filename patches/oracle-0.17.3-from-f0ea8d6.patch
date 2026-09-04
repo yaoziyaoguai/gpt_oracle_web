@@ -1,0 +1,762 @@
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/actions/promptComposer.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/promptComposer.js
+--- a/dist/src/browser/actions/promptComposer.js	2026-09-04 09:23:37
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-04 09:21:11
+@@ -71,8 +71,17 @@
+         const rect = preferred.getBoundingClientRect();
+         return {
+           focused: true,
++          kind: 'composer',
+           x: rect.left + rect.width / 2,
+           y: rect.top + rect.height / 2,
++          viewport: {
++            width: window.innerWidth,
++            height: window.innerHeight,
++            visualWidth: window.visualViewport?.width ?? window.innerWidth,
++            visualHeight: window.visualViewport?.height ?? window.innerHeight,
++            visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++            visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++          },
+         };
+       }
+       return { focused: false };
+@@ -86,7 +95,7 @@
+     }
+     const focusPoint = focusResult.result.value;
+     if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
+-        await clickTrustedPoint(runtime, input, focusPoint.x, focusPoint.y);
++        await clickTrustedPoint(runtime, input, focusPoint);
+     }
+     await input.insertText({ text: prompt });
+     // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
+@@ -235,13 +244,25 @@
+       if (!editor) return null;
+       editor.focus?.();
+       const rect = editor.getBoundingClientRect();
+-      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
++      return {
++        kind: 'composer',
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport: {
++          width: window.innerWidth,
++          height: window.innerHeight,
++          visualWidth: window.visualViewport?.width ?? window.innerWidth,
++          visualHeight: window.visualViewport?.height ?? window.innerHeight,
++          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++        },
++      };
+     })()`,
+         returnByValue: true,
+     });
+     const point = focus.result?.value;
+     if (point && typeof point.x === "number" && typeof point.y === "number") {
+-        await clickTrustedPoint(Runtime, Input, point.x, point.y);
++        await clickTrustedPoint(Runtime, Input, point);
+     }
+     await Input.dispatchKeyEvent({
+         type: "keyDown",
+@@ -644,7 +665,6 @@
+ async function attemptSendButton(Runtime, Input, _logger, attachmentNames, attachmentTimeoutMs) {
+     const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
+     const script = `(() => {
+-    ${buildClickDispatcher()}
+     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
+     const isVisible = (node) => {
+       if (!(node instanceof HTMLElement)) return false;
+@@ -675,11 +695,22 @@
+     button.scrollIntoView({ block: 'center', inline: 'center' });
+     const rect = button.getBoundingClientRect();
+     if (rect.width > 0 && rect.height > 0) {
+-      return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
++      return {
++        status: 'point',
++        kind: 'send',
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport: {
++          width: window.innerWidth,
++          height: window.innerHeight,
++          visualWidth: window.visualViewport?.width ?? window.innerWidth,
++          visualHeight: window.visualViewport?.height ?? window.innerHeight,
++          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++        },
++      };
+     }
+-    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
+-    dispatchClickSequence(button);
+-    return { status: 'clicked' };
++    return { status: 'missing' };
+   })()`;
+     // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
+     // settle slowly for multi-file uploads, but plain text sends should keep the
+@@ -704,12 +735,9 @@
+             typeof value === "object" &&
+             typeof value.x === "number" &&
+             typeof value.y === "number") {
+-            await clickTrustedPoint(Runtime, Input, value.x, value.y);
++            await clickTrustedPoint(Runtime, Input, value);
+             return true;
+         }
+-        if (status === "clicked") {
+-            return true;
+-        }
+         if (status === "missing") {
+             // Attachment readiness was verified above. Let the caller use its
+             // existing one-shot Enter fallback, then verify a committed turn.
+@@ -734,20 +762,130 @@
+     }
+     return false;
+ }
+-async function clickTrustedPoint(Runtime, Input, x, y) {
+-    if (Input && typeof Input.dispatchMouseEvent === "function") {
++function buildTrustedPointExpression(kind) {
++    return `(() => {
++      const kind = ${JSON.stringify(kind)};
++      const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const sendSelectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
++      const isVisible = (node) => {
++        if (!(node instanceof HTMLElement)) return false;
++        const rect = node.getBoundingClientRect();
++        if (rect.width <= 0 || rect.height <= 0) return false;
++        const style = window.getComputedStyle(node);
++        return style.display !== 'none' && style.visibility !== 'hidden';
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const isEnabled = (node) => {
++        const style = window.getComputedStyle(node);
++        return !(
++          node.hasAttribute('disabled') ||
++          node.getAttribute('aria-disabled') === 'true' ||
++          node.getAttribute('data-disabled') === 'true' ||
++          style.pointerEvents === 'none'
++        );
++      };
++      let target = null;
++      if (kind === 'composer') {
++        const candidates = inputSelectors
++          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++          .filter((node, index, all) => all.indexOf(node) === index);
++        const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++        target =
++          (isVisible(primary) && isEditable(primary) ? primary : null) ||
++          candidates.find((node) => node === document.activeElement && isVisible(node) && isEditable(node)) ||
++          candidates.find((node) => isVisible(node) && isEditable(node)) ||
++          null;
++      } else if (kind === 'send') {
++        const candidates = sendSelectors
++          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++          .filter((node, index, all) => all.indexOf(node) === index);
++        target = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
++        target?.scrollIntoView?.({ block: 'center', inline: 'center' });
++      }
++      if (!target) return { status: 'missing', kind };
++      const rect = target.getBoundingClientRect();
++      const x = rect.left + rect.width / 2;
++      const y = rect.top + rect.height / 2;
++      const hit = document.elementFromPoint(x, y);
++      const viewport = {
++        width: window.innerWidth,
++        height: window.innerHeight,
++        visualWidth: window.visualViewport?.width ?? window.innerWidth,
++        visualHeight: window.visualViewport?.height ?? window.innerHeight,
++        visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++        visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++      };
++      if (!(hit instanceof Node) || !(target === hit || target.contains(hit))) {
++        return { status: 'target-mismatch', kind, x, y, viewport };
++      }
++      return { status: 'point', kind, x, y, viewport };
++    })()`;
++}
++function sameViewport(left, right) {
++    if (!left || !right)
++        return false;
++    return left.width === right.width &&
++        left.height === right.height &&
++        left.visualWidth === right.visualWidth &&
++        left.visualHeight === right.visualHeight &&
++        left.visualOffsetLeft === right.visualOffsetLeft &&
++        left.visualOffsetTop === right.visualOffsetTop;
++}
++async function clickTrustedPoint(Runtime, Input, target) {
++    let expectedViewport = target?.viewport;
++    const kind = target?.kind;
++    if (kind !== "composer" && kind !== "send") {
++        throw new BrowserAutomationError("Trusted click target was not identified.", {
++            stage: "submit-prompt",
++            code: "trusted-target-unidentified",
++        });
++    }
++    for (let attempt = 0; attempt < 3; attempt += 1) {
++        const { result } = await Runtime.evaluate({
++            expression: buildTrustedPointExpression(kind),
++            returnByValue: true,
++        });
++        const point = result?.value;
++        if (point?.status !== "point") {
++            throw new BrowserAutomationError(`Trusted ${kind} target failed hit testing (${point?.status ?? "unknown"}).`, {
++                stage: "submit-prompt",
++                code: "trusted-target-mismatch",
++                kind,
++                status: point?.status ?? "unknown",
++            });
++        }
++        if (!sameViewport(expectedViewport, point.viewport)) {
++            expectedViewport = point.viewport;
++            continue;
++        }
++        const x = Number(point.x);
++        const y = Number(point.y);
++        if (!Number.isFinite(x) || !Number.isFinite(y)) {
++            throw new BrowserAutomationError(`Trusted ${kind} target returned invalid coordinates.`, {
++                stage: "submit-prompt",
++                code: "trusted-target-invalid-point",
++                kind,
++            });
++        }
++        if (!Input || typeof Input.dispatchMouseEvent !== "function") {
++            throw new BrowserAutomationError(`Trusted ${kind} target requires CDP pointer input.`, {
++                stage: "submit-prompt",
++                code: "trusted-input-unavailable",
++                kind,
++            });
++        }
+         await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+         await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+         return;
+     }
+-    await Runtime.evaluate({
+-        expression: `(() => {
+-      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+-      if (!(el instanceof HTMLElement)) return false;
+-      el.click();
+-      return true;
+-    })()`,
+-        returnByValue: true,
++    throw new BrowserAutomationError(`Trusted ${kind} target kept moving after a window resize.`, {
++        stage: "submit-prompt",
++        code: "trusted-target-resized",
++        kind,
+     });
+ }
+ async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/actions/thinkingTime.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/thinkingTime.js
+--- a/dist/src/browser/actions/thinkingTime.js	2026-09-04 09:23:37
++++ b/dist/src/browser/actions/thinkingTime.js	2026-09-04 09:21:04
+@@ -147,6 +147,40 @@
+         return false;
+     }
+ }
++function isThinkingPointerAction(result) {
++    return result?.status === "slider-click-required" ||
++        result?.status === "slider-drag-required" ||
++        result?.status === "slider-hover-required";
++}
++function sameThinkingViewport(left, right) {
++    if (!left || !right)
++        return false;
++    return left.width === right.width &&
++        left.height === right.height &&
++        left.visualWidth === right.visualWidth &&
++        left.visualHeight === right.visualHeight &&
++        left.visualOffsetLeft === right.visualOffsetLeft &&
++        left.visualOffsetTop === right.visualOffsetTop;
++}
++async function refreshThinkingPointerAction(Runtime, level, desiredModel, previous) {
++    const outcome = await Runtime.evaluate({
++        expression: buildThinkingTimeExpression(level, desiredModel),
++        awaitPromise: true,
++        returnByValue: true,
++    });
++    const current = outcome.result?.value;
++    if (!isThinkingPointerAction(current) ||
++        current.status !== previous.status ||
++        current.purpose !== previous.purpose ||
++        !sameThinkingViewport(previous.viewport, current.viewport)) {
++        return { status: "retry", result: current };
++    }
++    if (current.hitTargetMatches !== true ||
++        (current.status === "slider-drag-required" && current.destinationHitTargetMatches !== true)) {
++        return { status: "blocked", result: current };
++    }
++    return { status: "ready", result: current };
++}
+ async function evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input) {
+     let lastResult;
+     for (let attempt = 0; attempt < 16; attempt += 1) {
+@@ -156,10 +190,7 @@
+             returnByValue: true,
+         });
+         lastResult = outcome.result?.value;
+-        if (lastResult?.status !== "slider-key-required" &&
+-            lastResult?.status !== "slider-click-required" &&
+-            lastResult?.status !== "slider-drag-required" &&
+-            lastResult?.status !== "slider-hover-required") {
++        if (lastResult?.status !== "slider-key-required" && !isThinkingPointerAction(lastResult)) {
+             return lastResult;
+         }
+         if (!Input || typeof Input.dispatchKeyEvent !== "function") {
+@@ -169,80 +200,136 @@
+                 sliderInputAvailable: false,
+             };
+         }
+-        if (lastResult.status === "slider-click-required" ||
+-            lastResult.status === "slider-drag-required" ||
+-            lastResult.status === "slider-hover-required") {
+-            const x = Number(lastResult.x);
+-            const y = Number(lastResult.y);
++        if (isThinkingPointerAction(lastResult)) {
++            if (typeof Input.dispatchMouseEvent !== "function") {
++                return {
++                    ...lastResult,
++                    status: "selection-unverified",
++                    sliderPointerAvailable: false,
++                };
++            }
++            let refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, lastResult);
++            if (refreshed.status === "retry") {
++                lastResult = refreshed.result;
++                continue;
++            }
++            if (refreshed.status === "blocked") {
++                return {
++                    ...refreshed.result,
++                    status: "selection-unverified",
++                    pointerTargetVerified: false,
++                };
++            }
++            let action = refreshed.result;
++            const x = Number(action.x);
++            const y = Number(action.y);
+             if (!Number.isFinite(x) || !Number.isFinite(y)) {
+-                return { ...lastResult, status: "selection-unverified" };
++                return { ...action, status: "selection-unverified" };
+             }
+             await Input.dispatchMouseEvent({ type: "mouseMoved", x, y: y - 20 });
+             await new Promise((resolve) => setTimeout(resolve, 100));
+             await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+-            if (lastResult.status === "slider-click-required") {
++            refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
++            if (refreshed.status === "retry") {
++                lastResult = refreshed.result;
++                continue;
++            }
++            if (refreshed.status === "blocked") {
++                return {
++                    ...refreshed.result,
++                    status: "selection-unverified",
++                    pointerTargetVerified: false,
++                };
++            }
++            action = refreshed.result;
++            const actionX = Number(action.x);
++            const actionY = Number(action.y);
++            if (!Number.isFinite(actionX) || !Number.isFinite(actionY)) {
++                return { ...action, status: "selection-unverified" };
++            }
++            if (action.status === "slider-click-required") {
+                 await Input.dispatchMouseEvent({
+                     type: "mousePressed",
+-                    x,
+-                    y,
++                    x: actionX,
++                    y: actionY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+                 await Input.dispatchMouseEvent({
+                     type: "mouseReleased",
+-                    x,
+-                    y,
++                    x: actionX,
++                    y: actionY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+             }
+-            else if (lastResult.status === "slider-drag-required") {
+-                const targetX = Number(lastResult.clickX);
+-                const targetY = Number(lastResult.clickY);
++            else if (action.status === "slider-drag-required") {
++                const targetX = Number(action.clickX);
++                const targetY = Number(action.clickY);
+                 if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
+-                    return { ...lastResult, status: "selection-unverified" };
++                    return { ...action, status: "selection-unverified" };
+                 }
+                 // ChatGPT's slider ignores a drag until its visual thumb has first
+                 // received a standalone trusted click. Activate the thumb, then
+                 // start a separate drag to the requested stop.
+                 await Input.dispatchMouseEvent({
+                     type: "mousePressed",
+-                    x,
+-                    y,
++                    x: actionX,
++                    y: actionY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+                 await Input.dispatchMouseEvent({
+                     type: "mouseReleased",
+-                    x,
+-                    y,
++                    x: actionX,
++                    y: actionY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+                 await new Promise((resolve) => setTimeout(resolve, 150));
++                refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
++                if (refreshed.status !== "ready") {
++                    lastResult = refreshed.result;
++                    if (refreshed.status === "blocked") {
++                        return {
++                            ...refreshed.result,
++                            status: "selection-unverified",
++                            pointerTargetVerified: false,
++                        };
++                    }
++                    continue;
++                }
++                action = refreshed.result;
++                const dragStartX = Number(action.x);
++                const dragStartY = Number(action.y);
++                const dragTargetX = Number(action.clickX);
++                const dragTargetY = Number(action.clickY);
++                if (![dragStartX, dragStartY, dragTargetX, dragTargetY].every(Number.isFinite)) {
++                    return { ...action, status: "selection-unverified" };
++                }
+                 await Input.dispatchMouseEvent({
+                     type: "mousePressed",
+-                    x,
+-                    y,
++                    x: dragStartX,
++                    y: dragStartY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+                 await Input.dispatchMouseEvent({
+                     type: "mouseMoved",
+-                    x: (x + targetX) / 2,
+-                    y: (y + targetY) / 2,
++                    x: (dragStartX + dragTargetX) / 2,
++                    y: (dragStartY + dragTargetY) / 2,
+                     button: "left",
+                 });
+                 await Input.dispatchMouseEvent({
+                     type: "mouseMoved",
+-                    x: targetX,
+-                    y: targetY,
++                    x: dragTargetX,
++                    y: dragTargetY,
+                     button: "left",
+                 });
+                 await Input.dispatchMouseEvent({
+                     type: "mouseReleased",
+-                    x: targetX,
+-                    y: targetY,
++                    x: dragTargetX,
++                    y: dragTargetY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+@@ -254,15 +341,15 @@
+                 // before starting a separate drag.
+                 await Input.dispatchMouseEvent({
+                     type: "mousePressed",
+-                    x,
+-                    y,
++                    x: actionX,
++                    y: actionY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+                 await Input.dispatchMouseEvent({
+                     type: "mouseReleased",
+-                    x,
+-                    y,
++                    x: actionX,
++                    y: actionY,
+                     button: "left",
+                     clickCount: 1,
+                 });
+@@ -290,7 +377,7 @@
+                 nativeVirtualKeyCode: virtualKeyCode,
+             });
+         }
+-        await new Promise((resolve) => setTimeout(resolve, lastResult.status === "slider-hover-required" ? 500 : 200));
++        await new Promise((resolve) => setTimeout(resolve, lastResult?.status === "slider-hover-required" ? 500 : 200));
+     }
+     return {
+         ...lastResult,
+@@ -342,6 +429,34 @@
+     const INTELLIGENCE_WAIT_MS = 2500;
+
+     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++    const viewportSnapshot = () => ({
++      width: window.innerWidth,
++      height: window.innerHeight,
++      visualWidth: window.visualViewport?.width ?? window.innerWidth,
++      visualHeight: window.visualViewport?.height ?? window.innerHeight,
++      visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++      visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++    });
++    const pointerRequest = (status, target, x, y, extra = {}) => {
++      const hit = document.elementFromPoint(x, y);
++      const destinationX = Number(extra.clickX);
++      const destinationY = Number(extra.clickY);
++      const destinationHit = Number.isFinite(destinationX) && Number.isFinite(destinationY)
++        ? document.elementFromPoint(destinationX, destinationY)
++        : null;
++      return {
++        status,
++        x,
++        y,
++        ...extra,
++        viewport: viewportSnapshot(),
++        hitTargetMatches: Boolean(hit && (target === hit || target?.contains?.(hit))),
++        destinationHitTargetMatches:
++          destinationHit === null
++            ? null
++            : Boolean(destinationHit && (target === destinationHit || target?.contains?.(destinationHit))),
++      };
++    };
+     // Keep CJK characters, including Japanese kana, so localized labels survive
+     // normalization before being matched against LEVEL_TOKENS and picker controls.
+     const normalize = (value) => (value || '')
+@@ -1018,67 +1133,106 @@
+           sliderControlReady: false,
+         });
+       }
+-      // The visual slider expands only under a trusted pointer hover. Runtime
+-      // mouse events do not trigger it, so ask the outer CDP loop to move the
+-      // real pointer over the compact view first, then click the requested stop.
+-      if (isVisible(control)) {
+-        const rect = control.getBoundingClientRect();
+-        const inset = Math.min(24, rect.width * 0.1);
+-        const usableWidth = Math.max(1, rect.width - (2 * inset));
+-        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
+-        const targetRatio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
++      const activeElement = document.activeElement;
++      const powerHasFocus = activeElement === control;
++      const pointerAttempts = Number(window.__oraclePowerSliderPointerAttempts ?? 0);
++      const keyboardFocusAttempts = Number(window.__oraclePowerSliderKeyboardFocusAttempts ?? 0);
++      const controlRect = control.getBoundingClientRect?.();
++      if (powerHasFocus) {
+         return {
+-          status: 'slider-drag-required',
+-          x: rect.left + inset + (usableWidth * currentRatio),
+-          y: rect.top + (rect.height / 2),
+-          clickX: rect.left + inset + (usableWidth * targetRatio),
+-          clickY: rect.top + (rect.height / 2),
++          status: 'slider-key-required',
++          key: state.index < targetIndex ? 'ArrowRight' : 'ArrowLeft',
+           sliderPosition: String(state.index) + '/' + String(state.total),
+           requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderFocused: true,
+           initialSliderPosition: String(initialIndex) + '/' + String(state.total),
+           diagnostic: collectPickerDiagnostic(),
+         };
+       }
+-      const activeElement = document.activeElement;
+-      const powerHasFocus = activeElement === control;
+-      const pointerAttempts = Number(window.__oraclePowerSliderPointerAttempts ?? 0);
+-      const controlRect = control.getBoundingClientRect?.();
+-      if (controlRect && controlRect.width > 0 && !powerHasFocus && pointerAttempts < 2) {
+-        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
+-        const inset = Math.min(24, controlRect.width * 0.1);
+-        const usableWidth = Math.max(1, controlRect.width - (2 * inset));
+-        const ratio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
+-        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++      if (keyboardFocusAttempts < 4) {
++        window.__oraclePowerSliderKeyboardFocusAttempts = keyboardFocusAttempts + 1;
++        if (!menu.contains?.(activeElement)) {
++          try { menu.focus?.({ preventScroll: true }); } catch {}
++        }
+         return {
+-          status: 'slider-hover-required',
+-          x: controlRect.left + (controlRect.width / 2),
+-          y: controlRect.top + 1,
+-          clickX: controlRect.left + inset + (usableWidth * ratio),
+-          clickY: controlRect.top + 16,
+-          dragStartX: controlRect.left + inset + (usableWidth * currentRatio),
+-          dragStartY: controlRect.top + 16,
++          status: 'slider-key-required',
++          key: 'ArrowDown',
+           sliderPosition: String(state.index) + '/' + String(state.total),
+           requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderFocused: false,
++          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
+           diagnostic: collectPickerDiagnostic(),
+         };
+       }
+-      if (!powerHasFocus && !menu.contains?.(activeElement)) {
+-        try { menu.focus?.({ preventScroll: true }); } catch {}
++      // Prefer the slider's ARIA/keyboard path. A trusted click is used only to
++      // focus the current thumb after the menu's roving-focus keys did not land;
++      // the next probe sends an arrow key.
++      if (isVisible(control) && pointerAttempts < 2) {
++        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
++        const rect = control.getBoundingClientRect();
++        const inset = Math.min(24, rect.width * 0.1);
++        const usableWidth = Math.max(1, rect.width - (2 * inset));
++        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++        return pointerRequest(
++          'slider-click-required',
++          control,
++          rect.left + inset + (usableWidth * currentRatio),
++          rect.top + (rect.height / 2),
++          {
++            purpose: 'focus-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
+       }
+-      return {
+-        status: 'slider-key-required',
+-        // Radix keeps focus on the menu root when it opens and redirects direct
+-        // script focus calls. Trusted ArrowDown events follow its roving-focus
+-        // order to the Power row; only then do horizontal keys adjust the slider.
+-        key: powerHasFocus
+-          ? (state.index < targetIndex ? 'ArrowRight' : 'ArrowLeft')
+-          : 'ArrowDown',
++      // Some picker versions refuse focus even after trusted clicks. Keep one
++      // verified drag fallback, with both endpoints hit-tested against the slider.
++      if (isVisible(control)) {
++        const rect = control.getBoundingClientRect();
++        const inset = Math.min(24, rect.width * 0.1);
++        const usableWidth = Math.max(1, rect.width - (2 * inset));
++        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++        const targetRatio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
++        return pointerRequest(
++          'slider-drag-required',
++          control,
++          rect.left + inset + (usableWidth * currentRatio),
++          rect.top + (rect.height / 2),
++          {
++            clickX: rect.left + inset + (usableWidth * targetRatio),
++            clickY: rect.top + (rect.height / 2),
++            purpose: 'drag-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
++      }
++      if (controlRect && controlRect.width > 0 && !powerHasFocus && pointerAttempts < 2) {
++        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
++        const viewRect = state.view.getBoundingClientRect();
++        return pointerRequest(
++          'slider-hover-required',
++          state.view,
++          viewRect.left + (viewRect.width / 2),
++          viewRect.top + (viewRect.height / 2),
++          {
++            purpose: 'activate-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
++      }
++      return failure('selection-unverified', {
+         sliderPosition: String(state.index) + '/' + String(state.total),
+         requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
+-        sliderFocused: powerHasFocus,
+-        initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++        sliderFocused: false,
+         diagnostic: collectPickerDiagnostic(),
+-      };
++      });
+     };
+     const findAdvancedToggle = (menu) => {
+       for (const item of (menu || document).querySelectorAll('[role="menuitem"]')) {
+@@ -1427,12 +1581,13 @@
+       // the composer pill. Ask the outer CDP loop to perform that click instead
+       // of opening this picker with synthetic DOM events.
+       const rect = modelBtn.getBoundingClientRect();
+-      return {
+-        status: 'slider-click-required',
+-        x: rect.left + (rect.width / 2),
+-        y: rect.top + (rect.height / 2),
+-        purpose: 'open-effort-picker',
+-      };
++      return pointerRequest(
++        'slider-click-required',
++        modelBtn,
++        rect.left + (rect.width / 2),
++        rect.top + (rect.height / 2),
++        { purpose: 'open-effort-picker' },
++      );
+     }
+
+     const powerSliderResult = await selectEffortFromPowerSlider(findVisibleEffortMenu(modelBtn));
+diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/index.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/index.js
+--- a/dist/src/browser/index.js	2026-09-04 09:23:37
++++ b/dist/src/browser/index.js	2026-09-04 09:12:04
+@@ -296,6 +296,31 @@
+  * window swallows the click while the automation still believes it clicked.
+  * Soft-fails: focus emulation is an optimization, never a hard requirement.
+  */
++async function stabilizeChromeWindow(client, logger) {
++    const width = 1280;
++    const height = 720;
++    try {
++        const { windowId } = await client.Browser.getWindowForTarget();
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { windowState: "normal" },
++        });
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { width, height },
++        });
++        const observed = await client.Browser.getWindowBounds({ windowId });
++        const bounds = observed?.bounds;
++        if (bounds?.windowState !== "normal" || bounds.width !== width || bounds.height !== height) {
++            throw new Error(`observed ${bounds?.width ?? "?"}x${bounds?.height ?? "?"} (${bounds?.windowState ?? "unknown"})`);
++        }
++        logger(`Chrome window fixed at ${width}x${height}`);
++    }
++    catch (error) {
++        const message = error instanceof Error ? error.message : String(error);
++        throw new Error(`Failed to set stable Chrome window bounds: ${message}`);
++    }
++}
+ async function enableFocusEmulation(client, logger, label) {
+     try {
+         await client.Emulation.setFocusEmulationEnabled({ enabled: true });
+@@ -856,6 +881,7 @@
+             domainEnablers.push(DOM.enable());
+         }
+         await Promise.all(domainEnablers);
++        await stabilizeChromeWindow(client, logger);
+         if (!config.headless && config.hideWindow) {
+             await positionChromeWindowOffscreen(client, logger);
+         }
+@@ -1081,6 +1107,7 @@
+         // Handle thinking time selection if specified. Deep Research owns its own effort flow.
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+             await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+@@ -1110,6 +1137,7 @@
+             await handle.release().catch(() => undefined);
+         };
+         const submitOnce = async (prompt, submissionAttachments) => {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+             const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
+             const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));

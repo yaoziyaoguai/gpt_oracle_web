@@ -17,6 +17,8 @@
 - 修复附件已完成却被误判为仍在上传的问题。
 - 修复发送按钮事件未被页面接受、草稿存在却没有真正提交的问题。
 - 用新会话和 committed user turn 验证发送成功，而不是只看 `promptSubmitted`。
+- 固定自动化 Chrome 的初始窗口尺寸，并在档位选择和提交前恢复该尺寸。
+- 每次 trusted pointer 操作前重新定位元素、核对 viewport 并执行 `elementFromPoint` 命中检查；窗口尺寸变化时丢弃旧坐标。
 - 为每次咨询绑定独立的 session、Chrome PID、CDP port、target ID 和临时 Profile；Chrome 启动后立即记录 identity，无论成功、失败、超时或恢复结束都只清理这组资源。
 - 把本地修改保存为可校验、可回滚的版本化 patch，避免只存在于 Homebrew Cellar。
 
@@ -50,6 +52,20 @@ ChatGPT Web ──返回规划/审查/执行建议──▶ 当前 Codex 实现�
 
 临时 Chrome 窗口是正常现象。wrapper 不靠窗口标题或创建时间猜测归属，而是使用本次 runtime identity 精确关联。退出后 runtime 会关闭隔离窗口并清理临时 Profile；session 元数据只用于短期恢复和排障，不是仍在运行的网页。
 
+Prompt 写入使用 `Input.insertText`，附件使用 `DOM.setFileInputFiles`。这两步不依赖屏幕坐标。ChatGPT 的五档 power control 不是标准 `select`，发送按钮也需要网页接受可信输入事件，因此这两类操作仍通过 CDP keyboard/pointer 完成。runtime 优先读取 ARIA slider 并发送键盘事件；需要 pointer 时，点击前会重新定位目标并验证命中，不使用截图坐标或人工补点。
+
+Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该尺寸。如果用户在一次动作中改变窗口尺寸，旧 viewport 和旧坐标会失效，runtime 会重做当前动作。其他应用窗口覆盖 Oracle Chrome 不改变 DOM 命中结果；不要最小化窗口或持续拖动边框，因为 Chrome 可能暂停合成或节流页面，最终会按 fail-closed 规则停止。
+
+### 为什么不直接调用网页接口
+
+这个项目已经在用接口：Chrome DevTools Protocol 负责定位 DOM、写入 Prompt、挂载附件和发送可信输入事件。难点只在 ChatGPT 网页自身没有面向此用途的稳定公开接口：
+
+- 网页五档强度属于 ChatGPT UI 状态，没有公开的订阅版 API 可直接设置并回读。
+- OpenAI API 可以直接传请求参数，但使用独立 API 额度，不再是复用用户的 ChatGPT Web 订阅。
+- ChatGPT 私有内部请求依赖登录 Cookie、短期字段和未承诺的协议。直接复刻会扩大凭据风险，并在网页更新时失效。
+
+因此本项目使用公开的浏览器自动化边界：能用 DOM/CDP 直接完成的步骤不走坐标；必须由网页接收可信事件的控件才使用经过重新定位和命中验证的 keyboard/pointer 输入。
+
 ## 仓库结构
 
 ```text
@@ -63,7 +79,9 @@ ChatGPT Web ──返回规划/审查/执行建议──▶ 当前 Codex 实现�
 │       └── troubleshooting.md             fail-closed 故障解释
 ├── patches/
 │   ├── oracle-0.17.3.patch                最小 runtime patch
-│   └── oracle-0.17.3.sha256               原始/修改后文件校验和
+│   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
+│   ├── oracle-0.17.3-from-f0ea8d6.patch   上一受管版本到当前版本的增量 patch
+│   └── oracle-0.17.3-f0ea8d6.sha256       上一受管版本校验和
 ├── scripts/
 │   ├── install.sh                         安装或幂等更新
 │   ├── verify.sh                          离线安装验证
@@ -278,15 +296,16 @@ oracle-web --timeout 20m \
 
 ## Runtime patch 做了什么
 
-`patches/oracle-0.17.3.patch` 只支持上游 `0.17.3`，覆盖七个明确边界：
+`patches/oracle-0.17.3.patch` 只支持上游 `0.17.3`，覆盖八个明确边界：
 
 1. **Thinking time**：识别当前五档 power slider，通过真实 CDP pointer/keyboard 事件选择第 4、5 档，并对未验证选择 fail closed。
 2. **Page readiness**：首次文档 readiness 超时只 reload 当前隔离 tab 一次；能力控件缺失时也只对当前页做一次 bounded reload，之后仍然 fail closed。
 3. **Early runtime identity**：Chrome 启动后、首次导航前就持久化 PID、port 和 `userDataDir`，使早期失败也能按精确身份审计。
 4. **Attachment readiness**：在 prompt 尚未写入时，不再把发送按钮因空编辑器而 disabled 误判为附件上传未完成；prompt 写入后，带附件的 disabled 发送按钮会在 300 秒窗口内继续轮询。
-5. **Prompt submission**：始终优先真实 `#prompt-textarea`，先用 trusted CDP click 激活编辑器再写入；只有未出现 submission signal 时才单次 Enter 兜底，并要求 committed turn。
-6. **Recovery lifecycle**：新开的 recovery Chrome 在连接失败或后续任意异常时都经幂等 `finally` 清理；附着到已有临时 runtime 后按精确 identity 关闭和删除，不复用或猜测别的窗口。
-7. **Copied Profile reliability**：把临时副本标记为正常退出；`rsync exit 23` 只有在已复制 Cookie 数据库时才允许进入后续登录验证，否则仍然 fail closed。
+5. **Stable viewport**：本地自动化 Chrome 使用固定窗口尺寸；档位与发送动作在 pointer 输入前重新定位目标、比较 viewport、验证 DOM 命中，resize 后不使用旧坐标。
+6. **Prompt submission**：始终优先真实 `#prompt-textarea`，先用 trusted CDP click 激活编辑器再写入；只有未出现 submission signal 时才单次 Enter 兜底，并要求 committed turn。
+7. **Recovery lifecycle**：新开的 recovery Chrome 在连接失败或后续任意异常时都经幂等 `finally` 清理；附着到已有临时 runtime 后按精确 identity 关闭和删除，不复用或猜测别的窗口。
+8. **Copied Profile reliability**：把临时副本标记为正常退出；`rsync exit 23` 只有在已复制 Cookie 数据库时才允许进入后续登录验证，否则仍然 fail closed。
 
 安装器先检查七个原始文件 SHA-256。只有全部处于已知 pristine 状态时才应用 patch；全部处于已知 patched 状态时幂等退出；mixed 或 unknown 状态一律停止。
 
@@ -309,6 +328,9 @@ oracle-web --timeout 20m \
 - 下载准确版本 `@steipete/oracle@0.17.3` 到临时目录，或使用 `ORACLE_TEST_PACKAGE_ROOT` 指定的副本。
 - 安装 patch、wrapper 和 Skill。
 - 模拟双编辑器 DOM，确认写入和 Enter 始终落在真实 `#prompt-textarea`。
+- 验证窗口尺寸变化后旧坐标不会收到 pointer 事件，重新定位成功后只点击新坐标。
+- 验证 `elementFromPoint` 与预期目标不一致时不点击，且判断不依赖 `document.visibilityState`。
+- 验证 Chrome 窗口尺寸被恢复为 `1280×720`，失败时给出明确错误。
 - 验证 recovery cleanup 幂等、只使用记录的 Chrome PID、拒绝普通 Profile，并禁止批量进程清理命令。
 - 验证第二次安装幂等。
 - 使用 fake Oracle 检查 wrapper 参数，不接触 ChatGPT。
@@ -356,6 +378,10 @@ git pull --ff-only
 ```
 
 上游 Oracle 版本变化不是普通更新。必须重新审计 UI 行为、重新生成 patch 和 checksum，并分别通过第 4、5 档 live probe 后，才能声明支持新版本。安装器不会自动做这件事。
+
+安装器只为仓库上一受管提交 `f0ea8d6` 提供精确迁移：7 个 runtime 文件全部匹配该提交的 patched checksum 时，才应用增量 patch。任何其他旧版本、混合状态或本地修改仍按 unknown runtime 停止，不会被 `--force` 覆盖。
+
+Skill 安装到 Codex home 后，已有 Codex 任务在下一次调用 `oracle-web` 时读取当前安装版本。正在执行的咨询不会中途热更新；让该次运行结束，再发起一次新调用即可。
 
 ## 卸载与回滚
 
