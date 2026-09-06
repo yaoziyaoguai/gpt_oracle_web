@@ -11,7 +11,7 @@ Use the session metadata and concise browser log as evidence. Do not print promp
 - `Attachments did not finish uploading before timeout`: attachment readiness was not proven. A visible draft card alone is not a submitted message.
 - `attachment-send-not-ready`: attachment UI appeared, but the visible send button never became enabled within the configured attachment timeout. No committed turn was proven.
 - `Failed to set stable Chrome window bounds`: the owned window could not be restored to `1280x720`; no critical UI action should continue.
-- `trusted-target-mismatch`: the point under the pointer was not the re-located composer or send control. No pointer click was sent.
+- `trusted-target-mismatch`: none of the checked points inside the re-located composer, or the send control's center, passed DOM hit testing. No pointer click was sent.
 - `trusted-target-resized`: the viewport kept changing across three fresh probes. Old coordinates were discarded and no pointer click was sent.
 - `prompt-commit-timeout`: a send action was attempted but no committed user turn appeared. `promptSubmitted=true` is not success.
 

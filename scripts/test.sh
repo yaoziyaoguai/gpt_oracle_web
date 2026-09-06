@@ -27,6 +27,15 @@ export ORACLE_WEB_STATE_DIR="$test_root/state"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_2FE5969_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_2FE5969_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "2fe5969 runtime unexpectedly matched the current manifest"
+[[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_2FE5969_HASH_MANIFEST")" == "patched" ]] || \
+  oracle_web_die "legacy runtime did not match the 2fe5969 manifest"
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_209F3BA_UPGRADE_PATCH" >/dev/null
 patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_209F3BA_UPGRADE_PATCH" >/dev/null
 [[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
@@ -73,6 +82,7 @@ node -e '
 
 node -e '
   const fs = require("node:fs");
+  const vm = require("node:vm");
   (async () => {
     const source = fs.readFileSync(process.argv[1], "utf8");
     const start = source.indexOf("async function stabilizeChromeWindow");
@@ -490,18 +500,66 @@ node -e '
     ) {
       throw new Error("trusted click must use DOM hit testing and CDP input without depending on tab visibility");
     }
-    const clickTrustedPoint = new Function(
+    const trustedTargetHelpers = new Function(
       "INPUT_SELECTORS",
       "SEND_BUTTON_SELECTORS",
       "PROMPT_PRIMARY_SELECTOR",
       "BrowserAutomationError",
-      `${implementation}; return clickTrustedPoint;`,
+      `${implementation}; return { buildTrustedPointExpression, clickTrustedPoint };`,
     )(
       ["#prompt-textarea"],
       ["button[data-testid=send-button]"],
       "#prompt-textarea",
       class BrowserAutomationError extends Error {},
     );
+    const { buildTrustedPointExpression, clickTrustedPoint } = trustedTargetHelpers;
+    class FakeNode {}
+    class FakeElement extends FakeNode {
+      constructor(name) {
+        super();
+        this.name = name;
+        this.isContentEditable = name === "composer";
+      }
+      getBoundingClientRect() {
+        return { left: 0, top: 0, width: 400, height: 160 };
+      }
+      getAttribute(name) {
+        return name === "contenteditable" && this.isContentEditable ? "true" : null;
+      }
+      hasAttribute() { return false; }
+      contains(node) { return node === this; }
+      scrollIntoView() {}
+    }
+    class FakeTextAreaElement extends FakeElement {}
+    class FakeInputElement extends FakeElement {}
+    const composer = new FakeElement("composer");
+    const attachmentCard = new FakeElement("attachment-card");
+    const composerExpression = buildTrustedPointExpression("composer");
+    const composerPoint = vm.runInNewContext(composerExpression, {
+      Node: FakeNode,
+      HTMLElement: FakeElement,
+      HTMLTextAreaElement: FakeTextAreaElement,
+      HTMLInputElement: FakeInputElement,
+      document: {
+        activeElement: composer,
+        querySelector: () => composer,
+        querySelectorAll: () => [composer],
+        elementFromPoint: (x, y) => x === 200 && y === 80 ? attachmentCard : composer,
+      },
+      window: {
+        innerWidth: 1000,
+        innerHeight: 700,
+        visualViewport: null,
+        getComputedStyle: () => ({ pointerEvents: "auto" }),
+      },
+    });
+    if (
+      composerPoint?.status !== "point" ||
+      composerPoint.kind !== "composer" ||
+      (composerPoint.x === 200 && composerPoint.y === 80)
+    ) {
+      throw new Error(`valid composer point was not recovered around an attachment overlay: ${JSON.stringify(composerPoint)}`);
+    }
     const viewportBefore = {
       width: 1000, height: 700, visualWidth: 1000, visualHeight: 700,
       visualOffsetLeft: 0, visualOffsetTop: 0,

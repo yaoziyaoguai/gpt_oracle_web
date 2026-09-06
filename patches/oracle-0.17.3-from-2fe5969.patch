@@ -1,0 +1,41 @@
+diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
+--- a/dist/src/browser/actions/promptComposer.js
++++ b/dist/src/browser/actions/promptComposer.js
+@@ -808,9 +808,6 @@
+       }
+       if (!target) return { status: 'missing', kind };
+       const rect = target.getBoundingClientRect();
+-      const x = rect.left + rect.width / 2;
+-      const y = rect.top + rect.height / 2;
+-      const hit = document.elementFromPoint(x, y);
+       const viewport = {
+         width: window.innerWidth,
+         height: window.innerHeight,
+@@ -819,10 +816,24 @@
+         visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
+         visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
+       };
+-      if (!(hit instanceof Node) || !(target === hit || target.contains(hit))) {
+-        return { status: 'target-mismatch', kind, x, y, viewport };
++      const candidateFractions = kind === 'composer'
++        ? [[0.5, 0.5], [0.2, 0.8], [0.5, 0.8], [0.8, 0.8], [0.2, 0.5], [0.8, 0.5]]
++        : [[0.5, 0.5]];
++      for (const [xFraction, yFraction] of candidateFractions) {
++        const x = rect.left + rect.width * xFraction;
++        const y = rect.top + rect.height * yFraction;
++        const hit = document.elementFromPoint(x, y);
++        if (hit instanceof Node && (target === hit || target.contains(hit))) {
++          return { status: 'point', kind, x, y, viewport };
++        }
+       }
+-      return { status: 'point', kind, x, y, viewport };
++      return {
++        status: 'target-mismatch',
++        kind,
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport,
++      };
+     })()`;
+ }
+ function sameViewport(left, right) {
