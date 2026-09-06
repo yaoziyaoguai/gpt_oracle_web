@@ -27,6 +27,15 @@ export ORACLE_WEB_STATE_DIR="$test_root/state"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_209F3BA_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_209F3BA_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "209f3ba runtime unexpectedly matched the current manifest"
+[[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_209F3BA_HASH_MANIFEST")" == "patched" ]] || \
+  oracle_web_die "legacy runtime did not match the 209f3ba manifest"
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" >/dev/null
 patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" >/dev/null
 [[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
@@ -139,6 +148,147 @@ node -e '
     }
   })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/actions/thinkingTime.js"
+
+node -e '
+  const fs = require("node:fs");
+  const path = require("node:path");
+  (async () => {
+    const source = fs.readFileSync(process.argv[1], "utf8");
+    const start = source.indexOf("export async function uploadAttachmentFile");
+    const end = source.indexOf("export async function clearComposerAttachments", start);
+    if (start < 0 || end < 0) throw new Error("attachment upload function not found");
+    const implementation = source
+      .slice(start, end)
+      .replace("export async function uploadAttachmentFile", "async function uploadAttachmentFile");
+    const makeUploader = (waitForAttachmentVisible) => new Function(
+      "path",
+      "INPUT_SELECTORS",
+      "SEND_BUTTON_SELECTORS",
+      "UPLOAD_STATUS_SELECTORS",
+      "delay",
+      "logDomFailure",
+      "transferAttachmentViaDataTransfer",
+      "waitForAttachmentVisible",
+      "waitForAttachmentAnchored",
+      `${implementation}; return uploadAttachmentFile;`,
+    )(
+      path,
+      ["#prompt-textarea"],
+      ["button[data-testid=send-button]"],
+      [],
+      async () => {},
+      async () => {},
+      async () => {},
+      waitForAttachmentVisible,
+      async () => false,
+    );
+
+    const runGenericCardScenario = async (generatedBundle, visibleProbe) => {
+      let signalProbe = 0;
+      const runtime = {
+        evaluate: async ({ expression }) => {
+          if (expression.includes("el.click()")) {
+            return { result: { value: false } };
+          }
+          if (expression.includes("data-oracle-upload-candidate")) {
+            return { result: { value: {
+              ok: true,
+              baselineChipCount: 0,
+              baselineChips: [],
+              baselineUploading: false,
+              baselineFileCount: 0,
+              baselineInputCount: 0,
+              order: [0],
+            } } };
+          }
+          if (expression.includes("normalizedExpected")) {
+            signalProbe += 1;
+            return { result: { value: {
+              ui: false,
+              input: false,
+              inputCount: 0,
+              chipCount: signalProbe === 1 ? 0 : 1,
+              chipSignature: signalProbe === 1 ? "" : "14 个文件||||||file-pill",
+              uploading: false,
+              fileCount: 0,
+            } } };
+          }
+          if (expression.includes("return { ok: true, x:")) {
+            return { result: { value: { ok: false } } };
+          }
+          throw new Error(`unexpected attachment expression: ${expression.slice(0, 80)}`);
+        },
+      };
+      return makeUploader(visibleProbe)(
+        {
+          runtime,
+          dom: {
+            getDocument: async () => ({ root: { nodeId: 1 } }),
+            querySelector: async () => ({ nodeId: 2 }),
+            setFileInputFiles: async () => {},
+          },
+          input: { dispatchMouseEvent: async () => {} },
+        },
+        {
+          path: "/tmp/attachments-bundle.txt",
+          displayPath: "attachments-bundle.txt",
+          generatedBundle,
+        },
+        () => {},
+        { expectedCount: 1 },
+      );
+    };
+
+    let generatedVisibleProbes = 0;
+    const generatedResult = await runGenericCardScenario(true, async () => {
+      generatedVisibleProbes += 1;
+      throw new Error("generated bundle was forced through exact-name visibility");
+    });
+    if (!generatedResult || generatedVisibleProbes !== 0) {
+      throw new Error(`generated bundle did not accept its generic UI delta: probes=${generatedVisibleProbes}`);
+    }
+
+    let normalVisibleProbes = 0;
+    const normalResult = await runGenericCardScenario(false, async () => {
+      normalVisibleProbes += 1;
+      throw new Error("normal attachment was forced through exact-name visibility");
+    });
+    if (!normalResult || normalVisibleProbes !== 0) {
+      throw new Error(`normal attachment did not accept its generic UI delta: probes=${normalVisibleProbes}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/attachments.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?attachment-completion-test=${Date.now()}`);
+    let probes = 0;
+    const runtime = {
+      evaluate: async () => {
+        probes += 1;
+        return { result: { value: {
+          state: "disabled",
+          uploading: false,
+          filesAttached: true,
+          attachedNames: ["1 个文件"],
+          inputNames: [],
+          fileCount: 0,
+        } } };
+      },
+    };
+    await module.waitForAttachmentCompletion(
+      runtime,
+      2500,
+      [{ name: "oracle-web-live-probe.txt", generatedBundle: false }],
+      () => {},
+      { appearanceConfirmed: true },
+    );
+    if (probes < 2) {
+      throw new Error(`generic attachment completion was not stabilized: probes=${probes}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/attachments.js"
 
 node -e '
   const fs = require("node:fs");

@@ -5,6 +5,8 @@ readonly ORACLE_WEB_COMMON_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}
 readonly ORACLE_WEB_REPO_ROOT="$(CDPATH= cd -- "$ORACLE_WEB_COMMON_DIR/../.." && pwd)"
 readonly ORACLE_WEB_PATCH_FILE="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.patch"
 readonly ORACLE_WEB_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.sha256"
+readonly ORACLE_WEB_209F3BA_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-209f3ba.patch"
+readonly ORACLE_WEB_209F3BA_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-209f3ba.sha256"
 readonly ORACLE_WEB_F0EA8D6_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-f0ea8d6.patch"
 readonly ORACLE_WEB_F0EA8D6_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-f0ea8d6.sha256"
 

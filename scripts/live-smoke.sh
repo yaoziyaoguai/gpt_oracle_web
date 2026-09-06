@@ -28,8 +28,30 @@ esac
 
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/gpt-oracle-web-live.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
-probe_file="$test_root/oracle-web-live-probe.txt"
-printf '%s\n' 'Harmless oracle-web attachment probe.' > "$probe_file"
+fixture="${ORACLE_WEB_LIVE_FIXTURE:-single}"
+probe_files=()
+case "$fixture" in
+  single)
+    probe_file="$test_root/oracle-web-live-probe.txt"
+    printf '%s\n' 'Harmless oracle-web attachment probe.' > "$probe_file"
+    probe_files+=("$probe_file")
+    ;;
+  bundle|large-bundle)
+    for ((index = 1; index <= 14; index += 1)); do
+      probe_file="$test_root/oracle-web-live-probe-$index.txt"
+      if [[ "$fixture" == "large-bundle" ]]; then
+        awk -v file_index="$index" 'BEGIN { printf "Harmless bundle probe file %02d.\n", file_index; for (line = 1; line <= 900; line += 1) print "Harmless oracle attachment content." }' > "$probe_file"
+      else
+        printf 'Harmless bundle probe file %02d.\n' "$index" > "$probe_file"
+      fi
+      probe_files+=("$probe_file")
+    done
+    ;;
+  *)
+    echo "ORACLE_WEB_LIVE_FIXTURE must be single, bundle, or large-bundle" >&2
+    exit 64
+    ;;
+esac
 slug="oracle-web-live-$(date +%Y%m%d-%H%M%S)-$$"
 oracle_args=(
   --force
@@ -38,9 +60,11 @@ oracle_args=(
   --browser-thinking-time "$level"
   --browser-attachment-timeout 300s
   --browser-attachments always
-  -p 'Read the harmless attachment. Reply with exactly ORACLE-WEB-LIVE-OK and nothing else.'
-  --file "$probe_file"
+  -p 'Read the harmless attachment material. Reply with exactly ORACLE-WEB-LIVE-OK and nothing else.'
 )
+for probe_file in "${probe_files[@]}"; do
+  oracle_args+=(--file "$probe_file")
+done
 if [[ "${ORACLE_WEB_LIVE_VERBOSE:-}" == "1" ]]; then
   oracle_args+=(--verbose)
 fi

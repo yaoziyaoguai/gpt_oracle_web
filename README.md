@@ -15,6 +15,7 @@
 - 把网页版限定为 planner/reviewer，把实现、测试和最终判断留给当前 Codex。
 - 隔离多批咨询，避免把第二批材料串进第一批会话。
 - 修复附件已完成却被误判为仍在上传的问题。
+- 修复网页附件卡片不显示本地文件名时，普通附件和多文件自动合包被误判为附件缺失的问题。
 - 修复发送按钮事件未被页面接受、草稿存在却没有真正提交的问题。
 - 用新会话和 committed user turn 验证发送成功，而不是只看 `promptSubmitted`。
 - 固定自动化 Chrome 的初始窗口尺寸，并在档位选择和提交前恢复该尺寸。
@@ -80,6 +81,8 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 ├── patches/
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
+│   ├── oracle-0.17.3-from-209f3ba.patch   上一受管版本到当前版本的增量 patch
+│   ├── oracle-0.17.3-209f3ba.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-f0ea8d6.patch   上一受管版本到当前版本的增量 patch
 │   └── oracle-0.17.3-f0ea8d6.sha256       上一受管版本校验和
 ├── scripts/
@@ -351,6 +354,13 @@ ORACLE_WEB_LIVE_TEST=1 ./scripts/live-smoke.sh
 ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ./scripts/live-smoke.sh
 ```
 
+默认 fixture 是一个小文本附件。多文件与接近真实审查体量的自动合包测试：
+
+```bash
+ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_FIXTURE=bundle ./scripts/live-smoke.sh
+ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ORACLE_WEB_LIVE_FIXTURE=large-bundle ./scripts/live-smoke.sh
+```
+
 成功要求同时包含网页 `4/5` 或 `5/5` 证据和精确回复 `ORACLE-WEB-LIVE-OK`。
 测试会强制上传临时附件，并使用 300 秒附件就绪上限。
 
@@ -379,7 +389,9 @@ git pull --ff-only
 
 上游 Oracle 版本变化不是普通更新。必须重新审计 UI 行为、重新生成 patch 和 checksum，并分别通过第 4、5 档 live probe 后，才能声明支持新版本。安装器不会自动做这件事。
 
-安装器只为仓库上一受管提交 `f0ea8d6` 提供精确迁移：7 个 runtime 文件全部匹配该提交的 patched checksum 时，才应用增量 patch。任何其他旧版本、混合状态或本地修改仍按 unknown runtime 停止，不会被 `--force` 覆盖。
+安装器为受管提交 `f0ea8d6` 提供精确迁移：7 个 runtime 文件全部匹配该提交的 patched checksum 时，才应用增量 patch。任何其他旧版本、混合状态或本地修改仍按 unknown runtime 停止，不会被 `--force` 覆盖。
+
+安装器也为受管提交 `209f3ba` 提供精确迁移，用于把已安装的稳定窗口版本升级到多文件 bundle 修复版。
 
 Skill 安装到 Codex home 后，已有 Codex 任务在下一次调用 `oracle-web` 时读取当前安装版本。正在执行的咨询不会中途热更新；让该次运行结束，再发起一次新调用即可。
 

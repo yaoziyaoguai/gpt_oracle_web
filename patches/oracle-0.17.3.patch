@@ -1,7 +1,59 @@
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/attachments.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/attachments.js
+diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/attachments.js
 --- a/dist/src/browser/actions/attachments.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/actions/attachments.js	2026-09-04 08:58:12
-@@ -1460,8 +1460,12 @@
++++ b/dist/src/browser/actions/attachments.js	2026-09-06 21:34:39
+@@ -1032,7 +1032,9 @@
+         const inputNameCandidates = resolveInputNameCandidates();
+         const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
+             (lastInputValue && matchesExpectedName(lastInputValue));
+-        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
++        // This branch already requires a baseline-relative upload UI delta. Current
++        // ChatGPT cards do not always expose the local filename, so a second exact-name
++        // visibility probe would turn confirmed uploads into false negatives.
+         logger(inputHasFile
+             ? "Attachment queued (UI anchored, file input confirmed)"
+             : "Attachment queued (UI anchored)");
+@@ -1042,7 +1044,6 @@
+     const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
+         (lastInputValue && matchesExpectedName(lastInputValue));
+     if (await waitForAttachmentAnchored(runtime, expectedName, attachmentUiTimeoutMs)) {
+-        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
+         logger(inputHasFile
+             ? "Attachment queued (UI anchored, file input confirmed)"
+             : "Attachment queued (UI anchored)");
+@@ -1171,9 +1172,17 @@
+         throw new Error("Existing attachments still present in composer; aborting to avoid duplicate uploads.");
+     }
+ }
+-export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedNames = [], logger) {
++export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedAttachments = [], logger, options) {
+     const deadline = Date.now() + timeoutMs;
+-    const expectedNormalized = expectedNames.map((name) => name.toLowerCase());
++    const expectations = expectedAttachments
++        .map((attachment) => typeof attachment === "string"
++        ? { name: attachment, generatedBundle: false }
++        : {
++            name: typeof attachment?.name === "string" ? attachment.name : "",
++            generatedBundle: attachment?.generatedBundle === true,
++        })
++        .filter((attachment) => attachment.name.length > 0);
++    const expectedNormalized = expectations.map((attachment) => attachment.name.toLowerCase());
+     const expectedInputBasenames = expectedNormalized
+         .map((name) => name.split("/").pop()?.split("\\").pop() ?? name)
+         .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
+@@ -1450,7 +1459,11 @@
+                     return false;
+                 });
+             };
+-            const missing = expectedNormalized.filter((expected) => !matchesExpected(expected));
++            const genericAttachmentUiSatisfied = options?.appearanceConfirmed === true &&
++                Boolean(value.filesAttached);
++            const missing = genericAttachmentUiSatisfied
++                ? []
++                : expectedNormalized.filter((expected) => !matchesExpected(expected));
+             if (missing.length === 0 || fileCountSatisfied) {
+                 const stableThresholdMs = value.uploading ? 3000 : 1500;
+                 if (attachmentMatchSince === null) {
+@@ -1460,8 +1473,12 @@
                  if (stable && value.state === "ready") {
                      return;
                  }
@@ -16,9 +68,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/attac
                  if (value.state === "missing" && (value.filesAttached || fileCountSatisfied)) {
                      return;
                  }
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/navigation.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/navigation.js
+diff -ruN a/dist/src/browser/actions/navigation.js b/dist/src/browser/actions/navigation.js
 --- a/dist/src/browser/actions/navigation.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/actions/navigation.js	2026-09-04 08:58:12
++++ b/dist/src/browser/actions/navigation.js	2026-09-06 21:23:50
 @@ -37,7 +37,17 @@
  export async function navigateToChatGPT(Page, Runtime, url, logger) {
      logger(`Navigating to ${url}`);
@@ -38,9 +90,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/navig
  }
  async function dismissBlockingUi(Runtime, logger) {
      const outcome = await Runtime.evaluate({
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/promptComposer.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/promptComposer.js
+diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
 --- a/dist/src/browser/actions/promptComposer.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/actions/promptComposer.js	2026-09-04 09:21:11
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-06 21:23:50
 @@ -54,9 +54,35 @@
            candidates.push(node);
          }
@@ -434,9 +486,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/promp
  }
  function sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs) {
      if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/thinkingTime.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/thinkingTime.js
+diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
 --- a/dist/src/browser/actions/thinkingTime.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/actions/thinkingTime.js	2026-09-04 09:21:04
++++ b/dist/src/browser/actions/thinkingTime.js	2026-09-06 21:23:50
 @@ -2,6 +2,7 @@
  import { logDomFailure } from "../domDebug.js";
  import { buildClickDispatcher } from "./domEvents.js";
@@ -1194,9 +1246,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/actions/think
      }
 
      // ---------- COMPATIBILITY UI: unified "Intelligence" effort picker ----------
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/index.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/index.js
+diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
 --- a/dist/src/browser/index.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/index.js	2026-09-04 09:12:04
++++ b/dist/src/browser/index.js	2026-09-06 21:34:39
 @@ -296,6 +296,31 @@
   * window swallows the click while the automation still believes it clicked.
   * Soft-fails: focus emulation is an optimization, never a hard requirement.
@@ -1266,7 +1318,18 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/index.js /tmp
              const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
              const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
              const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
-@@ -2397,7 +2428,7 @@
+@@ -1136,7 +1167,9 @@
+                 const perFileTimeout = 20_000;
+                 const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
+                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
+-                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
++                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentExpectations, logger, {
++                    appearanceConfirmed: !inputOnlyAttachments,
++                });
+                 logger("All attachments uploaded");
+             }
+             if (deepResearch) {
+@@ -2397,7 +2430,7 @@
          const thinkingTime = config.thinkingTime;
          if (thinkingTime && !deepResearch) {
              const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
@@ -1275,9 +1338,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/index.js /tmp
                  retries: 2,
                  delayMs: 300,
                  onRetry: (attempt, error) => {
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/profileCopy.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/profileCopy.js
+diff -ruN a/dist/src/browser/profileCopy.js b/dist/src/browser/profileCopy.js
 --- a/dist/src/browser/profileCopy.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/profileCopy.js	2026-09-04 08:58:12
++++ b/dist/src/browser/profileCopy.js	2026-09-06 21:23:50
 @@ -1,5 +1,5 @@
  import { spawn } from "node:child_process";
 -import { cp, mkdir, readFile, rm } from "node:fs/promises";
@@ -1343,9 +1406,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/profileCopy.j
      }
  }
  function resolveChromeProfileDirectory(srcUserDataDir, localState, requestedProfile) {
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/pristine/dist/src/browser/reattach.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/reattach.js
+diff -ruN a/dist/src/browser/reattach.js b/dist/src/browser/reattach.js
 --- a/dist/src/browser/reattach.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/reattach.js	2026-09-04 08:58:12
++++ b/dist/src/browser/reattach.js	2026-09-06 21:23:50
 @@ -3,13 +3,14 @@
  import path from "node:path";
  import { mkdtemp, mkdir, rm } from "node:fs/promises";

@@ -1,6 +1,61 @@
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/actions/promptComposer.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js	2026-09-04 09:23:37
-+++ b/dist/src/browser/actions/promptComposer.js	2026-09-04 09:21:11
+diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/attachments.js
+--- a/dist/src/browser/actions/attachments.js	2026-09-06 21:25:30
++++ b/dist/src/browser/actions/attachments.js	2026-09-06 21:34:39
+@@ -1032,7 +1032,9 @@
+         const inputNameCandidates = resolveInputNameCandidates();
+         const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
+             (lastInputValue && matchesExpectedName(lastInputValue));
+-        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
++        // This branch already requires a baseline-relative upload UI delta. Current
++        // ChatGPT cards do not always expose the local filename, so a second exact-name
++        // visibility probe would turn confirmed uploads into false negatives.
+         logger(inputHasFile
+             ? "Attachment queued (UI anchored, file input confirmed)"
+             : "Attachment queued (UI anchored)");
+@@ -1042,7 +1044,6 @@
+     const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
+         (lastInputValue && matchesExpectedName(lastInputValue));
+     if (await waitForAttachmentAnchored(runtime, expectedName, attachmentUiTimeoutMs)) {
+-        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
+         logger(inputHasFile
+             ? "Attachment queued (UI anchored, file input confirmed)"
+             : "Attachment queued (UI anchored)");
+@@ -1171,9 +1172,17 @@
+         throw new Error("Existing attachments still present in composer; aborting to avoid duplicate uploads.");
+     }
+ }
+-export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedNames = [], logger) {
++export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedAttachments = [], logger, options) {
+     const deadline = Date.now() + timeoutMs;
+-    const expectedNormalized = expectedNames.map((name) => name.toLowerCase());
++    const expectations = expectedAttachments
++        .map((attachment) => typeof attachment === "string"
++        ? { name: attachment, generatedBundle: false }
++        : {
++            name: typeof attachment?.name === "string" ? attachment.name : "",
++            generatedBundle: attachment?.generatedBundle === true,
++        })
++        .filter((attachment) => attachment.name.length > 0);
++    const expectedNormalized = expectations.map((attachment) => attachment.name.toLowerCase());
+     const expectedInputBasenames = expectedNormalized
+         .map((name) => name.split("/").pop()?.split("\\").pop() ?? name)
+         .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
+@@ -1450,7 +1459,11 @@
+                     return false;
+                 });
+             };
+-            const missing = expectedNormalized.filter((expected) => !matchesExpected(expected));
++            const genericAttachmentUiSatisfied = options?.appearanceConfirmed === true &&
++                Boolean(value.filesAttached);
++            const missing = genericAttachmentUiSatisfied
++                ? []
++                : expectedNormalized.filter((expected) => !matchesExpected(expected));
+             if (missing.length === 0 || fileCountSatisfied) {
+                 const stableThresholdMs = value.uploading ? 3000 : 1500;
+                 if (attachmentMatchSince === null) {
+diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
+--- a/dist/src/browser/actions/promptComposer.js	2026-09-06 21:25:30
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-06 21:23:50
 @@ -71,8 +71,17 @@
          const rect = preferred.getBoundingClientRect();
          return {
@@ -246,9 +301,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/actions/promptC
      });
  }
  async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/actions/thinkingTime.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/actions/thinkingTime.js
---- a/dist/src/browser/actions/thinkingTime.js	2026-09-04 09:23:37
-+++ b/dist/src/browser/actions/thinkingTime.js	2026-09-04 09:21:04
+diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
+--- a/dist/src/browser/actions/thinkingTime.js	2026-09-06 21:25:30
++++ b/dist/src/browser/actions/thinkingTime.js	2026-09-06 21:23:50
 @@ -147,6 +147,40 @@
          return false;
      }
@@ -701,9 +756,9 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/actions/thinkin
      }
 
      const powerSliderResult = await selectEffortFromPowerSlider(findVisibleEffortMenu(modelBtn));
-diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/index.js /tmp/gpt-oracle-web-dev.fNG21D/patched/dist/src/browser/index.js
---- a/dist/src/browser/index.js	2026-09-04 09:23:37
-+++ b/dist/src/browser/index.js	2026-09-04 09:12:04
+diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
+--- a/dist/src/browser/index.js	2026-09-06 21:25:30
++++ b/dist/src/browser/index.js	2026-09-06 21:34:39
 @@ -296,6 +296,31 @@
   * window swallows the click while the automation still believes it clicked.
   * Soft-fails: focus emulation is an optimization, never a hard requirement.
@@ -760,3 +815,14 @@ diff -ruN /tmp/gpt-oracle-web-dev.fNG21D/legacy/dist/src/browser/index.js /tmp/g
              const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
              const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
              const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
+@@ -1139,7 +1167,9 @@
+                 const perFileTimeout = 20_000;
+                 const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
+                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
+-                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
++                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentExpectations, logger, {
++                    appearanceConfirmed: !inputOnlyAttachments,
++                });
+                 logger("All attachments uploaded");
+             }
+             if (deepResearch) {
