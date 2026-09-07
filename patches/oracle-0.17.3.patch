@@ -1,767 +1,38 @@
-diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
---- a/dist/src/browser/actions/thinkingTime.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/actions/thinkingTime.js	2026-09-07 10:07:35
-@@ -2,6 +2,7 @@
- import { logDomFailure } from "../domDebug.js";
- import { buildClickDispatcher } from "./domEvents.js";
- const BROWSER_THINKING_LOG_PREFIX = "[browser] Thinking time:";
-+const pickerReloadedRuntimes = new WeakSet();
- function formatBrowserThinkingLog(message) {
-     return `${BROWSER_THINKING_LOG_PREFIX} ${message.replace(/^Thinking time:\s*/, "")}`;
- }
-@@ -23,19 +24,45 @@
- /**
-  * Selects a thinking-time level in ChatGPT's composer.
-  *
-- * Missing controls remain best-effort except Pro Extended, which fails closed
-- * unless the selected option is confirmed.
-+ * High-effort targets fail closed unless the selected option is confirmed.
-  */
--export async function ensureThinkingTime(Runtime, level, logger, desiredModel) {
--    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
-+export async function ensureThinkingTime(Runtime, level, logger, desiredModel, Input) {
-+    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
-+    if (result?.status === "chip-not-found" &&
-+        Runtime &&
-+        (typeof Runtime === "object" || typeof Runtime === "function") &&
-+        !pickerReloadedRuntimes.has(Runtime)) {
-+        pickerReloadedRuntimes.add(Runtime);
-+        let reloadStarted = false;
-+        try {
-+            await Runtime.evaluate({ expression: "location.reload(); true", returnByValue: true });
-+            reloadStarted = true;
-+        }
-+        catch {
-+            // The normal fail-closed result below remains authoritative.
-+        }
-+        if (reloadStarted) {
-+            logger(`${BROWSER_THINKING_LOG_PREFIX} picker missing; reloading the isolated page once before verification.`);
-+            await new Promise((resolve) => setTimeout(resolve, 5_000));
-+            return ensureThinkingTime(Runtime, level, logger, desiredModel, Input);
-+        }
-+    }
-     const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
-     const targetModelKind = inferThinkingTargetModelKind(desiredModel);
-     const observedModelKind = result && "modelKind" in result ? result.modelKind : null;
--    // Pro is expensive and rate-limited, so a Pro request must never degrade quietly
--    // into a cheaper tier. Requesting it explicitly (level "pro") fails closed on its
--    // own, independently of the legacy Pro-model + "extended" combination.
--    const strictProEffort = level === "pro" ||
-+    // Every effort tier used by the local oracle-web workflow must be verified
-+    // before submission; never continue on an unknown fourth or fifth position.
-+    const strictTopEffort = level === "extra-high" || level === "max" || level === "pro" || level === "ultra" ||
-         ((targetModelKind === "pro" || observedModelKind === "pro") && level === "extended");
-+    const strictTarget = level === "extra-high"
-+        ? "position 4"
-+        : level === "max"
-+            ? "position 5"
-+            : level === "pro"
-+                ? "Pro"
-+                : level === "ultra"
-+                    ? "Ultra"
-+                    : "Pro Extended";
-     switch (result?.status) {
-         case "already-selected":
-             logger(formatBrowserThinkingLog(`${result.label ?? capitalizedLevel} (already selected)`));
-@@ -56,9 +83,8 @@
-                     ? ` for ${targetModelKind}`
-                     : "";
-             const message = `Thinking time: ${result.status.replaceAll("-", " ")}${kindHint} (requested ${capitalizedLevel})`;
--            if (strictProEffort) {
--                const target = level === "pro" ? "Pro" : "Pro Extended";
--                throw new Error(`${message}; refusing to submit without confirmed ${target}.`);
-+            if (strictTopEffort) {
-+                throw new Error(`${message}; refusing to submit without confirmed ${strictTarget}.`);
-             }
-             // "selection-unverified" is the one status here that already dispatched a
-             // click, so the effort may or may not have moved. Every other status left
-@@ -72,9 +98,8 @@
-         default: {
-             await logDomFailure(Runtime, logger, "thinking-time-unknown");
-             logPickerDiagnostic(result, logger);
--            if (strictProEffort) {
--                const target = level === "pro" ? "Pro" : "Pro Extended";
--                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${target}.`);
-+            if (strictTopEffort) {
-+                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${strictTarget}.`);
-             }
-             logger(formatBrowserThinkingLog(`unknown outcome selecting ${capitalizedLevel}; continuing with ChatGPT default.`));
-             return;
-@@ -84,11 +109,11 @@
- /**
-  * Best-effort selection of a thinking time level in ChatGPT's composer pill menu.
-  * Safe by default: if the pill/menu/option isn't present, we continue without throwing.
-- * @param level - The thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'pro', or 'heavy'
-+ * @param level - The thinking time intensity, including current max/ultra and legacy pro/heavy labels
-  */
--export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel) {
-+export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel, Input) {
-     try {
--        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
-+        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
-         const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
-         switch (result?.status) {
-             case "already-selected":
-@@ -122,13 +147,242 @@
-         return false;
+diff -ruN a/dist/src/browser/actions/assistantResponse.js b/dist/src/browser/actions/assistantResponse.js
+--- a/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:04:12
++++ b/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:09:02
+@@ -15,6 +15,7 @@
+ const TERMINAL_GATE_CONFIG = {
+     barConfirmCycles: readPositiveIntEnv("ORACLE_BAR_CONFIRM_CYCLES", 3),
+     minStableMs: readPositiveIntEnv("ORACLE_TERMINAL_MIN_STABLE_MS", 1_200),
++    quietStableMs: readPositiveIntEnv("ORACLE_TERMINAL_QUIET_STABLE_MS", 8_000),
+ };
+ export function createTerminalGateState(now) {
+     return {
+@@ -48,11 +49,19 @@
+         // requirement guards the documented race where finished-action controls surface while only
+         // the first tokens have rendered. Weak sidecar evidence cannot hang a finished turn, but
+         // strong live activity vetoes this proof and restarts its debounce.
+-        terminal =
++        const actionBarProof =
+             sample.barVisible &&
+                 !sample.strongThinkingActive &&
+                 barStableCycles >= config.barConfirmCycles &&
+                 stableMs >= config.minStableMs;
++        // Some completed ChatGPT turns never mount the action bar. A longer quiet
++        // window is a second proof: content must remain unchanged, no stop control
++        // may be present, and no strong thinking signal may be active. The longer
++        // threshold keeps short rendering pauses from finalizing a preamble.
++        const quietProof = sample.len >= MIN_CONFIDENT_ANSWER_LENGTH &&
++            !sample.strongThinkingActive &&
++            stableMs >= config.quietStableMs;
++        terminal = actionBarProof || quietProof;
      }
+     return { state: next, terminal };
  }
--async function evaluateThinkingTimeSelection(Runtime, level, desiredModel) {
-+function isThinkingPointerAction(result) {
-+    return result?.status === "slider-click-required" ||
-+        result?.status === "slider-drag-required" ||
-+        result?.status === "slider-hover-required";
-+}
-+function sameThinkingViewport(left, right) {
-+    if (!left || !right)
-+        return false;
-+    return left.width === right.width &&
-+        left.height === right.height &&
-+        left.visualWidth === right.visualWidth &&
-+        left.visualHeight === right.visualHeight &&
-+        left.visualOffsetLeft === right.visualOffsetLeft &&
-+        left.visualOffsetTop === right.visualOffsetTop;
-+}
-+async function refreshThinkingPointerAction(Runtime, level, desiredModel, previous) {
-     const outcome = await Runtime.evaluate({
-         expression: buildThinkingTimeExpression(level, desiredModel),
-         awaitPromise: true,
-         returnByValue: true,
-     });
--    return outcome.result?.value;
-+    const current = outcome.result?.value;
-+    if (!isThinkingPointerAction(current) ||
-+        current.status !== previous.status ||
-+        current.purpose !== previous.purpose ||
-+        !sameThinkingViewport(previous.viewport, current.viewport)) {
-+        return { status: "retry", result: current };
-+    }
-+    if (current.hitTargetMatches !== true ||
-+        (current.status === "slider-drag-required" && current.destinationHitTargetMatches !== true)) {
-+        return { status: "blocked", result: current };
-+    }
-+    return { status: "ready", result: current };
-+}
-+async function evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input) {
-+    let lastResult;
-+    for (let attempt = 0; attempt < 16; attempt += 1) {
-+        const outcome = await Runtime.evaluate({
-+            expression: buildThinkingTimeExpression(level, desiredModel),
-+            awaitPromise: true,
-+            returnByValue: true,
-+        });
-+        lastResult = outcome.result?.value;
-+        if (lastResult?.status !== "slider-key-required" && !isThinkingPointerAction(lastResult)) {
-+            return lastResult;
-+        }
-+        if (!Input || typeof Input.dispatchKeyEvent !== "function") {
-+            return {
-+                ...lastResult,
-+                status: "selection-unverified",
-+                sliderInputAvailable: false,
-+            };
-+        }
-+        if (isThinkingPointerAction(lastResult)) {
-+            if (typeof Input.dispatchMouseEvent !== "function") {
-+                return {
-+                    ...lastResult,
-+                    status: "selection-unverified",
-+                    sliderPointerAvailable: false,
-+                };
-+            }
-+            let refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, lastResult);
-+            if (refreshed.status === "retry") {
-+                lastResult = refreshed.result;
-+                continue;
-+            }
-+            if (refreshed.status === "blocked") {
-+                return {
-+                    ...refreshed.result,
-+                    status: "selection-unverified",
-+                    pointerTargetVerified: false,
-+                };
-+            }
-+            let action = refreshed.result;
-+            const x = Number(action.x);
-+            const y = Number(action.y);
-+            if (!Number.isFinite(x) || !Number.isFinite(y)) {
-+                return { ...action, status: "selection-unverified" };
-+            }
-+            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y: y - 20 });
-+            await new Promise((resolve) => setTimeout(resolve, 100));
-+            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
-+            refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
-+            if (refreshed.status === "retry") {
-+                lastResult = refreshed.result;
-+                continue;
-+            }
-+            if (refreshed.status === "blocked") {
-+                return {
-+                    ...refreshed.result,
-+                    status: "selection-unverified",
-+                    pointerTargetVerified: false,
-+                };
-+            }
-+            action = refreshed.result;
-+            const actionX = Number(action.x);
-+            const actionY = Number(action.y);
-+            if (!Number.isFinite(actionX) || !Number.isFinite(actionY)) {
-+                return { ...action, status: "selection-unverified" };
-+            }
-+            if (action.status === "slider-click-required") {
-+                await Input.dispatchMouseEvent({
-+                    type: "mousePressed",
-+                    x: actionX,
-+                    y: actionY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+                await Input.dispatchMouseEvent({
-+                    type: "mouseReleased",
-+                    x: actionX,
-+                    y: actionY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+            }
-+            else if (action.status === "slider-drag-required") {
-+                const targetX = Number(action.clickX);
-+                const targetY = Number(action.clickY);
-+                if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
-+                    return { ...action, status: "selection-unverified" };
-+                }
-+                // ChatGPT's slider ignores a drag until its visual thumb has first
-+                // received a standalone trusted click. Activate the thumb, then
-+                // start a separate drag to the requested stop.
-+                await Input.dispatchMouseEvent({
-+                    type: "mousePressed",
-+                    x: actionX,
-+                    y: actionY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+                await Input.dispatchMouseEvent({
-+                    type: "mouseReleased",
-+                    x: actionX,
-+                    y: actionY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+                await new Promise((resolve) => setTimeout(resolve, 150));
-+                refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
-+                if (refreshed.status !== "ready") {
-+                    lastResult = refreshed.result;
-+                    if (refreshed.status === "blocked") {
-+                        return {
-+                            ...refreshed.result,
-+                            status: "selection-unverified",
-+                            pointerTargetVerified: false,
-+                        };
-+                    }
-+                    continue;
-+                }
-+                action = refreshed.result;
-+                const dragStartX = Number(action.x);
-+                const dragStartY = Number(action.y);
-+                const dragTargetX = Number(action.clickX);
-+                const dragTargetY = Number(action.clickY);
-+                if (![dragStartX, dragStartY, dragTargetX, dragTargetY].every(Number.isFinite)) {
-+                    return { ...action, status: "selection-unverified" };
-+                }
-+                await Input.dispatchMouseEvent({
-+                    type: "mousePressed",
-+                    x: dragStartX,
-+                    y: dragStartY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+                await Input.dispatchMouseEvent({
-+                    type: "mouseMoved",
-+                    x: (dragStartX + dragTargetX) / 2,
-+                    y: (dragStartY + dragTargetY) / 2,
-+                    button: "left",
-+                });
-+                await Input.dispatchMouseEvent({
-+                    type: "mouseMoved",
-+                    x: dragTargetX,
-+                    y: dragTargetY,
-+                    button: "left",
-+                });
-+                await Input.dispatchMouseEvent({
-+                    type: "mouseReleased",
-+                    x: dragTargetX,
-+                    y: dragTargetY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+            }
-+            else {
-+                // The compact power row has zero height until it receives a real
-+                // pointer interaction. Click its activation strip first; the next
-+                // probe observes the expanded 32px control and can click the thumb
-+                // before starting a separate drag.
-+                await Input.dispatchMouseEvent({
-+                    type: "mousePressed",
-+                    x: actionX,
-+                    y: actionY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+                await Input.dispatchMouseEvent({
-+                    type: "mouseReleased",
-+                    x: actionX,
-+                    y: actionY,
-+                    button: "left",
-+                    clickCount: 1,
-+                });
-+                await new Promise((resolve) => setTimeout(resolve, 1000));
-+            }
-+        }
-+        else {
-+            const requestedKey = lastResult.key;
-+            const key = requestedKey === "ArrowLeft" || requestedKey === "ArrowDown"
-+                ? requestedKey
-+                : "ArrowRight";
-+            const virtualKeyCode = key === "ArrowLeft" ? 37 : key === "ArrowDown" ? 40 : 39;
-+            await Input.dispatchKeyEvent({
-+                type: "keyDown",
-+                key,
-+                code: key,
-+                windowsVirtualKeyCode: virtualKeyCode,
-+                nativeVirtualKeyCode: virtualKeyCode,
-+            });
-+            await Input.dispatchKeyEvent({
-+                type: "keyUp",
-+                key,
-+                code: key,
-+                windowsVirtualKeyCode: virtualKeyCode,
-+                nativeVirtualKeyCode: virtualKeyCode,
-+            });
-+        }
-+        await new Promise((resolve) => setTimeout(resolve, lastResult?.status === "slider-hover-required" ? 500 : 200));
-+    }
-+    return {
-+        ...lastResult,
-+        status: "selection-unverified",
-+    };
- }
- function buildThinkingTimeExpression(level, desiredModel) {
-     const menuContainerLiteral = JSON.stringify(MENU_CONTAINER_SELECTOR);
-@@ -137,6 +391,7 @@
-     const targetLevelLiteral = JSON.stringify(level.toLowerCase());
-     const targetModelKindLiteral = JSON.stringify(inferThinkingTargetModelKind(desiredModel));
-     const targetIsGpt56ModelLiteral = JSON.stringify(/(?:^|[^0-9])5[._ -]6(?:[^0-9]|$)/i.test(desiredModel ?? ""));
-+    const manualUltraPauseMsLiteral = JSON.stringify(Math.max(0, Number.parseInt(process.env.ORACLE_ULTRA_MANUAL_PAUSE_MS ?? "0", 10) || 0));
-     return `(async () => {
-     ${buildClickDispatcher()}
-
-@@ -146,6 +401,7 @@
-     const TARGET_LEVEL = ${targetLevelLiteral};
-     const TARGET_MODEL_KIND = ${targetModelKindLiteral};
-     const TARGET_IS_GPT56_MODEL = ${targetIsGpt56ModelLiteral};
-+    const MANUAL_ULTRA_PAUSE_MS = ${manualUltraPauseMsLiteral};
-
-     // Multilingual matchers: English level token + observed German/Japanese/Chinese variants.
-     const LEVEL_TOKENS = {
-@@ -153,6 +409,8 @@
-       standard: ['standard', 'medium', 'mittel', '中程度', '标准', '中'],
-       extended: ['extended', 'high', 'hoch', 'erweitert', '高い', '扩展', '深度', '加强', '高'],
-       'extra-high': ['extra high', 'sehr hoch', '非常に高い', '极高'],
-+      max: ['max'],
-+      ultra: ['ultra', '超高'],
-       heavy: ['heavy', 'schwer', '重度', '加重'],
-     };
-     // Pro is a tier you can request, but it is also a MODEL name, so it must never
-@@ -171,6 +429,34 @@
-     const INTELLIGENCE_WAIT_MS = 2500;
-
-     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-+    const viewportSnapshot = () => ({
-+      width: window.innerWidth,
-+      height: window.innerHeight,
-+      visualWidth: window.visualViewport?.width ?? window.innerWidth,
-+      visualHeight: window.visualViewport?.height ?? window.innerHeight,
-+      visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
-+      visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
-+    });
-+    const pointerRequest = (status, target, x, y, extra = {}) => {
-+      const hit = document.elementFromPoint(x, y);
-+      const destinationX = Number(extra.clickX);
-+      const destinationY = Number(extra.clickY);
-+      const destinationHit = Number.isFinite(destinationX) && Number.isFinite(destinationY)
-+        ? document.elementFromPoint(destinationX, destinationY)
-+        : null;
-+      return {
-+        status,
-+        x,
-+        y,
-+        ...extra,
-+        viewport: viewportSnapshot(),
-+        hitTargetMatches: Boolean(hit && (target === hit || target?.contains?.(hit))),
-+        destinationHitTargetMatches:
-+          destinationHit === null
-+            ? null
-+            : Boolean(destinationHit && (target === destinationHit || target?.contains?.(destinationHit))),
-+      };
-+    };
-     // Keep CJK characters, including Japanese kana, so localized labels survive
-     // normalization before being matched against LEVEL_TOKENS and picker controls.
-     const normalize = (value) => (value || '')
-@@ -295,15 +581,27 @@
-     const describeNode = (el) => {
-       if (!el || typeof el.getAttribute !== 'function') return null;
-       let rect = null;
-+      let style = null;
-       try {
-         const r = el.getBoundingClientRect?.();
-         if (r) {
-           rect = {
-+            x: Math.round(r.left),
-+            y: Math.round(r.top),
-             w: Math.round(r.width),
-             h: Math.round(r.height),
-             visible: r.width > 0 && r.height > 0,
-           };
-         }
-+        const computed = window.getComputedStyle?.(el);
-+        if (computed) {
-+          style = {
-+            display: computed.display,
-+            visibility: computed.visibility,
-+            opacity: computed.opacity,
-+            pointerEvents: computed.pointerEvents,
-+          };
-+        }
-       } catch {}
-       return {
-         tag: el.tagName || null,
-@@ -315,8 +613,10 @@
-         ariaSelected: el.getAttribute('aria-selected'),
-         ariaHaspopup: el.getAttribute('aria-haspopup'),
-         dataState: el.getAttribute('data-state'),
-+        tabIndex: typeof el.tabIndex === 'number' ? el.tabIndex : null,
-         text: redactDiagnosticText(el.textContent, 80),
-         rect,
-+        style,
-       };
-     };
-     const describeMenu = (menu) => {
-@@ -346,9 +646,28 @@
-           isVisible,
-         );
-         const modelBtn = findModelButton();
-+        let sliderProbe = null;
-+        try {
-+          const effortMenu = findVisibleEffortMenu(null);
-+          const sliderView = findPowerSliderView(effortMenu);
-+          const sliderControl = findPowerSliderControl(effortMenu, sliderView);
-+          const sliderRect = sliderControl?.getBoundingClientRect?.();
-+          if (sliderRect && sliderRect.width > 0) {
-+            const probeX = sliderRect.right - Math.min(24, sliderRect.width * 0.1);
-+            const probeY = sliderRect.top + (sliderRect.height > 0 ? sliderRect.height / 2 : 16);
-+            sliderProbe = {
-+              control: describeNode(sliderControl),
-+              hitTarget: describeNode(document.elementFromPoint(probeX, probeY)),
-+              x: Math.round(probeX),
-+              y: Math.round(probeY),
-+            };
-+          }
-+        } catch {}
-         return {
-           targetModelKind: TARGET_MODEL_KIND,
-           targetLevel: TARGET_LEVEL,
-+          sliderProbe,
-+          activeElement: describeNode(document.activeElement),
-           modelButton: describeNode(modelBtn),
-           composerButtons: composerButtons.slice(0, 12).map(describeNode),
-           trailingCount: trailings.length,
-@@ -685,6 +1004,7 @@
-     // (simple view) plus an "Advanced" view holding two submenu openers: Model and
-     // Effort. The tier rows only exist inside the Effort submenu, so the flat scan
-     // of the top-level menu finds nothing and we must expand and descend.
-+    const SIMPLE_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-simple-view"]';
-     const ADVANCED_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-advanced-view"]';
-     const SUBMENU_OPENER_SELECTOR = '[role="menuitem"][aria-haspopup="menu"]';
-     const nodeLabel = (node) =>
-@@ -697,10 +1017,223 @@
-       'avanzado', 'avancado', 'avance',
-     ];
-     const EFFORT_WORDS = [
--      'effort', 'aufwand', '强度', '努力', '推論レベル',
-+      'effort', 'power', 'aufwand', '强度', '能力', '努力', '推論レベル',
-       'esfuerzo', 'esforco', 'sforzo', 'inspanning', 'wysilek',
-     ];
-     const containsAny = (label, words) => words.some((word) => label.includes(word));
-+    const SLIDER_LEVEL_INDEX = {
-+      light: 1,
-+      standard: 2,
-+      extended: 3,
-+      'extra-high': 4,
-+      max: 5,
-+      ultra: 6,
-+    };
-+    const parseSliderPosition = (value) => {
-+      const text = String(value ?? '').replace(/\\s+/g, ' ').trim();
-+      const english = text.match(/(?:item\\s*)?(\\d+)\\s+of\\s+(\\d+)/i);
-+      if (english) return { index: Number(english[1]), total: Number(english[2]), text };
-+      const chinese = text.match(/第\\s*(\\d+)\\s*项\\s*[，,]?\\s*共\\s*(\\d+)\\s*项/);
-+      if (chinese) return { index: Number(chinese[1]), total: Number(chinese[2]), text };
-+      return null;
-+    };
-+    const findPowerSliderView = (menu) => {
-+      const scoped = menu?.querySelector?.(SIMPLE_VIEW_SELECTOR);
-+      if (isVisible(scoped)) return scoped;
-+      const global = document.querySelector(SIMPLE_VIEW_SELECTOR);
-+      return isVisible(global) ? global : null;
-+    };
-+    const findPowerSliderControl = (menu, view) => {
-+      const direct = view?.querySelector?.('[role="slider"], input[type="range"], [tabindex]');
-+      if (isVisible(direct)) return direct;
-+      // In the current Intelligence picker the zero-height Power row is a
-+      // sibling of the simple view, not its descendant. Search the whole menu
-+      // first so the outer CDP loop can activate it before the thumb appears.
-+      const scope = menu || view?.parentElement || document;
-+      let mountedKeyboardTarget = null;
-+      for (const item of scope.querySelectorAll('[role="slider"], input[type="range"], [role="menuitem"]')) {
-+        if (!containsAny(nodeLabel(item), EFFORT_WORDS)) continue;
-+        if (isVisible(item)) return item;
-+        // The current UI mounts a zero-height role=menuitem labelled "Power" as
-+        // the slider's keyboard target. It has no visual box by design but owns
-+        // the arrow-key handler, so presence is sufficient once the view exists.
-+        mountedKeyboardTarget ||= item;
-+      }
-+      return mountedKeyboardTarget;
-+    };
-+    const readPowerSliderState = (menu) => {
-+      const view = findPowerSliderView(menu);
-+      if (!view) return null;
-+      const control = findPowerSliderControl(menu, view);
-+      if (control) {
-+        const now = Number(control.getAttribute?.('aria-valuenow') ?? control.value);
-+        const min = Number(control.getAttribute?.('aria-valuemin') ?? control.min);
-+        const max = Number(control.getAttribute?.('aria-valuemax') ?? control.max);
-+        if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
-+          return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
-+        }
-+      }
-+      const parsed = parseSliderPosition(view.textContent ?? view.getAttribute?.('aria-label'));
-+      return parsed ? { ...parsed, view, control } : null;
-+    };
-+    const selectEffortFromPowerSlider = async (menu) => {
-+      const targetIndex = SLIDER_LEVEL_INDEX[TARGET_LEVEL];
-+      if (!targetIndex || !menu) return null;
-+      // The simple slider view and its position text render before the keyboard
-+      // target becomes visible. Wait for that target instead of treating the
-+      // temporarily zero-height Power menu item as an unsupported layout.
-+      if (!findPowerSliderView(menu)) return null;
-+      if (
-+        TARGET_LEVEL === 'ultra' &&
-+        MANUAL_ULTRA_PAUSE_MS > 0 &&
-+        !window.__oracleUltraManualPauseCompleted
-+      ) {
-+        window.__oracleUltraManualPauseCompleted = true;
-+        await sleep(MANUAL_ULTRA_PAUSE_MS);
-+        if (!isVisible(menu?.querySelector?.(SIMPLE_VIEW_SELECTOR))) {
-+          menu = findVisibleEffortMenu(null) || menu;
-+        }
-+      }
-+      let state = null;
-+      const readyDeadline = performance.now() + MAX_WAIT_MS;
-+      while (performance.now() < readyDeadline) {
-+        // Keep the menu that actually owns the slider. A global scan can return
-+        // an inner Radix collection root whose aggregate text looks identical
-+        // but which does not contain the simple slider view.
-+        const currentMenu = isVisible(menu?.querySelector?.(SIMPLE_VIEW_SELECTOR))
-+          ? menu
-+          : (findVisibleEffortMenu(null) || menu);
-+        const candidate = readPowerSliderState(currentMenu);
-+        if (candidate && candidate.total >= targetIndex) {
-+          const control = candidate.control || findPowerSliderControl(currentMenu, candidate.view);
-+          if (candidate.index === targetIndex || control) {
-+            state = { ...candidate, control };
-+            menu = currentMenu;
-+            break;
-+          }
-+        }
-+        await sleep(100);
-+      }
-+      if (!state) {
-+        return failure('selection-unverified', {
-+          requestedSliderPosition: String(targetIndex) + '/6',
-+          sliderControlReady: false,
-+        });
-+      }
-+      const initialIndex = state.index;
-+      if (state.index === targetIndex) {
-+        closeOpenMenus();
-+        return { status: 'already-selected', label: state.text || TARGET_LEVEL };
-+      }
-+      let control = state.control || findPowerSliderControl(menu, state.view);
-+      if (!control) {
-+        return failure('selection-unverified', {
-+          sliderPosition: String(state.index) + '/' + String(state.total),
-+          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+          sliderControlReady: false,
-+        });
-+      }
-+      const activeElement = document.activeElement;
-+      const powerHasFocus = activeElement === control;
-+      const pointerAttempts = Number(window.__oraclePowerSliderPointerAttempts ?? 0);
-+      const keyboardFocusAttempts = Number(window.__oraclePowerSliderKeyboardFocusAttempts ?? 0);
-+      const controlRect = control.getBoundingClientRect?.();
-+      if (powerHasFocus) {
-+        return {
-+          status: 'slider-key-required',
-+          key: state.index < targetIndex ? 'ArrowRight' : 'ArrowLeft',
-+          sliderPosition: String(state.index) + '/' + String(state.total),
-+          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+          sliderFocused: true,
-+          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
-+          diagnostic: collectPickerDiagnostic(),
-+        };
-+      }
-+      if (keyboardFocusAttempts < 4) {
-+        window.__oraclePowerSliderKeyboardFocusAttempts = keyboardFocusAttempts + 1;
-+        if (!menu.contains?.(activeElement)) {
-+          try { menu.focus?.({ preventScroll: true }); } catch {}
-+        }
-+        return {
-+          status: 'slider-key-required',
-+          key: 'ArrowDown',
-+          sliderPosition: String(state.index) + '/' + String(state.total),
-+          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+          sliderFocused: false,
-+          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
-+          diagnostic: collectPickerDiagnostic(),
-+        };
-+      }
-+      // Prefer the slider's ARIA/keyboard path. A trusted click is used only to
-+      // focus the current thumb after the menu's roving-focus keys did not land;
-+      // the next probe sends an arrow key.
-+      if (isVisible(control) && pointerAttempts < 2) {
-+        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
-+        const rect = control.getBoundingClientRect();
-+        const inset = Math.min(24, rect.width * 0.1);
-+        const usableWidth = Math.max(1, rect.width - (2 * inset));
-+        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
-+        return pointerRequest(
-+          'slider-click-required',
-+          control,
-+          rect.left + inset + (usableWidth * currentRatio),
-+          rect.top + (rect.height / 2),
-+          {
-+            purpose: 'focus-power-slider',
-+            sliderPosition: String(state.index) + '/' + String(state.total),
-+            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
-+            diagnostic: collectPickerDiagnostic(),
-+          },
-+        );
-+      }
-+      // Some picker versions refuse focus even after trusted clicks. Keep one
-+      // verified drag fallback, with both endpoints hit-tested against the slider.
-+      if (isVisible(control)) {
-+        const rect = control.getBoundingClientRect();
-+        const inset = Math.min(24, rect.width * 0.1);
-+        const usableWidth = Math.max(1, rect.width - (2 * inset));
-+        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
-+        const targetRatio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
-+        return pointerRequest(
-+          'slider-drag-required',
-+          control,
-+          rect.left + inset + (usableWidth * currentRatio),
-+          rect.top + (rect.height / 2),
-+          {
-+            clickX: rect.left + inset + (usableWidth * targetRatio),
-+            clickY: rect.top + (rect.height / 2),
-+            purpose: 'drag-power-slider',
-+            sliderPosition: String(state.index) + '/' + String(state.total),
-+            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
-+            diagnostic: collectPickerDiagnostic(),
-+          },
-+        );
-+      }
-+      if (controlRect && controlRect.width > 0 && !powerHasFocus && pointerAttempts < 2) {
-+        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
-+        const viewRect = state.view.getBoundingClientRect();
-+        return pointerRequest(
-+          'slider-hover-required',
-+          state.view,
-+          viewRect.left + (viewRect.width / 2),
-+          viewRect.top + (viewRect.height / 2),
-+          {
-+            purpose: 'activate-power-slider',
-+            sliderPosition: String(state.index) + '/' + String(state.total),
-+            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+            diagnostic: collectPickerDiagnostic(),
-+          },
-+        );
-+      }
-+      return failure('selection-unverified', {
-+        sliderPosition: String(state.index) + '/' + String(state.total),
-+        requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
-+        sliderFocused: false,
-+        diagnostic: collectPickerDiagnostic(),
-+      });
-+    };
-     const findAdvancedToggle = (menu) => {
-       for (const item of (menu || document).querySelectorAll('[role="menuitem"]')) {
-         if (!isVisible(item)) continue;
-@@ -855,6 +1388,12 @@
-     };
-     const legacyEffortOwnerIsReady = () => {
-       if (
-+        SLIDER_LEVEL_INDEX[TARGET_LEVEL] &&
-+        isVisible(document.querySelector(INTELLIGENCE_MENU_SELECTOR))
-+      ) {
-+        return true;
-+      }
-+      if (
-         TARGET_MODEL_KIND === 'pro' &&
-         TARGET_LEVEL === 'extended' &&
-         isVisible(document.querySelector(INTELLIGENCE_MENU_SELECTOR))
-@@ -920,6 +1459,10 @@
-       while (performance.now() < deadline) {
-         const menu = findVisibleEffortMenu(composerEffortPill);
-         if (menu) {
-+          const powerSliderResult = await selectEffortFromPowerSlider(menu);
-+          if (powerSliderResult) {
-+            return powerSliderResult;
-+          }
-           const proEffortResult = await selectProEffortFromSubmenu();
-           if (proEffortResult) {
-             return proEffortResult;
-@@ -1034,10 +1577,24 @@
-       modelBtn.getAttribute('aria-expanded') !== 'true' &&
-       !legacyEffortOwnerIsReady()
-     ) {
--      dispatchClickSequence(modelBtn);
--      await sleep(INITIAL_WAIT_MS);
-+      // The slider only mounts its interactive thumb after a trusted click on
-+      // the composer pill. Ask the outer CDP loop to perform that click instead
-+      // of opening this picker with synthetic DOM events.
-+      const rect = modelBtn.getBoundingClientRect();
-+      return pointerRequest(
-+        'slider-click-required',
-+        modelBtn,
-+        rect.left + (rect.width / 2),
-+        rect.top + (rect.height / 2),
-+        { purpose: 'open-effort-picker' },
-+      );
-     }
-
-+    const powerSliderResult = await selectEffortFromPowerSlider(findVisibleEffortMenu(modelBtn));
-+    if (powerSliderResult) {
-+      return powerSliderResult;
-+    }
-+
-     // ---------- COMPATIBILITY UI: unified "Intelligence" effort picker ----------
-     // One observed ChatGPT layout replaced the per-model trailing buttons with a single
-     // "Intelligence" menu ([data-testid="composer-intelligence-picker-content"]),
 diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/attachments.js
---- a/dist/src/browser/actions/attachments.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/actions/attachments.js	2026-09-07 10:07:35
+--- a/dist/src/browser/actions/attachments.js	2026-09-07 15:04:26
++++ b/dist/src/browser/actions/attachments.js	2026-09-07 15:03:25
 @@ -1032,7 +1032,9 @@
          const inputNameCandidates = resolveInputNameCandidates();
          const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
@@ -829,9 +100,31 @@ diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/a
                  if (value.state === "missing" && (value.filesAttached || fileCountSatisfied)) {
                      return;
                  }
+diff -ruN a/dist/src/browser/actions/navigation.js b/dist/src/browser/actions/navigation.js
+--- a/dist/src/browser/actions/navigation.js	2026-09-07 15:04:26
++++ b/dist/src/browser/actions/navigation.js	2026-09-07 15:03:25
+@@ -37,7 +37,17 @@
+ export async function navigateToChatGPT(Page, Runtime, url, logger) {
+     logger(`Navigating to ${url}`);
+     await Page.navigate({ url });
+-    await waitForDocumentReady(Runtime, 45_000);
++    try {
++        await waitForDocumentReady(Runtime, 45_000);
++    }
++    catch (error) {
++        if (typeof Page.reload !== "function") {
++            throw error;
++        }
++        logger("[nav] initial document readiness timed out; reloading the isolated tab once.");
++        await Page.reload({ ignoreCache: false });
++        await waitForDocumentReady(Runtime, 45_000);
++    }
+ }
+ async function dismissBlockingUi(Runtime, logger) {
+     const outcome = await Runtime.evaluate({
 diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 10:12:09
+--- a/dist/src/browser/actions/promptComposer.js	2026-09-07 15:04:26
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 15:03:25
 @@ -54,9 +54,39 @@
            candidates.push(node);
          }
@@ -1125,7 +418,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
          await delay(100);
      }
      if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
-@@ -659,23 +836,179 @@
+@@ -659,22 +836,178 @@
      }
      return false;
  }
@@ -1278,7 +571,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        code: "trusted-target-resized",
 +        kind,
      });
- }
++}
 +async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
 +    const deadline = Date.now() + timeoutMs;
 +    const baseline = typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
@@ -1314,13 +607,1177 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        await delay(100);
 +    }
 +    return false;
-+}
+ }
  function sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs) {
      if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
-         return 20_000;
+diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
+--- a/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:04:26
++++ b/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:10:06
+@@ -2,6 +2,7 @@
+ import { logDomFailure } from "../domDebug.js";
+ import { buildClickDispatcher } from "./domEvents.js";
+ const BROWSER_THINKING_LOG_PREFIX = "[browser] Thinking time:";
++const pickerReloadedRuntimes = new WeakSet();
+ function formatBrowserThinkingLog(message) {
+     return `${BROWSER_THINKING_LOG_PREFIX} ${message.replace(/^Thinking time:\s*/, "")}`;
+ }
+@@ -20,29 +21,65 @@
+     }
+     logger(`[browser] Model picker diagnostic: ${JSON.stringify(diagnostic)}`);
+ }
++function buildThinkingSelectionEvidence(level, result, verified) {
++    return {
++        requestedLevel: level,
++        resolvedLabel: result?.label ?? null,
++        status: result?.status ?? "unknown",
++        verified,
++        source: "thinking-time-control",
++        capturedAt: new Date().toISOString(),
++    };
++}
+ /**
+  * Selects a thinking-time level in ChatGPT's composer.
+  *
+- * Missing controls remain best-effort except Pro Extended, which fails closed
+- * unless the selected option is confirmed.
++ * High-effort targets fail closed unless the selected option is confirmed.
+  */
+-export async function ensureThinkingTime(Runtime, level, logger, desiredModel) {
+-    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
++export async function ensureThinkingTime(Runtime, level, logger, desiredModel, Input) {
++    const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
++    if (result?.status === "chip-not-found" &&
++        Runtime &&
++        (typeof Runtime === "object" || typeof Runtime === "function") &&
++        !pickerReloadedRuntimes.has(Runtime)) {
++        pickerReloadedRuntimes.add(Runtime);
++        let reloadStarted = false;
++        try {
++            await Runtime.evaluate({ expression: "location.reload(); true", returnByValue: true });
++            reloadStarted = true;
++        }
++        catch {
++            // The normal fail-closed result below remains authoritative.
++        }
++        if (reloadStarted) {
++            logger(`${BROWSER_THINKING_LOG_PREFIX} picker missing; reloading the isolated page once before verification.`);
++            await new Promise((resolve) => setTimeout(resolve, 5_000));
++            return ensureThinkingTime(Runtime, level, logger, desiredModel, Input);
++        }
++    }
+     const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
+     const targetModelKind = inferThinkingTargetModelKind(desiredModel);
+     const observedModelKind = result && "modelKind" in result ? result.modelKind : null;
+-    // Pro is expensive and rate-limited, so a Pro request must never degrade quietly
+-    // into a cheaper tier. Requesting it explicitly (level "pro") fails closed on its
+-    // own, independently of the legacy Pro-model + "extended" combination.
+-    const strictProEffort = level === "pro" ||
++    // Every effort tier used by the local oracle-web workflow must be verified
++    // before submission; never continue on an unknown fourth or fifth position.
++    const strictTopEffort = level === "extra-high" || level === "max" || level === "pro" || level === "ultra" ||
+         ((targetModelKind === "pro" || observedModelKind === "pro") && level === "extended");
++    const strictTarget = level === "extra-high"
++        ? "position 4"
++        : level === "max"
++            ? "position 5"
++            : level === "pro"
++                ? "Pro"
++                : level === "ultra"
++                    ? "Ultra"
++                    : "Pro Extended";
+     switch (result?.status) {
+         case "already-selected":
+             logger(formatBrowserThinkingLog(`${result.label ?? capitalizedLevel} (already selected)`));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, true);
+         case "switched":
+             logger(formatBrowserThinkingLog(result.label ?? capitalizedLevel));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, true);
+         case "chip-not-found":
+         case "menu-not-found":
+         case "option-not-found":
+@@ -56,9 +93,8 @@
+                     ? ` for ${targetModelKind}`
+                     : "";
+             const message = `Thinking time: ${result.status.replaceAll("-", " ")}${kindHint} (requested ${capitalizedLevel})`;
+-            if (strictProEffort) {
+-                const target = level === "pro" ? "Pro" : "Pro Extended";
+-                throw new Error(`${message}; refusing to submit without confirmed ${target}.`);
++            if (strictTopEffort) {
++                throw new Error(`${message}; refusing to submit without confirmed ${strictTarget}.`);
+             }
+             // "selection-unverified" is the one status here that already dispatched a
+             // click, so the effort may or may not have moved. Every other status left
+@@ -67,28 +103,27 @@
+                 ? "the effort in ChatGPT is unconfirmed"
+                 : "keeping the effort already selected in ChatGPT";
+             logger(formatBrowserThinkingLog(`${message}; ${outcome}.`));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, false);
+         }
+         default: {
+             await logDomFailure(Runtime, logger, "thinking-time-unknown");
+             logPickerDiagnostic(result, logger);
+-            if (strictProEffort) {
+-                const target = level === "pro" ? "Pro" : "Pro Extended";
+-                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${target}.`);
++            if (strictTopEffort) {
++                throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${strictTarget}.`);
+             }
+             logger(formatBrowserThinkingLog(`unknown outcome selecting ${capitalizedLevel}; continuing with ChatGPT default.`));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, false);
+         }
+     }
+ }
+ /**
+  * Best-effort selection of a thinking time level in ChatGPT's composer pill menu.
+  * Safe by default: if the pill/menu/option isn't present, we continue without throwing.
+- * @param level - The thinking time intensity: 'light', 'standard', 'extended', 'extra-high', 'pro', or 'heavy'
++ * @param level - The thinking time intensity, including current max/ultra and legacy pro/heavy labels
+  */
+-export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel) {
++export async function ensureThinkingTimeIfAvailable(Runtime, level, logger, desiredModel, Input) {
+     try {
+-        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
++        const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input);
+         const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
+         switch (result?.status) {
+             case "already-selected":
+@@ -122,14 +157,243 @@
+         return false;
+     }
+ }
+-async function evaluateThinkingTimeSelection(Runtime, level, desiredModel) {
++function isThinkingPointerAction(result) {
++    return result?.status === "slider-click-required" ||
++        result?.status === "slider-drag-required" ||
++        result?.status === "slider-hover-required";
++}
++function sameThinkingViewport(left, right) {
++    if (!left || !right)
++        return false;
++    return left.width === right.width &&
++        left.height === right.height &&
++        left.visualWidth === right.visualWidth &&
++        left.visualHeight === right.visualHeight &&
++        left.visualOffsetLeft === right.visualOffsetLeft &&
++        left.visualOffsetTop === right.visualOffsetTop;
++}
++async function refreshThinkingPointerAction(Runtime, level, desiredModel, previous) {
+     const outcome = await Runtime.evaluate({
+         expression: buildThinkingTimeExpression(level, desiredModel),
+         awaitPromise: true,
+         returnByValue: true,
+     });
+-    return outcome.result?.value;
++    const current = outcome.result?.value;
++    if (!isThinkingPointerAction(current) ||
++        current.status !== previous.status ||
++        current.purpose !== previous.purpose ||
++        !sameThinkingViewport(previous.viewport, current.viewport)) {
++        return { status: "retry", result: current };
++    }
++    if (current.hitTargetMatches !== true ||
++        (current.status === "slider-drag-required" && current.destinationHitTargetMatches !== true)) {
++        return { status: "blocked", result: current };
++    }
++    return { status: "ready", result: current };
+ }
++async function evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input) {
++    let lastResult;
++    for (let attempt = 0; attempt < 16; attempt += 1) {
++        const outcome = await Runtime.evaluate({
++            expression: buildThinkingTimeExpression(level, desiredModel),
++            awaitPromise: true,
++            returnByValue: true,
++        });
++        lastResult = outcome.result?.value;
++        if (lastResult?.status !== "slider-key-required" && !isThinkingPointerAction(lastResult)) {
++            return lastResult;
++        }
++        if (!Input || typeof Input.dispatchKeyEvent !== "function") {
++            return {
++                ...lastResult,
++                status: "selection-unverified",
++                sliderInputAvailable: false,
++            };
++        }
++        if (isThinkingPointerAction(lastResult)) {
++            if (typeof Input.dispatchMouseEvent !== "function") {
++                return {
++                    ...lastResult,
++                    status: "selection-unverified",
++                    sliderPointerAvailable: false,
++                };
++            }
++            let refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, lastResult);
++            if (refreshed.status === "retry") {
++                lastResult = refreshed.result;
++                continue;
++            }
++            if (refreshed.status === "blocked") {
++                return {
++                    ...refreshed.result,
++                    status: "selection-unverified",
++                    pointerTargetVerified: false,
++                };
++            }
++            let action = refreshed.result;
++            const x = Number(action.x);
++            const y = Number(action.y);
++            if (!Number.isFinite(x) || !Number.isFinite(y)) {
++                return { ...action, status: "selection-unverified" };
++            }
++            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y: y - 20 });
++            await new Promise((resolve) => setTimeout(resolve, 100));
++            await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
++            refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
++            if (refreshed.status === "retry") {
++                lastResult = refreshed.result;
++                continue;
++            }
++            if (refreshed.status === "blocked") {
++                return {
++                    ...refreshed.result,
++                    status: "selection-unverified",
++                    pointerTargetVerified: false,
++                };
++            }
++            action = refreshed.result;
++            const actionX = Number(action.x);
++            const actionY = Number(action.y);
++            if (!Number.isFinite(actionX) || !Number.isFinite(actionY)) {
++                return { ...action, status: "selection-unverified" };
++            }
++            if (action.status === "slider-click-required") {
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x: actionX,
++                    y: actionY,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x: actionX,
++                    y: actionY,
++                    button: "left",
++                    clickCount: 1,
++                });
++            }
++            else if (action.status === "slider-drag-required") {
++                const targetX = Number(action.clickX);
++                const targetY = Number(action.clickY);
++                if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
++                    return { ...action, status: "selection-unverified" };
++                }
++                // ChatGPT's slider ignores a drag until its visual thumb has first
++                // received a standalone trusted click. Activate the thumb, then
++                // start a separate drag to the requested stop.
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x: actionX,
++                    y: actionY,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x: actionX,
++                    y: actionY,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await new Promise((resolve) => setTimeout(resolve, 150));
++                refreshed = await refreshThinkingPointerAction(Runtime, level, desiredModel, action);
++                if (refreshed.status !== "ready") {
++                    lastResult = refreshed.result;
++                    if (refreshed.status === "blocked") {
++                        return {
++                            ...refreshed.result,
++                            status: "selection-unverified",
++                            pointerTargetVerified: false,
++                        };
++                    }
++                    continue;
++                }
++                action = refreshed.result;
++                const dragStartX = Number(action.x);
++                const dragStartY = Number(action.y);
++                const dragTargetX = Number(action.clickX);
++                const dragTargetY = Number(action.clickY);
++                if (![dragStartX, dragStartY, dragTargetX, dragTargetY].every(Number.isFinite)) {
++                    return { ...action, status: "selection-unverified" };
++                }
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x: dragStartX,
++                    y: dragStartY,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseMoved",
++                    x: (dragStartX + dragTargetX) / 2,
++                    y: (dragStartY + dragTargetY) / 2,
++                    button: "left",
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseMoved",
++                    x: dragTargetX,
++                    y: dragTargetY,
++                    button: "left",
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x: dragTargetX,
++                    y: dragTargetY,
++                    button: "left",
++                    clickCount: 1,
++                });
++            }
++            else {
++                // The compact power row has zero height until it receives a real
++                // pointer interaction. Click its activation strip first; the next
++                // probe observes the expanded 32px control and can click the thumb
++                // before starting a separate drag.
++                await Input.dispatchMouseEvent({
++                    type: "mousePressed",
++                    x: actionX,
++                    y: actionY,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await Input.dispatchMouseEvent({
++                    type: "mouseReleased",
++                    x: actionX,
++                    y: actionY,
++                    button: "left",
++                    clickCount: 1,
++                });
++                await new Promise((resolve) => setTimeout(resolve, 1000));
++            }
++        }
++        else {
++            const requestedKey = lastResult.key;
++            const key = requestedKey === "ArrowLeft" || requestedKey === "ArrowDown"
++                ? requestedKey
++                : "ArrowRight";
++            const virtualKeyCode = key === "ArrowLeft" ? 37 : key === "ArrowDown" ? 40 : 39;
++            await Input.dispatchKeyEvent({
++                type: "keyDown",
++                key,
++                code: key,
++                windowsVirtualKeyCode: virtualKeyCode,
++                nativeVirtualKeyCode: virtualKeyCode,
++            });
++            await Input.dispatchKeyEvent({
++                type: "keyUp",
++                key,
++                code: key,
++                windowsVirtualKeyCode: virtualKeyCode,
++                nativeVirtualKeyCode: virtualKeyCode,
++            });
++        }
++        await new Promise((resolve) => setTimeout(resolve, lastResult?.status === "slider-hover-required" ? 500 : 200));
++    }
++    return {
++        ...lastResult,
++        status: "selection-unverified",
++    };
++}
+ function buildThinkingTimeExpression(level, desiredModel) {
+     const menuContainerLiteral = JSON.stringify(MENU_CONTAINER_SELECTOR);
+     const menuItemLiteral = JSON.stringify(MENU_ITEM_SELECTOR);
+@@ -137,6 +401,7 @@
+     const targetLevelLiteral = JSON.stringify(level.toLowerCase());
+     const targetModelKindLiteral = JSON.stringify(inferThinkingTargetModelKind(desiredModel));
+     const targetIsGpt56ModelLiteral = JSON.stringify(/(?:^|[^0-9])5[._ -]6(?:[^0-9]|$)/i.test(desiredModel ?? ""));
++    const manualUltraPauseMsLiteral = JSON.stringify(Math.max(0, Number.parseInt(process.env.ORACLE_ULTRA_MANUAL_PAUSE_MS ?? "0", 10) || 0));
+     return `(async () => {
+     ${buildClickDispatcher()}
+ 
+@@ -146,6 +411,7 @@
+     const TARGET_LEVEL = ${targetLevelLiteral};
+     const TARGET_MODEL_KIND = ${targetModelKindLiteral};
+     const TARGET_IS_GPT56_MODEL = ${targetIsGpt56ModelLiteral};
++    const MANUAL_ULTRA_PAUSE_MS = ${manualUltraPauseMsLiteral};
+ 
+     // Multilingual matchers: English level token + observed German/Japanese/Chinese variants.
+     const LEVEL_TOKENS = {
+@@ -153,6 +419,8 @@
+       standard: ['standard', 'medium', 'mittel', '中程度', '标准', '中'],
+       extended: ['extended', 'high', 'hoch', 'erweitert', '高い', '扩展', '深度', '加强', '高'],
+       'extra-high': ['extra high', 'sehr hoch', '非常に高い', '极高'],
++      max: ['max'],
++      ultra: ['ultra', '超高'],
+       heavy: ['heavy', 'schwer', '重度', '加重'],
+     };
+     // Pro is a tier you can request, but it is also a MODEL name, so it must never
+@@ -171,6 +439,34 @@
+     const INTELLIGENCE_WAIT_MS = 2500;
+ 
+     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++    const viewportSnapshot = () => ({
++      width: window.innerWidth,
++      height: window.innerHeight,
++      visualWidth: window.visualViewport?.width ?? window.innerWidth,
++      visualHeight: window.visualViewport?.height ?? window.innerHeight,
++      visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++      visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++    });
++    const pointerRequest = (status, target, x, y, extra = {}) => {
++      const hit = document.elementFromPoint(x, y);
++      const destinationX = Number(extra.clickX);
++      const destinationY = Number(extra.clickY);
++      const destinationHit = Number.isFinite(destinationX) && Number.isFinite(destinationY)
++        ? document.elementFromPoint(destinationX, destinationY)
++        : null;
++      return {
++        status,
++        x,
++        y,
++        ...extra,
++        viewport: viewportSnapshot(),
++        hitTargetMatches: Boolean(hit && (target === hit || target?.contains?.(hit))),
++        destinationHitTargetMatches:
++          destinationHit === null
++            ? null
++            : Boolean(destinationHit && (target === destinationHit || target?.contains?.(destinationHit))),
++      };
++    };
+     // Keep CJK characters, including Japanese kana, so localized labels survive
+     // normalization before being matched against LEVEL_TOKENS and picker controls.
+     const normalize = (value) => (value || '')
+@@ -295,15 +591,27 @@
+     const describeNode = (el) => {
+       if (!el || typeof el.getAttribute !== 'function') return null;
+       let rect = null;
++      let style = null;
+       try {
+         const r = el.getBoundingClientRect?.();
+         if (r) {
+           rect = {
++            x: Math.round(r.left),
++            y: Math.round(r.top),
+             w: Math.round(r.width),
+             h: Math.round(r.height),
+             visible: r.width > 0 && r.height > 0,
+           };
+         }
++        const computed = window.getComputedStyle?.(el);
++        if (computed) {
++          style = {
++            display: computed.display,
++            visibility: computed.visibility,
++            opacity: computed.opacity,
++            pointerEvents: computed.pointerEvents,
++          };
++        }
+       } catch {}
+       return {
+         tag: el.tagName || null,
+@@ -315,8 +623,10 @@
+         ariaSelected: el.getAttribute('aria-selected'),
+         ariaHaspopup: el.getAttribute('aria-haspopup'),
+         dataState: el.getAttribute('data-state'),
++        tabIndex: typeof el.tabIndex === 'number' ? el.tabIndex : null,
+         text: redactDiagnosticText(el.textContent, 80),
+         rect,
++        style,
+       };
+     };
+     const describeMenu = (menu) => {
+@@ -346,9 +656,28 @@
+           isVisible,
+         );
+         const modelBtn = findModelButton();
++        let sliderProbe = null;
++        try {
++          const effortMenu = findVisibleEffortMenu(null);
++          const sliderView = findPowerSliderView(effortMenu);
++          const sliderControl = findPowerSliderControl(effortMenu, sliderView);
++          const sliderRect = sliderControl?.getBoundingClientRect?.();
++          if (sliderRect && sliderRect.width > 0) {
++            const probeX = sliderRect.right - Math.min(24, sliderRect.width * 0.1);
++            const probeY = sliderRect.top + (sliderRect.height > 0 ? sliderRect.height / 2 : 16);
++            sliderProbe = {
++              control: describeNode(sliderControl),
++              hitTarget: describeNode(document.elementFromPoint(probeX, probeY)),
++              x: Math.round(probeX),
++              y: Math.round(probeY),
++            };
++          }
++        } catch {}
+         return {
+           targetModelKind: TARGET_MODEL_KIND,
+           targetLevel: TARGET_LEVEL,
++          sliderProbe,
++          activeElement: describeNode(document.activeElement),
+           modelButton: describeNode(modelBtn),
+           composerButtons: composerButtons.slice(0, 12).map(describeNode),
+           trailingCount: trailings.length,
+@@ -685,6 +1014,7 @@
+     // (simple view) plus an "Advanced" view holding two submenu openers: Model and
+     // Effort. The tier rows only exist inside the Effort submenu, so the flat scan
+     // of the top-level menu finds nothing and we must expand and descend.
++    const SIMPLE_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-simple-view"]';
+     const ADVANCED_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-advanced-view"]';
+     const SUBMENU_OPENER_SELECTOR = '[role="menuitem"][aria-haspopup="menu"]';
+     const nodeLabel = (node) =>
+@@ -697,10 +1027,223 @@
+       'avanzado', 'avancado', 'avance',
+     ];
+     const EFFORT_WORDS = [
+-      'effort', 'aufwand', '强度', '努力', '推論レベル',
++      'effort', 'power', 'aufwand', '强度', '能力', '努力', '推論レベル',
+       'esfuerzo', 'esforco', 'sforzo', 'inspanning', 'wysilek',
+     ];
+     const containsAny = (label, words) => words.some((word) => label.includes(word));
++    const SLIDER_LEVEL_INDEX = {
++      light: 1,
++      standard: 2,
++      extended: 3,
++      'extra-high': 4,
++      max: 5,
++      ultra: 6,
++    };
++    const parseSliderPosition = (value) => {
++      const text = String(value ?? '').replace(/\\s+/g, ' ').trim();
++      const english = text.match(/(?:item\\s*)?(\\d+)\\s+of\\s+(\\d+)/i);
++      if (english) return { index: Number(english[1]), total: Number(english[2]), text };
++      const chinese = text.match(/第\\s*(\\d+)\\s*项\\s*[，,]?\\s*共\\s*(\\d+)\\s*项/);
++      if (chinese) return { index: Number(chinese[1]), total: Number(chinese[2]), text };
++      return null;
++    };
++    const findPowerSliderView = (menu) => {
++      const scoped = menu?.querySelector?.(SIMPLE_VIEW_SELECTOR);
++      if (isVisible(scoped)) return scoped;
++      const global = document.querySelector(SIMPLE_VIEW_SELECTOR);
++      return isVisible(global) ? global : null;
++    };
++    const findPowerSliderControl = (menu, view) => {
++      const direct = view?.querySelector?.('[role="slider"], input[type="range"], [tabindex]');
++      if (isVisible(direct)) return direct;
++      // In the current Intelligence picker the zero-height Power row is a
++      // sibling of the simple view, not its descendant. Search the whole menu
++      // first so the outer CDP loop can activate it before the thumb appears.
++      const scope = menu || view?.parentElement || document;
++      let mountedKeyboardTarget = null;
++      for (const item of scope.querySelectorAll('[role="slider"], input[type="range"], [role="menuitem"]')) {
++        if (!containsAny(nodeLabel(item), EFFORT_WORDS)) continue;
++        if (isVisible(item)) return item;
++        // The current UI mounts a zero-height role=menuitem labelled "Power" as
++        // the slider's keyboard target. It has no visual box by design but owns
++        // the arrow-key handler, so presence is sufficient once the view exists.
++        mountedKeyboardTarget ||= item;
++      }
++      return mountedKeyboardTarget;
++    };
++    const readPowerSliderState = (menu) => {
++      const view = findPowerSliderView(menu);
++      if (!view) return null;
++      const control = findPowerSliderControl(menu, view);
++      if (control) {
++        const now = Number(control.getAttribute?.('aria-valuenow') ?? control.value);
++        const min = Number(control.getAttribute?.('aria-valuemin') ?? control.min);
++        const max = Number(control.getAttribute?.('aria-valuemax') ?? control.max);
++        if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
++          return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
++        }
++      }
++      const parsed = parseSliderPosition(view.textContent ?? view.getAttribute?.('aria-label'));
++      return parsed ? { ...parsed, view, control } : null;
++    };
++    const selectEffortFromPowerSlider = async (menu) => {
++      const targetIndex = SLIDER_LEVEL_INDEX[TARGET_LEVEL];
++      if (!targetIndex || !menu) return null;
++      // The simple slider view and its position text render before the keyboard
++      // target becomes visible. Wait for that target instead of treating the
++      // temporarily zero-height Power menu item as an unsupported layout.
++      if (!findPowerSliderView(menu)) return null;
++      if (
++        TARGET_LEVEL === 'ultra' &&
++        MANUAL_ULTRA_PAUSE_MS > 0 &&
++        !window.__oracleUltraManualPauseCompleted
++      ) {
++        window.__oracleUltraManualPauseCompleted = true;
++        await sleep(MANUAL_ULTRA_PAUSE_MS);
++        if (!isVisible(menu?.querySelector?.(SIMPLE_VIEW_SELECTOR))) {
++          menu = findVisibleEffortMenu(null) || menu;
++        }
++      }
++      let state = null;
++      const readyDeadline = performance.now() + MAX_WAIT_MS;
++      while (performance.now() < readyDeadline) {
++        // Keep the menu that actually owns the slider. A global scan can return
++        // an inner Radix collection root whose aggregate text looks identical
++        // but which does not contain the simple slider view.
++        const currentMenu = isVisible(menu?.querySelector?.(SIMPLE_VIEW_SELECTOR))
++          ? menu
++          : (findVisibleEffortMenu(null) || menu);
++        const candidate = readPowerSliderState(currentMenu);
++        if (candidate && candidate.total >= targetIndex) {
++          const control = candidate.control || findPowerSliderControl(currentMenu, candidate.view);
++          if (candidate.index === targetIndex || control) {
++            state = { ...candidate, control };
++            menu = currentMenu;
++            break;
++          }
++        }
++        await sleep(100);
++      }
++      if (!state) {
++        return failure('selection-unverified', {
++          requestedSliderPosition: String(targetIndex) + '/6',
++          sliderControlReady: false,
++        });
++      }
++      const initialIndex = state.index;
++      if (state.index === targetIndex) {
++        closeOpenMenus();
++        return { status: 'already-selected', label: state.text || TARGET_LEVEL };
++      }
++      let control = state.control || findPowerSliderControl(menu, state.view);
++      if (!control) {
++        return failure('selection-unverified', {
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderControlReady: false,
++        });
++      }
++      const activeElement = document.activeElement;
++      const powerHasFocus = activeElement === control;
++      const pointerAttempts = Number(window.__oraclePowerSliderPointerAttempts ?? 0);
++      const keyboardFocusAttempts = Number(window.__oraclePowerSliderKeyboardFocusAttempts ?? 0);
++      const controlRect = control.getBoundingClientRect?.();
++      if (powerHasFocus) {
++        return {
++          status: 'slider-key-required',
++          key: state.index < targetIndex ? 'ArrowRight' : 'ArrowLeft',
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderFocused: true,
++          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++          diagnostic: collectPickerDiagnostic(),
++        };
++      }
++      if (keyboardFocusAttempts < 4) {
++        window.__oraclePowerSliderKeyboardFocusAttempts = keyboardFocusAttempts + 1;
++        if (!menu.contains?.(activeElement)) {
++          try { menu.focus?.({ preventScroll: true }); } catch {}
++        }
++        return {
++          status: 'slider-key-required',
++          key: 'ArrowDown',
++          sliderPosition: String(state.index) + '/' + String(state.total),
++          requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++          sliderFocused: false,
++          initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++          diagnostic: collectPickerDiagnostic(),
++        };
++      }
++      // Prefer the slider's ARIA/keyboard path. A trusted click is used only to
++      // focus the current thumb after the menu's roving-focus keys did not land;
++      // the next probe sends an arrow key.
++      if (isVisible(control) && pointerAttempts < 2) {
++        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
++        const rect = control.getBoundingClientRect();
++        const inset = Math.min(24, rect.width * 0.1);
++        const usableWidth = Math.max(1, rect.width - (2 * inset));
++        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++        return pointerRequest(
++          'slider-click-required',
++          control,
++          rect.left + inset + (usableWidth * currentRatio),
++          rect.top + (rect.height / 2),
++          {
++            purpose: 'focus-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
++      }
++      // Some picker versions refuse focus even after trusted clicks. Keep one
++      // verified drag fallback, with both endpoints hit-tested against the slider.
++      if (isVisible(control)) {
++        const rect = control.getBoundingClientRect();
++        const inset = Math.min(24, rect.width * 0.1);
++        const usableWidth = Math.max(1, rect.width - (2 * inset));
++        const currentRatio = state.total > 1 ? (state.index - 1) / (state.total - 1) : 0;
++        const targetRatio = state.total > 1 ? (targetIndex - 1) / (state.total - 1) : 0;
++        return pointerRequest(
++          'slider-drag-required',
++          control,
++          rect.left + inset + (usableWidth * currentRatio),
++          rect.top + (rect.height / 2),
++          {
++            clickX: rect.left + inset + (usableWidth * targetRatio),
++            clickY: rect.top + (rect.height / 2),
++            purpose: 'drag-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            initialSliderPosition: String(initialIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
++      }
++      if (controlRect && controlRect.width > 0 && !powerHasFocus && pointerAttempts < 2) {
++        window.__oraclePowerSliderPointerAttempts = pointerAttempts + 1;
++        const viewRect = state.view.getBoundingClientRect();
++        return pointerRequest(
++          'slider-hover-required',
++          state.view,
++          viewRect.left + (viewRect.width / 2),
++          viewRect.top + (viewRect.height / 2),
++          {
++            purpose: 'activate-power-slider',
++            sliderPosition: String(state.index) + '/' + String(state.total),
++            requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++            diagnostic: collectPickerDiagnostic(),
++          },
++        );
++      }
++      return failure('selection-unverified', {
++        sliderPosition: String(state.index) + '/' + String(state.total),
++        requestedSliderPosition: String(targetIndex) + '/' + String(state.total),
++        sliderFocused: false,
++        diagnostic: collectPickerDiagnostic(),
++      });
++    };
+     const findAdvancedToggle = (menu) => {
+       for (const item of (menu || document).querySelectorAll('[role="menuitem"]')) {
+         if (!isVisible(item)) continue;
+@@ -855,6 +1398,12 @@
+     };
+     const legacyEffortOwnerIsReady = () => {
+       if (
++        SLIDER_LEVEL_INDEX[TARGET_LEVEL] &&
++        isVisible(document.querySelector(INTELLIGENCE_MENU_SELECTOR))
++      ) {
++        return true;
++      }
++      if (
+         TARGET_MODEL_KIND === 'pro' &&
+         TARGET_LEVEL === 'extended' &&
+         isVisible(document.querySelector(INTELLIGENCE_MENU_SELECTOR))
+@@ -920,6 +1469,10 @@
+       while (performance.now() < deadline) {
+         const menu = findVisibleEffortMenu(composerEffortPill);
+         if (menu) {
++          const powerSliderResult = await selectEffortFromPowerSlider(menu);
++          if (powerSliderResult) {
++            return powerSliderResult;
++          }
+           const proEffortResult = await selectProEffortFromSubmenu();
+           if (proEffortResult) {
+             return proEffortResult;
+@@ -1034,8 +1587,22 @@
+       modelBtn.getAttribute('aria-expanded') !== 'true' &&
+       !legacyEffortOwnerIsReady()
+     ) {
+-      dispatchClickSequence(modelBtn);
+-      await sleep(INITIAL_WAIT_MS);
++      // The slider only mounts its interactive thumb after a trusted click on
++      // the composer pill. Ask the outer CDP loop to perform that click instead
++      // of opening this picker with synthetic DOM events.
++      const rect = modelBtn.getBoundingClientRect();
++      return pointerRequest(
++        'slider-click-required',
++        modelBtn,
++        rect.left + (rect.width / 2),
++        rect.top + (rect.height / 2),
++        { purpose: 'open-effort-picker' },
++      );
++    }
++
++    const powerSliderResult = await selectEffortFromPowerSlider(findVisibleEffortMenu(modelBtn));
++    if (powerSliderResult) {
++      return powerSliderResult;
+     }
+ 
+     // ---------- COMPATIBILITY UI: unified "Intelligence" effort picker ----------
+diff -ruN a/dist/src/browser/chromeLifecycle.js b/dist/src/browser/chromeLifecycle.js
+--- a/dist/src/browser/chromeLifecycle.js	2026-09-07 15:04:12
++++ b/dist/src/browser/chromeLifecycle.js	2026-09-07 15:09:51
+@@ -79,9 +79,11 @@
+             logger(`Received ${signal}; terminating Chrome process`);
+         }
+         void (async () => {
++            // Persist the interruption before closing the only browser that can
++            // identify this run. Session metadata must not remain "running"
++            // after an operator cancels a copied-profile consultation.
++            await opts?.emitRuntimeHint?.(signal).catch(() => undefined);
+             if (leaveRunning) {
+-                // Ensure reattach hints are written before we exit.
+-                await opts?.emitRuntimeHint?.().catch(() => undefined);
+                 if (inFlight) {
+                     logger('Session still in flight; reattach with "oracle session <slug>" to continue.');
+                 }
+diff -ruN a/dist/src/browser/config.js b/dist/src/browser/config.js
+--- a/dist/src/browser/config.js	2026-09-07 15:04:12
++++ b/dist/src/browser/config.js	2026-09-07 15:11:29
+@@ -23,7 +23,7 @@
+     browserTabRef: null,
+     url: CHATGPT_URL,
+     chatgptUrl: CHATGPT_URL,
+-    timeoutMs: 1_200_000,
++    timeoutMs: 2_700_000,
+     debugPort: null,
+     inputTimeoutMs: 60_000,
+     attachmentTimeoutMs: 45_000,
+diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
+--- a/dist/src/browser/index.js	2026-09-07 15:04:26
++++ b/dist/src/browser/index.js	2026-09-07 15:10:37
+@@ -38,6 +38,49 @@
+ export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
+ export { parseDuration, delay, normalizeChatgptUrl, isTemporaryChatUrl } from "./utils.js";
+ export { formatThinkingLog, formatThinkingWaitingLog, buildThinkingStatusExpressionForTest, readThinkingStatusForTest, sanitizeThinkingText, startThinkingStatusMonitorForTest, } from "./actions/thinkingStatus.js";
++function createBrowserRunDeadline(timeoutMs) {
++    let expired = false;
++    let timer;
++    const normalizedTimeoutMs = Math.max(1, Number(timeoutMs) || 1);
++    const promise = new Promise((_, reject) => {
++        timer = setTimeout(() => {
++            expired = true;
++            reject(new Error("browser-run-deadline-exceeded"));
++        }, normalizedTimeoutMs);
++    });
++    // The deadline can fire while a non-raced setup operation is still resolving.
++    // Keep the rejection handled until the main browser race observes it.
++    promise.catch(() => undefined);
++    return {
++        promise,
++        get expired() {
++            return expired;
++        },
++        dispose() {
++            if (timer) {
++                clearTimeout(timer);
++                timer = undefined;
++            }
++        },
++    };
++}
++export function createBrowserRunDeadlineForTest(timeoutMs) {
++    return createBrowserRunDeadline(timeoutMs);
++}
++function buildPowerControlModelSelectionEvidence(requestedModel, strategy, thinkingSelection) {
++    return {
++        requestedModel,
++        resolvedLabel: thinkingSelection.resolvedLabel,
++        strategy,
++        status: thinkingSelection.status,
++        verified: thinkingSelection.verified === true,
++        source: thinkingSelection.source ?? "thinking-time-control",
++        capturedAt: thinkingSelection.capturedAt ?? new Date().toISOString(),
++    };
++}
++export function buildPowerControlModelSelectionEvidenceForTest(requestedModel, strategy, thinkingSelection) {
++    return buildPowerControlModelSelectionEvidence(requestedModel, strategy, thinkingSelection);
++}
+ function redactBrowserConfigForDebugLog(config) {
+     const redacted = { ...config };
+     if (Array.isArray(config.inlineCookies)) {
+@@ -80,6 +123,19 @@
+         return false;
+     return options.effectiveKeepBrowser || options.preserveBrowserOnError;
+ }
++async function terminateLocalChromeAfterRun(options) {
++    if (options.connectionClosedUnexpectedly && !options.usingCopiedProfile) {
++        return false;
++    }
++    if (options.terminatedRecordedChrome) {
++        return false;
++    }
++    await options.chrome.kill();
++    return true;
++}
++export async function terminateLocalChromeAfterRunForTest(options) {
++    return terminateLocalChromeAfterRun(options);
++}
+ export function shouldPreserveBrowserOnErrorForTest(error, headless) {
+     return shouldPreserveBrowserOnError(error, headless);
+ }
+@@ -296,6 +352,31 @@
+  * window swallows the click while the automation still believes it clicked.
+  * Soft-fails: focus emulation is an optimization, never a hard requirement.
+  */
++async function stabilizeChromeWindow(client, logger) {
++    const width = 1280;
++    const height = 720;
++    try {
++        const { windowId } = await client.Browser.getWindowForTarget();
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { windowState: "normal" },
++        });
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { width, height },
++        });
++        const observed = await client.Browser.getWindowBounds({ windowId });
++        const bounds = observed?.bounds;
++        if (bounds?.windowState !== "normal" || bounds.width !== width || bounds.height !== height) {
++            throw new Error(`observed ${bounds?.width ?? "?"}x${bounds?.height ?? "?"} (${bounds?.windowState ?? "unknown"})`);
++        }
++        logger(`Chrome window fixed at ${width}x${height}`);
++    }
++    catch (error) {
++        const message = error instanceof Error ? error.message : String(error);
++        throw new Error(`Failed to set stable Chrome window bounds: ${message}`);
++    }
++}
+ async function enableFocusEmulation(client, logger, label) {
+     try {
+         await client.Emulation.setFocusEmulationEnabled({ enabled: true });
+@@ -598,7 +679,7 @@
+     let modelSelectionEvidence;
+     let tabLease = null;
+     let conversationUrlMonitor = null;
+-    const emitRuntimeHint = async () => {
++    const emitRuntimeHint = async (interruptedSignal) => {
+         if (!chrome?.port) {
+             return;
+         }
+@@ -613,6 +694,7 @@
+             promptSubmitted,
+             userDataDir,
+             controllerPid: process.pid,
++            ...(interruptedSignal ? { interruptedSignal } : {}),
+         };
+         try {
+             await runtimeHintCb?.(hint, modelSelectionEvidence);
+@@ -741,6 +823,9 @@
+             chromePort: chrome.port,
+         });
+     }
++    // Persist the owned runtime before navigation so even an early page-load
++    // failure can be audited and cleaned by exact PID/Profile identity.
++    await emitRuntimeHint();
+     let removeTerminationHooks = null;
+     try {
+         removeTerminationHooks = registerTerminationHooks(chrome, userDataDir, effectiveKeepBrowser, logger, {
+@@ -758,6 +843,7 @@
+     let isolatedTargetId = null;
+     let ownsTarget = true;
+     const startedAt = Date.now();
++    const browserRunDeadline = createBrowserRunDeadline(config.timeoutMs);
+     let answerText = "";
+     let answerMarkdown = "";
+     let answerHtml = "";
+@@ -846,13 +932,14 @@
+                 })();
+             });
+         });
+-        const raceWithDisconnect = (promise) => Promise.race([promise, disconnectPromise]);
++        const raceWithDisconnect = (promise) => Promise.race([promise, disconnectPromise, browserRunDeadline.promise]);
+         const { Network, Page, Runtime, Input, DOM, Target } = client;
+         const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
+         if (DOM && typeof DOM.enable === "function") {
+             domainEnablers.push(DOM.enable());
+         }
+         await Promise.all(domainEnablers);
++        await stabilizeChromeWindow(client, logger);
+         if (!config.headless && config.hideWindow) {
+             await positionChromeWindowOffscreen(client, logger);
+         }
+@@ -1078,8 +1165,9 @@
+         // Handle thinking time selection if specified. Deep Research owns its own effort flow.
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            const thinkingSelectionEvidence = await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {
+@@ -1088,6 +1176,10 @@
+                     }
+                 },
+             }));
++            if (thinkingSelectionEvidence?.verified) {
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, thinkingSelectionEvidence);
++                await emitRuntimeHint();
++            }
+         }
+         const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
+         let profileLock = null;
+@@ -1107,6 +1199,7 @@
+             await handle.release().catch(() => undefined);
+         };
+         const submitOnce = async (prompt, submissionAttachments) => {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+             const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
+             const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
+@@ -1136,7 +1229,9 @@
+                 const perFileTimeout = 20_000;
+                 const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
+                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
+-                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
++                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentExpectations, logger, {
++                    appearanceConfirmed: !inputOnlyAttachments,
++                });
+                 logger("All attachments uploaded");
+             }
+             if (deepResearch) {
+@@ -1726,7 +1821,23 @@
+         };
+     }
+     catch (error) {
+-        const normalizedError = error instanceof Error ? error : new Error(String(error));
++        let normalizedError = error instanceof Error ? error : new Error(String(error));
++        if (browserRunDeadline.expired) {
++            normalizedError = new BrowserAutomationError(`Browser run exceeded the shared ${formatElapsed(config.timeoutMs)} deadline.`, {
++                stage: "browser-run-timeout",
++                runtime: {
++                    chromePid: chrome.pid,
++                    chromePort: chrome.port,
++                    chromeHost,
++                    userDataDir,
++                    chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
++                    tabUrl: lastUrl,
++                    conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
++                    promptSubmitted,
++                    controllerPid: process.pid,
++                },
++            }, normalizedError);
++        }
+         const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
+         connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
+         const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
+@@ -1812,6 +1923,7 @@
+         }, normalizedError);
+     }
+     finally {
++        browserRunDeadline.dispose();
+         await conversationUrlMonitor?.stop();
+         try {
+             if (!connectionClosedUnexpectedly) {
+@@ -1917,16 +2029,17 @@
+         removeDialogHandler?.();
+         removeTerminationHooks?.();
+         if (!keepBrowserOpen) {
+-            if (!connectionClosedUnexpectedly) {
+-                try {
+-                    if (!terminatedRecordedChrome) {
+-                        await chrome.kill();
+-                    }
+-                }
+-                catch {
+-                    // ignore kill failures
+-                }
++            try {
++                await terminateLocalChromeAfterRun({
++                    connectionClosedUnexpectedly,
++                    usingCopiedProfile,
++                    terminatedRecordedChrome,
++                    chrome,
++                });
+             }
++            catch {
++                // ignore kill failures
++            }
+             if (manualLogin) {
+                 const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
+                     connectionClosedUnexpectedly,
+@@ -2397,7 +2510,7 @@
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            const thinkingSelectionEvidence = await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {
+@@ -2406,6 +2519,10 @@
+                     }
+                 },
+             });
++            if (thinkingSelectionEvidence?.verified) {
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, thinkingSelectionEvidence);
++                await emitRuntimeHint();
++            }
+         }
+         const submitOnce = async (prompt, submissionAttachments) => {
+             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+diff -ruN a/dist/src/browser/profileCopy.js b/dist/src/browser/profileCopy.js
+--- a/dist/src/browser/profileCopy.js	2026-09-07 15:04:26
++++ b/dist/src/browser/profileCopy.js	2026-09-07 15:03:25
+@@ -1,5 +1,5 @@
+ import { spawn } from "node:child_process";
+-import { cp, mkdir, readFile, rm } from "node:fs/promises";
++import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+ import path from "node:path";
+ /**
+  * Cache/derived subdirectories that bloat the copy and carry no signed-in-session
+@@ -52,13 +52,19 @@
+             args.push("--exclude", exclude);
+         }
+         args.push(`${srcProfile}/`, `${destProfile}/`);
+-        await new Promise((resolve, reject) => {
++        const rsyncExitCode = await new Promise((resolve, reject) => {
+             const child = spawn("rsync", args, { stdio: "ignore" });
+             child.on("error", (err) => reject(new Error(`--copy-profile requires rsync on PATH (spawn failed): ${err.message}`)));
+-            child.on("close", (code) => code === 0 || code === 24
+-                ? resolve()
+-                : reject(new Error(`rsync failed copying Chrome profile (exit ${code})`)));
++            child.on("close", (code) => resolve(code));
+         });
++        const partialCopyHasSessionMaterial = rsyncExitCode === 23 && (await hasCopiedCookieDatabase(destProfile));
++        if (rsyncExitCode !== 0 && rsyncExitCode !== 24 && !partialCopyHasSessionMaterial) {
++            throw new Error(`rsync failed copying Chrome profile (exit ${rsyncExitCode})`);
++        }
++        // A live Chrome profile commonly records exit_type=Crashed while it is
++        // running. The throwaway copy must not inherit that stale session marker,
++        // or every Oracle window opens with a misleading restore-pages bubble.
++        await markCopiedProfileExitedCleanly(destProfile);
+         return profileDirectory;
+     }
+     catch (error) {
+@@ -66,6 +72,33 @@
+         // session-bearing copies before surfacing setup failures.
+         await rm(destDir, { recursive: true, force: true }).catch(() => undefined);
+         throw error;
++    }
++}
++async function hasCopiedCookieDatabase(profileDir) {
++    for (const relativePath of [path.join("Network", "Cookies"), "Cookies"]) {
++        try {
++            await access(path.join(profileDir, relativePath));
++            return true;
++        }
++        catch {
++            // Continue checking legacy and current Chrome cookie locations.
++        }
++    }
++    return false;
++}
++async function markCopiedProfileExitedCleanly(profileDir) {
++    const preferencesPath = path.join(profileDir, "Preferences");
++    try {
++        const raw = await readFile(preferencesPath, "utf8");
++        const preferences = JSON.parse(raw);
++        preferences.profile ||= {};
++        preferences.profile.exit_type = "Normal";
++        preferences.profile.exited_cleanly = true;
++        await writeFile(preferencesPath, JSON.stringify(preferences));
++    }
++    catch {
++        // The launch flag also suppresses the bubble; a missing or temporarily
++        // unreadable Preferences file must not make profile copying fail.
+     }
+ }
+ function resolveChromeProfileDirectory(srcUserDataDir, localState, requestedProfile) {
 diff -ruN a/dist/src/browser/reattach.js b/dist/src/browser/reattach.js
---- a/dist/src/browser/reattach.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/reattach.js	2026-09-07 10:07:35
+--- a/dist/src/browser/reattach.js	2026-09-07 15:04:26
++++ b/dist/src/browser/reattach.js	2026-09-07 15:03:25
 @@ -3,13 +3,14 @@
  import path from "node:path";
  import { mkdtemp, mkdir, rm } from "node:fs/promises";
@@ -1559,231 +2016,153 @@ diff -ruN a/dist/src/browser/reattach.js b/dist/src/browser/reattach.js
 +    createRecoveryCleanup,
 +    createAttachedRuntimeCleanup,
  };
-diff -ruN a/dist/src/browser/profileCopy.js b/dist/src/browser/profileCopy.js
---- a/dist/src/browser/profileCopy.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/profileCopy.js	2026-09-07 10:07:35
-@@ -1,5 +1,5 @@
- import { spawn } from "node:child_process";
--import { cp, mkdir, readFile, rm } from "node:fs/promises";
-+import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
- import path from "node:path";
- /**
-  * Cache/derived subdirectories that bloat the copy and carry no signed-in-session
-@@ -52,13 +52,19 @@
-             args.push("--exclude", exclude);
-         }
-         args.push(`${srcProfile}/`, `${destProfile}/`);
--        await new Promise((resolve, reject) => {
-+        const rsyncExitCode = await new Promise((resolve, reject) => {
-             const child = spawn("rsync", args, { stdio: "ignore" });
-             child.on("error", (err) => reject(new Error(`--copy-profile requires rsync on PATH (spawn failed): ${err.message}`)));
--            child.on("close", (code) => code === 0 || code === 24
--                ? resolve()
--                : reject(new Error(`rsync failed copying Chrome profile (exit ${code})`)));
-+            child.on("close", (code) => resolve(code));
-         });
-+        const partialCopyHasSessionMaterial = rsyncExitCode === 23 && (await hasCopiedCookieDatabase(destProfile));
-+        if (rsyncExitCode !== 0 && rsyncExitCode !== 24 && !partialCopyHasSessionMaterial) {
-+            throw new Error(`rsync failed copying Chrome profile (exit ${rsyncExitCode})`);
-+        }
-+        // A live Chrome profile commonly records exit_type=Crashed while it is
-+        // running. The throwaway copy must not inherit that stale session marker,
-+        // or every Oracle window opens with a misleading restore-pages bubble.
-+        await markCopiedProfileExitedCleanly(destProfile);
-         return profileDirectory;
+diff -ruN a/dist/src/browser/sessionRunner.js b/dist/src/browser/sessionRunner.js
+--- a/dist/src/browser/sessionRunner.js	2026-09-07 15:04:12
++++ b/dist/src/browser/sessionRunner.js	2026-09-07 15:26:44
+@@ -99,7 +99,7 @@
+     automationLogger.verbose = Boolean(runOptions.verbose);
+     automationLogger.sessionLog = runOptions.verbose ? log : () => { };
+     log(headerLine);
+-    log(chalk.dim("This run can take up to an hour (usually ~10 minutes)."));
++    log(chalk.dim("This run can take up to 45 minutes (usually ~10 minutes)."));
+     if (runOptions.verbose) {
+         log(chalk.dim("Chrome automation does not stream output; this may take a minute..."));
      }
-     catch (error) {
-@@ -68,6 +74,33 @@
-         throw error;
+diff -ruN a/dist/src/cli/browserConfig.js b/dist/src/cli/browserConfig.js
+--- a/dist/src/cli/browserConfig.js	2026-09-07 15:04:12
++++ b/dist/src/cli/browserConfig.js	2026-09-07 15:11:29
+@@ -7,7 +7,7 @@
+ import { parseDuration } from "../duration.js";
+ import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
+ import { getOracleHomeDir } from "../oracleHome.js";
+-const DEFAULT_BROWSER_TIMEOUT_MS = 1_200_000;
++const DEFAULT_BROWSER_TIMEOUT_MS = 2_700_000;
+ const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
+ const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
+ const DEFAULT_BROWSER_RECHECK_TIMEOUT_MS = 120_000;
+diff -ruN a/dist/src/cli/help.js b/dist/src/cli/help.js
+--- a/dist/src/cli/help.js	2026-09-07 15:04:12
++++ b/dist/src/cli/help.js	2026-09-07 15:35:04
+@@ -52,7 +52,7 @@
+         `${colors.bullet("•")} Oracle is one-shot by default. Continue saved API or ChatGPT browser sessions with ${colors.accent("--followup <sessionId|responseId>")}; use repeated ${colors.accent("--browser-follow-up")} for planned same-run ChatGPT turns.`,
+         `${colors.bullet("•")} Run ${colors.accent("--files-report")} to inspect token spend before hitting the API.`,
+         `${colors.bullet("•")} Non-preview runs spawn detached sessions (especially gpt-5.5-pro API). If the CLI times out, do not re-run — reattach with ${colors.accent("oracle session <slug>")} to resume/inspect the existing run.`,
+-        `${colors.bullet("•")} Set a memorable 3–5 word slug via ${colors.accent('--slug "<words>"')} to keep session IDs tidy.`,
++        `${colors.bullet("•")} Set a memorable 3–12 word slug via ${colors.accent('--slug "<words>"')} to keep session IDs tidy.`,
+         `${colors.bullet("•")} Finished sessions auto-hide preamble logs when reattached; raw timestamps remain in the saved log file.`,
+         `${colors.bullet("•")} Need hidden flags? Run ${colors.accent(`${program.name()} --help --verbose`)} to list search/token/browser overrides.`,
+         `${colors.bullet("•")} If any Oracle session is already running, do not start new API runs. Attach to the existing browser session instead; only trigger API calls when you explicitly mean to.`,
+diff -ruN a/dist/src/cli/sessionRunner.js b/dist/src/cli/sessionRunner.js
+--- a/dist/src/cli/sessionRunner.js	2026-09-07 15:04:12
++++ b/dist/src/cli/sessionRunner.js	2026-09-07 15:27:45
+@@ -27,6 +27,35 @@
+ import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
+ const isTty = process.stdout.isTTY;
+ const dim = (text) => (isTty ? kleur.dim(text) : text);
++function buildRuntimeHintSessionUpdate(browserConfig, runtime, modelSelection, completedAt = new Date().toISOString()) {
++    const browser = {
++        config: browserConfig,
++        runtime,
++        ...(modelSelection ? { modelSelection } : {}),
++    };
++    const interruptedSignal = typeof runtime?.interruptedSignal === "string"
++        ? runtime.interruptedSignal
++        : null;
++    if (!interruptedSignal) {
++        return { status: "running", browser };
++    }
++    const message = `Browser run interrupted by ${interruptedSignal}.`;
++    return {
++        status: "error",
++        completedAt,
++        errorMessage: message,
++        browser,
++        response: { status: "incomplete", incompleteReason: "interrupted" },
++        error: {
++            category: "browser-automation",
++            message,
++            details: { stage: "interrupted", signal: interruptedSignal },
++        },
++    };
++}
++export function buildRuntimeHintSessionUpdateForTest(browserConfig, runtime, modelSelection, completedAt) {
++    return buildRuntimeHintSessionUpdate(browserConfig, runtime, modelSelection, completedAt);
++}
+ export async function performSessionRun({ sessionMeta, runOptions, mode, browserConfig, cwd, log, write, version, notifications, browserDeps, muteStdout = false, }) {
+     const writeInline = (chunk) => {
+         // Keep session logs intact while still echoing inline output to the user.
+@@ -58,18 +87,17 @@
+             const runnerDeps = {
+                 ...browserDeps,
+                 persistRuntimeHint: async (runtime, modelSelection) => {
+-                    const browser = {
+-                        config: browserConfig,
+-                        runtime,
+-                        ...(modelSelection ? { modelSelection } : {}),
+-                    };
+-                    await sessionStore.updateSession(sessionMeta.id, {
+-                        status: "running",
+-                        browser,
+-                    });
++                    const update = buildRuntimeHintSessionUpdate(browserConfig, runtime, modelSelection);
++                    await sessionStore.updateSession(sessionMeta.id, update);
++                    if (runtime?.interruptedSignal && modelForStatus) {
++                        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
++                            status: "error",
++                            completedAt: update.completedAt,
++                        });
++                    }
+                     // Keep this attempt's copy fresh so error paths fall back to the
+                     // latest persisted browser evidence instead of stale session input.
+-                    currentBrowser = browser;
++                    currentBrowser = update.browser;
+                 },
+             };
+             const result = await runBrowserSessionExecution({
+diff -ruN a/dist/src/cli/tui/index.js b/dist/src/cli/tui/index.js
+--- a/dist/src/cli/tui/index.js	2026-09-07 15:04:12
++++ b/dist/src/cli/tui/index.js	2026-09-07 15:35:04
+@@ -317,7 +317,7 @@
+         {
+             name: "slug",
+             type: "input",
+-            message: "Optional slug (3–5 words, leave blank for auto):",
++            message: "Optional slug (3–12 words, leave blank for auto):",
+         },
+         {
+             name: "model",
+diff -ruN a/dist/src/sessionManager.js b/dist/src/sessionManager.js
+--- a/dist/src/sessionManager.js	2026-09-07 15:04:12
++++ b/dist/src/sessionManager.js	2026-09-07 15:10:52
+@@ -23,6 +23,9 @@
+ const MAX_SLUG_WORDS = 5;
+ const MIN_CUSTOM_SLUG_WORDS = 3;
+ const MAX_SLUG_WORD_LENGTH = 10;
++const MAX_CUSTOM_SLUG_WORDS = 12;
++const MAX_CUSTOM_SLUG_WORD_LENGTH = 32;
++const MAX_CUSTOM_SLUG_LENGTH = 120;
+ // Session artifacts (prompt, attached file contents, model responses) are sensitive.
+ // Keep them owner-only, matching the meta.json / bridge-config posture (0o600/0o700).
+ const SESSION_DIR_MODE = 0o700;
+@@ -114,10 +117,18 @@
+     return slug.split("-").filter(Boolean).length;
+ }
+ function normalizeCustomSlug(candidate) {
+-    const slug = slugify(candidate, MAX_SLUG_WORDS);
++    const words = candidate?.toLowerCase().match(/[a-z0-9]+/g) ?? [];
++    const overlongWord = words.find((word) => word.length > MAX_CUSTOM_SLUG_WORD_LENGTH);
++    if (overlongWord) {
++        throw new Error(`Custom slug words must not exceed ${MAX_CUSTOM_SLUG_WORD_LENGTH} characters.`);
++    }
++    const slug = words.join("-");
+     const wordCount = countSlugWords(slug);
+-    if (wordCount < MIN_CUSTOM_SLUG_WORDS || wordCount > MAX_SLUG_WORDS) {
+-        throw new Error(`Custom slug must include between ${MIN_CUSTOM_SLUG_WORDS} and ${MAX_SLUG_WORDS} words.`);
++    if (wordCount < MIN_CUSTOM_SLUG_WORDS || wordCount > MAX_CUSTOM_SLUG_WORDS) {
++        throw new Error(`Custom slug must include between ${MIN_CUSTOM_SLUG_WORDS} and ${MAX_CUSTOM_SLUG_WORDS} words.`);
++    }
++    if (slug.length > MAX_CUSTOM_SLUG_LENGTH) {
++        throw new Error(`Custom slug must not exceed ${MAX_CUSTOM_SLUG_LENGTH} characters.`);
      }
+     return slug;
  }
-+async function hasCopiedCookieDatabase(profileDir) {
-+    for (const relativePath of [path.join("Network", "Cookies"), "Cookies"]) {
-+        try {
-+            await access(path.join(profileDir, relativePath));
-+            return true;
-+        }
-+        catch {
-+            // Continue checking legacy and current Chrome cookie locations.
-+        }
-+    }
-+    return false;
-+}
-+async function markCopiedProfileExitedCleanly(profileDir) {
-+    const preferencesPath = path.join(profileDir, "Preferences");
-+    try {
-+        const raw = await readFile(preferencesPath, "utf8");
-+        const preferences = JSON.parse(raw);
-+        preferences.profile ||= {};
-+        preferences.profile.exit_type = "Normal";
-+        preferences.profile.exited_cleanly = true;
-+        await writeFile(preferencesPath, JSON.stringify(preferences));
-+    }
-+    catch {
-+        // The launch flag also suppresses the bubble; a missing or temporarily
-+        // unreadable Preferences file must not make profile copying fail.
-+    }
-+}
- function resolveChromeProfileDirectory(srcUserDataDir, localState, requestedProfile) {
-     let profile = requestedProfile?.trim();
-     if (!profile) {
-diff -ruN a/dist/src/browser/actions/navigation.js b/dist/src/browser/actions/navigation.js
---- a/dist/src/browser/actions/navigation.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/actions/navigation.js	2026-09-07 10:07:35
-@@ -37,7 +37,17 @@
- export async function navigateToChatGPT(Page, Runtime, url, logger) {
-     logger(`Navigating to ${url}`);
-     await Page.navigate({ url });
--    await waitForDocumentReady(Runtime, 45_000);
-+    try {
-+        await waitForDocumentReady(Runtime, 45_000);
-+    }
-+    catch (error) {
-+        if (typeof Page.reload !== "function") {
-+            throw error;
-+        }
-+        logger("[nav] initial document readiness timed out; reloading the isolated tab once.");
-+        await Page.reload({ ignoreCache: false });
-+        await waitForDocumentReady(Runtime, 45_000);
-+    }
- }
- async function dismissBlockingUi(Runtime, logger) {
-     const outcome = await Runtime.evaluate({
-diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
---- a/dist/src/browser/index.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/index.js	2026-09-07 10:32:36
-@@ -80,6 +80,19 @@
-         return false;
-     return options.effectiveKeepBrowser || options.preserveBrowserOnError;
- }
-+async function terminateLocalChromeAfterRun(options) {
-+    if (options.connectionClosedUnexpectedly && !options.usingCopiedProfile) {
-+        return false;
-+    }
-+    if (options.terminatedRecordedChrome) {
-+        return false;
-+    }
-+    await options.chrome.kill();
-+    return true;
-+}
-+export async function terminateLocalChromeAfterRunForTest(options) {
-+    return terminateLocalChromeAfterRun(options);
-+}
- export function shouldPreserveBrowserOnErrorForTest(error, headless) {
-     return shouldPreserveBrowserOnError(error, headless);
- }
-@@ -296,6 +309,31 @@
-  * window swallows the click while the automation still believes it clicked.
-  * Soft-fails: focus emulation is an optimization, never a hard requirement.
-  */
-+async function stabilizeChromeWindow(client, logger) {
-+    const width = 1280;
-+    const height = 720;
-+    try {
-+        const { windowId } = await client.Browser.getWindowForTarget();
-+        await client.Browser.setWindowBounds({
-+            windowId,
-+            bounds: { windowState: "normal" },
-+        });
-+        await client.Browser.setWindowBounds({
-+            windowId,
-+            bounds: { width, height },
-+        });
-+        const observed = await client.Browser.getWindowBounds({ windowId });
-+        const bounds = observed?.bounds;
-+        if (bounds?.windowState !== "normal" || bounds.width !== width || bounds.height !== height) {
-+            throw new Error(`observed ${bounds?.width ?? "?"}x${bounds?.height ?? "?"} (${bounds?.windowState ?? "unknown"})`);
-+        }
-+        logger(`Chrome window fixed at ${width}x${height}`);
-+    }
-+    catch (error) {
-+        const message = error instanceof Error ? error.message : String(error);
-+        throw new Error(`Failed to set stable Chrome window bounds: ${message}`);
-+    }
-+}
- async function enableFocusEmulation(client, logger, label) {
-     try {
-         await client.Emulation.setFocusEmulationEnabled({ enabled: true });
-@@ -741,6 +779,9 @@
-             chromePort: chrome.port,
-         });
-     }
-+    // Persist the owned runtime before navigation so even an early page-load
-+    // failure can be audited and cleaned by exact PID/Profile identity.
-+    await emitRuntimeHint();
-     let removeTerminationHooks = null;
-     try {
-         removeTerminationHooks = registerTerminationHooks(chrome, userDataDir, effectiveKeepBrowser, logger, {
-@@ -853,6 +894,7 @@
-             domainEnablers.push(DOM.enable());
-         }
-         await Promise.all(domainEnablers);
-+        await stabilizeChromeWindow(client, logger);
-         if (!config.headless && config.hideWindow) {
-             await positionChromeWindowOffscreen(client, logger);
-         }
-@@ -1078,8 +1120,9 @@
-         // Handle thinking time selection if specified. Deep Research owns its own effort flow.
-         const thinkingTime = config.thinkingTime;
-         if (thinkingTime && !deepResearch) {
-+            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
-             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
--            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
-+            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
-                 retries: 2,
-                 delayMs: 300,
-                 onRetry: (attempt, error) => {
-@@ -1107,6 +1150,7 @@
-             await handle.release().catch(() => undefined);
-         };
-         const submitOnce = async (prompt, submissionAttachments) => {
-+            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
-             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
-             const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
-             const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
-@@ -1136,7 +1180,9 @@
-                 const perFileTimeout = 20_000;
-                 const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
-                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
--                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
-+                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentExpectations, logger, {
-+                    appearanceConfirmed: !inputOnlyAttachments,
-+                });
-                 logger("All attachments uploaded");
-             }
-             if (deepResearch) {
-@@ -1917,15 +1963,16 @@
-         removeDialogHandler?.();
-         removeTerminationHooks?.();
-         if (!keepBrowserOpen) {
--            if (!connectionClosedUnexpectedly) {
--                try {
--                    if (!terminatedRecordedChrome) {
--                        await chrome.kill();
--                    }
--                }
--                catch {
--                    // ignore kill failures
--                }
-+            try {
-+                await terminateLocalChromeAfterRun({
-+                    connectionClosedUnexpectedly,
-+                    usingCopiedProfile,
-+                    terminatedRecordedChrome,
-+                    chrome,
-+                });
-+            }
-+            catch {
-+                // ignore kill failures
-             }
-             if (manualLogin) {
-                 const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
-@@ -2397,7 +2444,7 @@
-         const thinkingTime = config.thinkingTime;
-         if (thinkingTime && !deepResearch) {
-             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
--            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
-+            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
-                 retries: 2,
-                 delayMs: 300,
-                 onRetry: (attempt, error) => {

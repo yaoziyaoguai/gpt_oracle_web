@@ -1,5 +1,5 @@
 diff -ruN a/dist/src/browser/actions/assistantResponse.js b/dist/src/browser/actions/assistantResponse.js
---- a/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:19:24
+--- a/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:03:09
 +++ b/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:09:02
 @@ -15,6 +15,7 @@
  const TERMINAL_GATE_CONFIG = {
@@ -30,230 +30,8 @@ diff -ruN a/dist/src/browser/actions/assistantResponse.js b/dist/src/browser/act
      }
      return { state: next, terminal };
  }
-diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/attachments.js
---- a/dist/src/browser/actions/attachments.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/actions/attachments.js	2026-09-07 15:03:25
-@@ -1032,7 +1032,9 @@
-         const inputNameCandidates = resolveInputNameCandidates();
-         const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
-             (lastInputValue && matchesExpectedName(lastInputValue));
--        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
-+        // This branch already requires a baseline-relative upload UI delta. Current
-+        // ChatGPT cards do not always expose the local filename, so a second exact-name
-+        // visibility probe would turn confirmed uploads into false negatives.
-         logger(inputHasFile
-             ? "Attachment queued (UI anchored, file input confirmed)"
-             : "Attachment queued (UI anchored)");
-@@ -1042,7 +1044,6 @@
-     const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
-         (lastInputValue && matchesExpectedName(lastInputValue));
-     if (await waitForAttachmentAnchored(runtime, expectedName, attachmentUiTimeoutMs)) {
--        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
-         logger(inputHasFile
-             ? "Attachment queued (UI anchored, file input confirmed)"
-             : "Attachment queued (UI anchored)");
-@@ -1171,9 +1172,17 @@
-         throw new Error("Existing attachments still present in composer; aborting to avoid duplicate uploads.");
-     }
- }
--export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedNames = [], logger) {
-+export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedAttachments = [], logger, options) {
-     const deadline = Date.now() + timeoutMs;
--    const expectedNormalized = expectedNames.map((name) => name.toLowerCase());
-+    const expectations = expectedAttachments
-+        .map((attachment) => typeof attachment === "string"
-+        ? { name: attachment, generatedBundle: false }
-+        : {
-+            name: typeof attachment?.name === "string" ? attachment.name : "",
-+            generatedBundle: attachment?.generatedBundle === true,
-+        })
-+        .filter((attachment) => attachment.name.length > 0);
-+    const expectedNormalized = expectations.map((attachment) => attachment.name.toLowerCase());
-     const expectedInputBasenames = expectedNormalized
-         .map((name) => name.split("/").pop()?.split("\\").pop() ?? name)
-         .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
-@@ -1450,7 +1459,11 @@
-                     return false;
-                 });
-             };
--            const missing = expectedNormalized.filter((expected) => !matchesExpected(expected));
-+            const genericAttachmentUiSatisfied = options?.appearanceConfirmed === true &&
-+                Boolean(value.filesAttached);
-+            const missing = genericAttachmentUiSatisfied
-+                ? []
-+                : expectedNormalized.filter((expected) => !matchesExpected(expected));
-             if (missing.length === 0 || fileCountSatisfied) {
-                 const stableThresholdMs = value.uploading ? 3000 : 1500;
-                 if (attachmentMatchSince === null) {
-diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 15:03:25
-@@ -68,9 +68,13 @@
-         candidates.find((node) => isVisible(node)) ||
-         candidates[0];
-       if (preferred && focusNode(preferred)) {
-+        const activeAfterFocus = document.activeElement;
-         const rect = preferred.getBoundingClientRect();
-         return {
-           focused: true,
-+          activeMatches:
-+            preferred === activeAfterFocus ||
-+            (activeAfterFocus instanceof Node && preferred.contains(activeAfterFocus)),
-           kind: 'composer',
-           x: rect.left + rect.width / 2,
-           y: rect.top + rect.height / 2,
-@@ -95,7 +99,21 @@
-     }
-     const focusPoint = focusResult.result.value;
-     if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
--        await clickTrustedPoint(runtime, input, focusPoint);
-+        try {
-+            await clickTrustedPoint(runtime, input, focusPoint);
-+        }
-+        catch (error) {
-+            const details = error instanceof BrowserAutomationError ? error.details : null;
-+            if (focusPoint.activeMatches !== true ||
-+                details?.code !== "trusted-target-mismatch" ||
-+                details?.kind !== "composer") {
-+                throw error;
-+            }
-+            if (!(await hasFocusedVisibleComposer(runtime))) {
-+                throw error;
-+            }
-+            logger("Composer pointer target was covered; using verified editor focus");
-+        }
-     }
-     await input.insertText({ text: prompt });
-     // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
-@@ -187,6 +205,14 @@
-     const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
-     const observedActive = postVerification.result?.value?.activeValue ?? "";
-     const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
-+    if (observedLength === 0) {
-+        await logDomFailure(runtime, logger, "prompt-insertion-unverified");
-+        throw new BrowserAutomationError("Prompt insertion could not be verified in the focused composer.", {
-+            stage: "submit-prompt",
-+            code: "prompt-insertion-unverified",
-+            promptLength,
-+        });
-+    }
-     if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
-         // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
-         await logDomFailure(runtime, logger, "prompt-too-large");
-@@ -218,6 +244,37 @@
-     // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-     return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
- }
-+async function hasFocusedVisibleComposer(Runtime) {
-+    const result = await Runtime.evaluate({
-+        expression: `(() => {
-+      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
-+      const isVisible = (node) => {
-+        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-+        const rect = node.getBoundingClientRect();
-+        return rect.width > 0 && rect.height > 0;
-+      };
-+      const isEditable = (node) =>
-+        node instanceof HTMLTextAreaElement ||
-+        node instanceof HTMLInputElement ||
-+        node.isContentEditable ||
-+        node.getAttribute?.('contenteditable') === 'true';
-+      const active = document.activeElement;
-+      if (!(active instanceof Node)) return false;
-+      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
-+      const candidates = [
-+        primary,
-+        ...selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))),
-+      ].filter((node, index, all) => node && all.indexOf(node) === index);
-+      return candidates.some((node) =>
-+        isVisible(node) &&
-+        isEditable(node) &&
-+        (node === active || node.contains(active))
-+      );
-+    })()`,
-+        returnByValue: true,
-+    });
-+    return result.result?.value === true;
-+}
- async function submitViaEnter(Runtime, Input) {
-     const focus = await Runtime.evaluate({
-         expression: `(() => {
-@@ -243,9 +300,13 @@
-         candidates.find((node) => isVisible(node) && isEditable(node));
-       if (!editor) return null;
-       editor.focus?.();
-+      const activeAfterFocus = document.activeElement;
-       const rect = editor.getBoundingClientRect();
-       return {
-         kind: 'composer',
-+        activeMatches:
-+          editor === activeAfterFocus ||
-+          (activeAfterFocus instanceof Node && editor.contains(activeAfterFocus)),
-         x: rect.left + rect.width / 2,
-         y: rect.top + rect.height / 2,
-         viewport: {
-@@ -262,7 +323,20 @@
-     });
-     const point = focus.result?.value;
-     if (point && typeof point.x === "number" && typeof point.y === "number") {
--        await clickTrustedPoint(Runtime, Input, point);
-+        try {
-+            await clickTrustedPoint(Runtime, Input, point);
-+        }
-+        catch (error) {
-+            const details = error instanceof BrowserAutomationError ? error.details : null;
-+            if (point.activeMatches !== true ||
-+                details?.code !== "trusted-target-mismatch" ||
-+                details?.kind !== "composer") {
-+                throw error;
-+            }
-+            if (!(await hasFocusedVisibleComposer(Runtime))) {
-+                throw error;
-+            }
-+        }
-     }
-     await Input.dispatchKeyEvent({
-         type: "keyDown",
-@@ -808,9 +882,6 @@
-       }
-       if (!target) return { status: 'missing', kind };
-       const rect = target.getBoundingClientRect();
--      const x = rect.left + rect.width / 2;
--      const y = rect.top + rect.height / 2;
--      const hit = document.elementFromPoint(x, y);
-       const viewport = {
-         width: window.innerWidth,
-         height: window.innerHeight,
-@@ -819,10 +890,24 @@
-         visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
-         visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
-       };
--      if (!(hit instanceof Node) || !(target === hit || target.contains(hit))) {
--        return { status: 'target-mismatch', kind, x, y, viewport };
-+      const candidateFractions = kind === 'composer'
-+        ? [[0.5, 0.5], [0.2, 0.8], [0.5, 0.8], [0.8, 0.8], [0.2, 0.5], [0.8, 0.5]]
-+        : [[0.5, 0.5]];
-+      for (const [xFraction, yFraction] of candidateFractions) {
-+        const x = rect.left + rect.width * xFraction;
-+        const y = rect.top + rect.height * yFraction;
-+        const hit = document.elementFromPoint(x, y);
-+        if (hit instanceof Node && (target === hit || target.contains(hit))) {
-+          return { status: 'point', kind, x, y, viewport };
-+        }
-       }
--      return { status: 'point', kind, x, y, viewport };
-+      return {
-+        status: 'target-mismatch',
-+        kind,
-+        x: rect.left + rect.width / 2,
-+        y: rect.top + rect.height / 2,
-+        viewport,
-+      };
-     })()`;
- }
- function sameViewport(left, right) {
 diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
---- a/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:19:24
+--- a/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:03:09
 +++ b/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:10:06
 @@ -21,6 +21,16 @@
      }
@@ -304,7 +82,7 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
      }
  }
 diff -ruN a/dist/src/browser/chromeLifecycle.js b/dist/src/browser/chromeLifecycle.js
---- a/dist/src/browser/chromeLifecycle.js	2026-09-07 15:19:24
+--- a/dist/src/browser/chromeLifecycle.js	2026-09-07 15:03:09
 +++ b/dist/src/browser/chromeLifecycle.js	2026-09-07 15:09:51
 @@ -79,9 +79,11 @@
              logger(`Received ${signal}; terminating Chrome process`);
@@ -321,7 +99,7 @@ diff -ruN a/dist/src/browser/chromeLifecycle.js b/dist/src/browser/chromeLifecyc
                      logger('Session still in flight; reattach with "oracle session <slug>" to continue.');
                  }
 diff -ruN a/dist/src/browser/config.js b/dist/src/browser/config.js
---- a/dist/src/browser/config.js	2026-09-07 15:19:24
+--- a/dist/src/browser/config.js	2026-09-07 15:03:09
 +++ b/dist/src/browser/config.js	2026-09-07 15:11:29
 @@ -23,7 +23,7 @@
      browserTabRef: null,
@@ -333,7 +111,7 @@ diff -ruN a/dist/src/browser/config.js b/dist/src/browser/config.js
      inputTimeoutMs: 60_000,
      attachmentTimeoutMs: 45_000,
 diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
---- a/dist/src/browser/index.js	2026-09-07 15:19:24
+--- a/dist/src/browser/index.js	2026-09-07 15:03:09
 +++ b/dist/src/browser/index.js	2026-09-07 15:10:37
 @@ -38,6 +38,49 @@
  export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
@@ -385,27 +163,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
  function redactBrowserConfigForDebugLog(config) {
      const redacted = { ...config };
      if (Array.isArray(config.inlineCookies)) {
-@@ -80,6 +123,19 @@
-         return false;
-     return options.effectiveKeepBrowser || options.preserveBrowserOnError;
- }
-+async function terminateLocalChromeAfterRun(options) {
-+    if (options.connectionClosedUnexpectedly && !options.usingCopiedProfile) {
-+        return false;
-+    }
-+    if (options.terminatedRecordedChrome) {
-+        return false;
-+    }
-+    await options.chrome.kill();
-+    return true;
-+}
-+export async function terminateLocalChromeAfterRunForTest(options) {
-+    return terminateLocalChromeAfterRun(options);
-+}
- export function shouldPreserveBrowserOnErrorForTest(error, headless) {
-     return shouldPreserveBrowserOnError(error, headless);
- }
-@@ -623,7 +679,7 @@
+@@ -636,7 +679,7 @@
      let modelSelectionEvidence;
      let tabLease = null;
      let conversationUrlMonitor = null;
@@ -414,7 +172,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          if (!chrome?.port) {
              return;
          }
-@@ -638,6 +694,7 @@
+@@ -651,6 +694,7 @@
              promptSubmitted,
              userDataDir,
              controllerPid: process.pid,
@@ -422,7 +180,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          };
          try {
              await runtimeHintCb?.(hint, modelSelectionEvidence);
-@@ -786,6 +843,7 @@
+@@ -799,6 +843,7 @@
      let isolatedTargetId = null;
      let ownsTarget = true;
      const startedAt = Date.now();
@@ -430,7 +188,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
      let answerText = "";
      let answerMarkdown = "";
      let answerHtml = "";
-@@ -874,7 +932,7 @@
+@@ -887,7 +932,7 @@
                  })();
              });
          });
@@ -439,7 +197,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          const { Network, Page, Runtime, Input, DOM, Target } = client;
          const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
          if (DOM && typeof DOM.enable === "function") {
-@@ -1109,7 +1167,7 @@
+@@ -1122,7 +1167,7 @@
          if (thinkingTime && !deepResearch) {
              await raceWithDisconnect(stabilizeChromeWindow(client, logger));
              const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
@@ -448,7 +206,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
                  retries: 2,
                  delayMs: 300,
                  onRetry: (attempt, error) => {
-@@ -1118,6 +1176,10 @@
+@@ -1131,6 +1176,10 @@
                      }
                  },
              }));
@@ -459,18 +217,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          }
          const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
          let profileLock = null;
-@@ -1167,7 +1229,9 @@
-                 const perFileTimeout = 20_000;
-                 const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
-                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
--                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
-+                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentExpectations, logger, {
-+                    appearanceConfirmed: !inputOnlyAttachments,
-+                });
-                 logger("All attachments uploaded");
-             }
-             if (deepResearch) {
-@@ -1757,7 +1821,23 @@
+@@ -1772,7 +1821,23 @@
          };
      }
      catch (error) {
@@ -495,7 +242,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
          connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
          const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
-@@ -1843,6 +1923,7 @@
+@@ -1858,6 +1923,7 @@
          }, normalizedError);
      }
      finally {
@@ -503,34 +250,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          await conversationUrlMonitor?.stop();
          try {
              if (!connectionClosedUnexpectedly) {
-@@ -1948,16 +2029,17 @@
-         removeDialogHandler?.();
-         removeTerminationHooks?.();
-         if (!keepBrowserOpen) {
--            if (!connectionClosedUnexpectedly) {
--                try {
--                    if (!terminatedRecordedChrome) {
--                        await chrome.kill();
--                    }
--                }
--                catch {
--                    // ignore kill failures
--                }
-+            try {
-+                await terminateLocalChromeAfterRun({
-+                    connectionClosedUnexpectedly,
-+                    usingCopiedProfile,
-+                    terminatedRecordedChrome,
-+                    chrome,
-+                });
-             }
-+            catch {
-+                // ignore kill failures
-+            }
-             if (manualLogin) {
-                 const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
-                     connectionClosedUnexpectedly,
-@@ -2428,7 +2510,7 @@
+@@ -2444,7 +2510,7 @@
          const thinkingTime = config.thinkingTime;
          if (thinkingTime && !deepResearch) {
              const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
@@ -539,7 +259,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
                  retries: 2,
                  delayMs: 300,
                  onRetry: (attempt, error) => {
-@@ -2437,6 +2519,10 @@
+@@ -2453,6 +2519,10 @@
                      }
                  },
              });
@@ -551,7 +271,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          const submitOnce = async (prompt, submissionAttachments) => {
              const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
 diff -ruN a/dist/src/browser/sessionRunner.js b/dist/src/browser/sessionRunner.js
---- a/dist/src/browser/sessionRunner.js	2026-09-07 15:19:24
+--- a/dist/src/browser/sessionRunner.js	2026-09-07 15:03:09
 +++ b/dist/src/browser/sessionRunner.js	2026-09-07 15:26:44
 @@ -99,7 +99,7 @@
      automationLogger.verbose = Boolean(runOptions.verbose);
@@ -563,7 +283,7 @@ diff -ruN a/dist/src/browser/sessionRunner.js b/dist/src/browser/sessionRunner.j
          log(chalk.dim("Chrome automation does not stream output; this may take a minute..."));
      }
 diff -ruN a/dist/src/cli/browserConfig.js b/dist/src/cli/browserConfig.js
---- a/dist/src/cli/browserConfig.js	2026-09-07 15:19:24
+--- a/dist/src/cli/browserConfig.js	2026-09-07 15:03:09
 +++ b/dist/src/cli/browserConfig.js	2026-09-07 15:11:29
 @@ -7,7 +7,7 @@
  import { parseDuration } from "../duration.js";
@@ -575,7 +295,7 @@ diff -ruN a/dist/src/cli/browserConfig.js b/dist/src/cli/browserConfig.js
  const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
  const DEFAULT_BROWSER_RECHECK_TIMEOUT_MS = 120_000;
 diff -ruN a/dist/src/cli/help.js b/dist/src/cli/help.js
---- a/dist/src/cli/help.js	2026-09-07 15:19:24
+--- a/dist/src/cli/help.js	2026-09-07 15:03:09
 +++ b/dist/src/cli/help.js	2026-09-07 15:35:04
 @@ -52,7 +52,7 @@
          `${colors.bullet("•")} Oracle is one-shot by default. Continue saved API or ChatGPT browser sessions with ${colors.accent("--followup <sessionId|responseId>")}; use repeated ${colors.accent("--browser-follow-up")} for planned same-run ChatGPT turns.`,
@@ -587,7 +307,7 @@ diff -ruN a/dist/src/cli/help.js b/dist/src/cli/help.js
          `${colors.bullet("•")} Need hidden flags? Run ${colors.accent(`${program.name()} --help --verbose`)} to list search/token/browser overrides.`,
          `${colors.bullet("•")} If any Oracle session is already running, do not start new API runs. Attach to the existing browser session instead; only trigger API calls when you explicitly mean to.`,
 diff -ruN a/dist/src/cli/sessionRunner.js b/dist/src/cli/sessionRunner.js
---- a/dist/src/cli/sessionRunner.js	2026-09-07 15:19:24
+--- a/dist/src/cli/sessionRunner.js	2026-09-07 15:03:09
 +++ b/dist/src/cli/sessionRunner.js	2026-09-07 15:27:45
 @@ -27,6 +27,35 @@
  import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
@@ -654,7 +374,7 @@ diff -ruN a/dist/src/cli/sessionRunner.js b/dist/src/cli/sessionRunner.js
              };
              const result = await runBrowserSessionExecution({
 diff -ruN a/dist/src/cli/tui/index.js b/dist/src/cli/tui/index.js
---- a/dist/src/cli/tui/index.js	2026-09-07 15:19:24
+--- a/dist/src/cli/tui/index.js	2026-09-07 15:03:09
 +++ b/dist/src/cli/tui/index.js	2026-09-07 15:35:04
 @@ -317,7 +317,7 @@
          {
@@ -666,7 +386,7 @@ diff -ruN a/dist/src/cli/tui/index.js b/dist/src/cli/tui/index.js
          {
              name: "model",
 diff -ruN a/dist/src/sessionManager.js b/dist/src/sessionManager.js
---- a/dist/src/sessionManager.js	2026-09-07 15:19:24
+--- a/dist/src/sessionManager.js	2026-09-07 15:03:09
 +++ b/dist/src/sessionManager.js	2026-09-07 15:10:52
 @@ -23,6 +23,9 @@
  const MAX_SLUG_WORDS = 5;

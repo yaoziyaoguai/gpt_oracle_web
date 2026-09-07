@@ -70,6 +70,7 @@ slug="ow-live-$(date +%Y%m%d-%H%M%S)-$$"
 oracle_args=(
   --force
   --timeout 5m
+  --browser-timeout 5m
   --slug "$slug"
   --browser-thinking-time "$level"
   --browser-attachment-timeout 300s

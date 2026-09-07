@@ -15,11 +15,12 @@ Use the session metadata and concise browser log as evidence. Do not print promp
 - `trusted-target-resized`: the viewport kept changing across three fresh probes. Old coordinates were discarded and no pointer click was sent.
 - `prompt-insertion-unverified`: the runtime used the verified focused composer but could not read the inserted prompt back from the editor. No send action was attempted.
 - `prompt-commit-timeout`: a send action was attempted but no committed user turn appeared. `promptSubmitted=true` is not success.
+- `browser-run-timeout`: the shared browser deadline expired. Submission, answer capture, and recheck do not receive fresh timeout budgets.
 - `connection-lost`: CDP disconnected before completion. A copied-profile run is not retained for recovery; verify that its recorded Chrome PID stopped and its temporary Profile was removed.
 
 ## Safe checks
 
-1. Inspect the exact session's `status`, structured `error`, `browser.modelSelection`, and `browser.runtime.promptSubmitted`.
+1. Inspect the exact session's `status`, structured `error`, `browser.modelSelection`, `browser.runtime.promptSubmitted`, and `browser.runtime.interruptedSignal`.
 2. Read `browser.runtime.chromePid`, `chromePort`, `chromeTargetId`, `userDataDir`, and `controllerPid` from that exact session. These fields identify the owned browser; timestamps and window titles do not.
 3. After the run exits, verify only the recorded `chromePid` and temporary `userDataDir`. Never use a process-name-wide kill, never signal `controllerPid`, and never delete a normal Chrome Profile.
 4. If selection or submission was not confirmed, stop. Do not click the browser manually and do not automatically create another session.

@@ -1,6 +1,38 @@
+diff -ruN a/dist/src/browser/actions/assistantResponse.js b/dist/src/browser/actions/assistantResponse.js
+--- a/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:19:24
++++ b/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:09:02
+@@ -15,6 +15,7 @@
+ const TERMINAL_GATE_CONFIG = {
+     barConfirmCycles: readPositiveIntEnv("ORACLE_BAR_CONFIRM_CYCLES", 3),
+     minStableMs: readPositiveIntEnv("ORACLE_TERMINAL_MIN_STABLE_MS", 1_200),
++    quietStableMs: readPositiveIntEnv("ORACLE_TERMINAL_QUIET_STABLE_MS", 8_000),
+ };
+ export function createTerminalGateState(now) {
+     return {
+@@ -48,11 +49,19 @@
+         // requirement guards the documented race where finished-action controls surface while only
+         // the first tokens have rendered. Weak sidecar evidence cannot hang a finished turn, but
+         // strong live activity vetoes this proof and restarts its debounce.
+-        terminal =
++        const actionBarProof =
+             sample.barVisible &&
+                 !sample.strongThinkingActive &&
+                 barStableCycles >= config.barConfirmCycles &&
+                 stableMs >= config.minStableMs;
++        // Some completed ChatGPT turns never mount the action bar. A longer quiet
++        // window is a second proof: content must remain unchanged, no stop control
++        // may be present, and no strong thinking signal may be active. The longer
++        // threshold keeps short rendering pauses from finalizing a preamble.
++        const quietProof = sample.len >= MIN_CONFIDENT_ANSWER_LENGTH &&
++            !sample.strongThinkingActive &&
++            stableMs >= config.quietStableMs;
++        terminal = actionBarProof || quietProof;
+     }
+     return { state: next, terminal };
+ }
 diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js	2026-09-07 10:09:46
-+++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 10:12:09
+--- a/dist/src/browser/actions/promptComposer.js	2026-09-07 15:19:24
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 15:03:25
 @@ -68,9 +68,13 @@
          candidates.find((node) => isVisible(node)) ||
          candidates[0];
@@ -53,11 +85,10 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
          // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
          await logDomFailure(runtime, logger, "prompt-too-large");
-@@ -217,6 +243,37 @@
-     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
+@@ -218,6 +244,37 @@
      // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
      return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
-+}
+ }
 +async function hasFocusedVisibleComposer(Runtime) {
 +    const result = await Runtime.evaluate({
 +        expression: `(() => {
@@ -88,9 +119,10 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        returnByValue: true,
 +    });
 +    return result.result?.value === true;
- }
++}
  async function submitViaEnter(Runtime, Input) {
      const focus = await Runtime.evaluate({
+         expression: `(() => {
 @@ -243,9 +300,13 @@
          candidates.find((node) => isVisible(node) && isEditable(node));
        if (!editor) return null;
@@ -127,14 +159,143 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      }
      await Input.dispatchKeyEvent({
          type: "keyDown",
+diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
+--- a/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:19:24
++++ b/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:10:06
+@@ -21,6 +21,16 @@
+     }
+     logger(`[browser] Model picker diagnostic: ${JSON.stringify(diagnostic)}`);
+ }
++function buildThinkingSelectionEvidence(level, result, verified) {
++    return {
++        requestedLevel: level,
++        resolvedLabel: result?.label ?? null,
++        status: result?.status ?? "unknown",
++        verified,
++        source: "thinking-time-control",
++        capturedAt: new Date().toISOString(),
++    };
++}
+ /**
+  * Selects a thinking-time level in ChatGPT's composer.
+  *
+@@ -66,10 +76,10 @@
+     switch (result?.status) {
+         case "already-selected":
+             logger(formatBrowserThinkingLog(`${result.label ?? capitalizedLevel} (already selected)`));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, true);
+         case "switched":
+             logger(formatBrowserThinkingLog(result.label ?? capitalizedLevel));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, true);
+         case "chip-not-found":
+         case "menu-not-found":
+         case "option-not-found":
+@@ -93,7 +103,7 @@
+                 ? "the effort in ChatGPT is unconfirmed"
+                 : "keeping the effort already selected in ChatGPT";
+             logger(formatBrowserThinkingLog(`${message}; ${outcome}.`));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, false);
+         }
+         default: {
+             await logDomFailure(Runtime, logger, "thinking-time-unknown");
+@@ -102,7 +112,7 @@
+                 throw new Error(`Thinking time: unknown outcome selecting ${capitalizedLevel}; refusing to submit without confirmed ${strictTarget}.`);
+             }
+             logger(formatBrowserThinkingLog(`unknown outcome selecting ${capitalizedLevel}; continuing with ChatGPT default.`));
+-            return;
++            return buildThinkingSelectionEvidence(level, result, false);
+         }
+     }
+ }
+diff -ruN a/dist/src/browser/chromeLifecycle.js b/dist/src/browser/chromeLifecycle.js
+--- a/dist/src/browser/chromeLifecycle.js	2026-09-07 15:19:24
++++ b/dist/src/browser/chromeLifecycle.js	2026-09-07 15:09:51
+@@ -79,9 +79,11 @@
+             logger(`Received ${signal}; terminating Chrome process`);
+         }
+         void (async () => {
++            // Persist the interruption before closing the only browser that can
++            // identify this run. Session metadata must not remain "running"
++            // after an operator cancels a copied-profile consultation.
++            await opts?.emitRuntimeHint?.(signal).catch(() => undefined);
+             if (leaveRunning) {
+-                // Ensure reattach hints are written before we exit.
+-                await opts?.emitRuntimeHint?.().catch(() => undefined);
+                 if (inFlight) {
+                     logger('Session still in flight; reattach with "oracle session <slug>" to continue.');
+                 }
+diff -ruN a/dist/src/browser/config.js b/dist/src/browser/config.js
+--- a/dist/src/browser/config.js	2026-09-07 15:19:24
++++ b/dist/src/browser/config.js	2026-09-07 15:11:29
+@@ -23,7 +23,7 @@
+     browserTabRef: null,
+     url: CHATGPT_URL,
+     chatgptUrl: CHATGPT_URL,
+-    timeoutMs: 1_200_000,
++    timeoutMs: 2_700_000,
+     debugPort: null,
+     inputTimeoutMs: 60_000,
+     attachmentTimeoutMs: 45_000,
 diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
---- a/dist/src/browser/index.js	2026-09-07 10:08:26
-+++ b/dist/src/browser/index.js	2026-09-07 10:32:36
-@@ -79,7 +79,20 @@
-     if (options.usingCopiedProfile)
+--- a/dist/src/browser/index.js	2026-09-07 15:19:24
++++ b/dist/src/browser/index.js	2026-09-07 15:10:37
+@@ -38,6 +38,49 @@
+ export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
+ export { parseDuration, delay, normalizeChatgptUrl, isTemporaryChatUrl } from "./utils.js";
+ export { formatThinkingLog, formatThinkingWaitingLog, buildThinkingStatusExpressionForTest, readThinkingStatusForTest, sanitizeThinkingText, startThinkingStatusMonitorForTest, } from "./actions/thinkingStatus.js";
++function createBrowserRunDeadline(timeoutMs) {
++    let expired = false;
++    let timer;
++    const normalizedTimeoutMs = Math.max(1, Number(timeoutMs) || 1);
++    const promise = new Promise((_, reject) => {
++        timer = setTimeout(() => {
++            expired = true;
++            reject(new Error("browser-run-deadline-exceeded"));
++        }, normalizedTimeoutMs);
++    });
++    // The deadline can fire while a non-raced setup operation is still resolving.
++    // Keep the rejection handled until the main browser race observes it.
++    promise.catch(() => undefined);
++    return {
++        promise,
++        get expired() {
++            return expired;
++        },
++        dispose() {
++            if (timer) {
++                clearTimeout(timer);
++                timer = undefined;
++            }
++        },
++    };
++}
++export function createBrowserRunDeadlineForTest(timeoutMs) {
++    return createBrowserRunDeadline(timeoutMs);
++}
++function buildPowerControlModelSelectionEvidence(requestedModel, strategy, thinkingSelection) {
++    return {
++        requestedModel,
++        resolvedLabel: thinkingSelection.resolvedLabel,
++        strategy,
++        status: thinkingSelection.status,
++        verified: thinkingSelection.verified === true,
++        source: thinkingSelection.source ?? "thinking-time-control",
++        capturedAt: thinkingSelection.capturedAt ?? new Date().toISOString(),
++    };
++}
++export function buildPowerControlModelSelectionEvidenceForTest(requestedModel, strategy, thinkingSelection) {
++    return buildPowerControlModelSelectionEvidence(requestedModel, strategy, thinkingSelection);
++}
+ function redactBrowserConfigForDebugLog(config) {
+     const redacted = { ...config };
+     if (Array.isArray(config.inlineCookies)) {
+@@ -80,6 +123,19 @@
          return false;
      return options.effectiveKeepBrowser || options.preserveBrowserOnError;
-+}
+ }
 +async function terminateLocalChromeAfterRun(options) {
 +    if (options.connectionClosedUnexpectedly && !options.usingCopiedProfile) {
 +        return false;
@@ -144,14 +305,101 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
 +    }
 +    await options.chrome.kill();
 +    return true;
- }
++}
 +export async function terminateLocalChromeAfterRunForTest(options) {
 +    return terminateLocalChromeAfterRun(options);
 +}
  export function shouldPreserveBrowserOnErrorForTest(error, headless) {
      return shouldPreserveBrowserOnError(error, headless);
  }
-@@ -1950,16 +1963,17 @@
+@@ -623,7 +679,7 @@
+     let modelSelectionEvidence;
+     let tabLease = null;
+     let conversationUrlMonitor = null;
+-    const emitRuntimeHint = async () => {
++    const emitRuntimeHint = async (interruptedSignal) => {
+         if (!chrome?.port) {
+             return;
+         }
+@@ -638,6 +694,7 @@
+             promptSubmitted,
+             userDataDir,
+             controllerPid: process.pid,
++            ...(interruptedSignal ? { interruptedSignal } : {}),
+         };
+         try {
+             await runtimeHintCb?.(hint, modelSelectionEvidence);
+@@ -786,6 +843,7 @@
+     let isolatedTargetId = null;
+     let ownsTarget = true;
+     const startedAt = Date.now();
++    const browserRunDeadline = createBrowserRunDeadline(config.timeoutMs);
+     let answerText = "";
+     let answerMarkdown = "";
+     let answerHtml = "";
+@@ -874,7 +932,7 @@
+                 })();
+             });
+         });
+-        const raceWithDisconnect = (promise) => Promise.race([promise, disconnectPromise]);
++        const raceWithDisconnect = (promise) => Promise.race([promise, disconnectPromise, browserRunDeadline.promise]);
+         const { Network, Page, Runtime, Input, DOM, Target } = client;
+         const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
+         if (DOM && typeof DOM.enable === "function") {
+@@ -1109,7 +1167,7 @@
+         if (thinkingTime && !deepResearch) {
+             await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
++            const thinkingSelectionEvidence = await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {
+@@ -1118,6 +1176,10 @@
+                     }
+                 },
+             }));
++            if (thinkingSelectionEvidence?.verified) {
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, thinkingSelectionEvidence);
++                await emitRuntimeHint();
++            }
+         }
+         const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
+         let profileLock = null;
+@@ -1759,7 +1821,23 @@
+         };
+     }
+     catch (error) {
+-        const normalizedError = error instanceof Error ? error : new Error(String(error));
++        let normalizedError = error instanceof Error ? error : new Error(String(error));
++        if (browserRunDeadline.expired) {
++            normalizedError = new BrowserAutomationError(`Browser run exceeded the shared ${formatElapsed(config.timeoutMs)} deadline.`, {
++                stage: "browser-run-timeout",
++                runtime: {
++                    chromePid: chrome.pid,
++                    chromePort: chrome.port,
++                    chromeHost,
++                    userDataDir,
++                    chromeTargetId: lastTargetId ?? isolatedTargetId ?? undefined,
++                    tabUrl: lastUrl,
++                    conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
++                    promptSubmitted,
++                    controllerPid: process.pid,
++                },
++            }, normalizedError);
++        }
+         const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
+         connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
+         const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
+@@ -1845,6 +1923,7 @@
+         }, normalizedError);
+     }
+     finally {
++        browserRunDeadline.dispose();
+         await conversationUrlMonitor?.stop();
+         try {
+             if (!connectionClosedUnexpectedly) {
+@@ -1950,16 +2029,17 @@
          removeDialogHandler?.();
          removeTerminationHooks?.();
          if (!keepBrowserOpen) {
@@ -178,3 +426,173 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
              if (manualLogin) {
                  const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
                      connectionClosedUnexpectedly,
+@@ -2430,7 +2510,7 @@
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
++            const thinkingSelectionEvidence = await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {
+@@ -2439,6 +2519,10 @@
+                     }
+                 },
+             });
++            if (thinkingSelectionEvidence?.verified) {
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, thinkingSelectionEvidence);
++                await emitRuntimeHint();
++            }
+         }
+         const submitOnce = async (prompt, submissionAttachments) => {
+             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+diff -ruN a/dist/src/browser/sessionRunner.js b/dist/src/browser/sessionRunner.js
+--- a/dist/src/browser/sessionRunner.js	2026-09-07 15:19:24
++++ b/dist/src/browser/sessionRunner.js	2026-09-07 15:26:44
+@@ -99,7 +99,7 @@
+     automationLogger.verbose = Boolean(runOptions.verbose);
+     automationLogger.sessionLog = runOptions.verbose ? log : () => { };
+     log(headerLine);
+-    log(chalk.dim("This run can take up to an hour (usually ~10 minutes)."));
++    log(chalk.dim("This run can take up to 45 minutes (usually ~10 minutes)."));
+     if (runOptions.verbose) {
+         log(chalk.dim("Chrome automation does not stream output; this may take a minute..."));
+     }
+diff -ruN a/dist/src/cli/browserConfig.js b/dist/src/cli/browserConfig.js
+--- a/dist/src/cli/browserConfig.js	2026-09-07 15:19:24
++++ b/dist/src/cli/browserConfig.js	2026-09-07 15:11:29
+@@ -7,7 +7,7 @@
+ import { parseDuration } from "../duration.js";
+ import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
+ import { getOracleHomeDir } from "../oracleHome.js";
+-const DEFAULT_BROWSER_TIMEOUT_MS = 1_200_000;
++const DEFAULT_BROWSER_TIMEOUT_MS = 2_700_000;
+ const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
+ const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
+ const DEFAULT_BROWSER_RECHECK_TIMEOUT_MS = 120_000;
+diff -ruN a/dist/src/cli/help.js b/dist/src/cli/help.js
+--- a/dist/src/cli/help.js	2026-09-07 15:19:24
++++ b/dist/src/cli/help.js	2026-09-07 15:35:04
+@@ -52,7 +52,7 @@
+         `${colors.bullet("•")} Oracle is one-shot by default. Continue saved API or ChatGPT browser sessions with ${colors.accent("--followup <sessionId|responseId>")}; use repeated ${colors.accent("--browser-follow-up")} for planned same-run ChatGPT turns.`,
+         `${colors.bullet("•")} Run ${colors.accent("--files-report")} to inspect token spend before hitting the API.`,
+         `${colors.bullet("•")} Non-preview runs spawn detached sessions (especially gpt-5.5-pro API). If the CLI times out, do not re-run — reattach with ${colors.accent("oracle session <slug>")} to resume/inspect the existing run.`,
+-        `${colors.bullet("•")} Set a memorable 3–5 word slug via ${colors.accent('--slug "<words>"')} to keep session IDs tidy.`,
++        `${colors.bullet("•")} Set a memorable 3–12 word slug via ${colors.accent('--slug "<words>"')} to keep session IDs tidy.`,
+         `${colors.bullet("•")} Finished sessions auto-hide preamble logs when reattached; raw timestamps remain in the saved log file.`,
+         `${colors.bullet("•")} Need hidden flags? Run ${colors.accent(`${program.name()} --help --verbose`)} to list search/token/browser overrides.`,
+         `${colors.bullet("•")} If any Oracle session is already running, do not start new API runs. Attach to the existing browser session instead; only trigger API calls when you explicitly mean to.`,
+diff -ruN a/dist/src/cli/sessionRunner.js b/dist/src/cli/sessionRunner.js
+--- a/dist/src/cli/sessionRunner.js	2026-09-07 15:19:24
++++ b/dist/src/cli/sessionRunner.js	2026-09-07 15:27:45
+@@ -27,6 +27,35 @@
+ import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
+ const isTty = process.stdout.isTTY;
+ const dim = (text) => (isTty ? kleur.dim(text) : text);
++function buildRuntimeHintSessionUpdate(browserConfig, runtime, modelSelection, completedAt = new Date().toISOString()) {
++    const browser = {
++        config: browserConfig,
++        runtime,
++        ...(modelSelection ? { modelSelection } : {}),
++    };
++    const interruptedSignal = typeof runtime?.interruptedSignal === "string"
++        ? runtime.interruptedSignal
++        : null;
++    if (!interruptedSignal) {
++        return { status: "running", browser };
++    }
++    const message = `Browser run interrupted by ${interruptedSignal}.`;
++    return {
++        status: "error",
++        completedAt,
++        errorMessage: message,
++        browser,
++        response: { status: "incomplete", incompleteReason: "interrupted" },
++        error: {
++            category: "browser-automation",
++            message,
++            details: { stage: "interrupted", signal: interruptedSignal },
++        },
++    };
++}
++export function buildRuntimeHintSessionUpdateForTest(browserConfig, runtime, modelSelection, completedAt) {
++    return buildRuntimeHintSessionUpdate(browserConfig, runtime, modelSelection, completedAt);
++}
+ export async function performSessionRun({ sessionMeta, runOptions, mode, browserConfig, cwd, log, write, version, notifications, browserDeps, muteStdout = false, }) {
+     const writeInline = (chunk) => {
+         // Keep session logs intact while still echoing inline output to the user.
+@@ -58,18 +87,17 @@
+             const runnerDeps = {
+                 ...browserDeps,
+                 persistRuntimeHint: async (runtime, modelSelection) => {
+-                    const browser = {
+-                        config: browserConfig,
+-                        runtime,
+-                        ...(modelSelection ? { modelSelection } : {}),
+-                    };
+-                    await sessionStore.updateSession(sessionMeta.id, {
+-                        status: "running",
+-                        browser,
+-                    });
++                    const update = buildRuntimeHintSessionUpdate(browserConfig, runtime, modelSelection);
++                    await sessionStore.updateSession(sessionMeta.id, update);
++                    if (runtime?.interruptedSignal && modelForStatus) {
++                        await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
++                            status: "error",
++                            completedAt: update.completedAt,
++                        });
++                    }
+                     // Keep this attempt's copy fresh so error paths fall back to the
+                     // latest persisted browser evidence instead of stale session input.
+-                    currentBrowser = browser;
++                    currentBrowser = update.browser;
+                 },
+             };
+             const result = await runBrowserSessionExecution({
+diff -ruN a/dist/src/cli/tui/index.js b/dist/src/cli/tui/index.js
+--- a/dist/src/cli/tui/index.js	2026-09-07 15:19:23
++++ b/dist/src/cli/tui/index.js	2026-09-07 15:35:04
+@@ -317,7 +317,7 @@
+         {
+             name: "slug",
+             type: "input",
+-            message: "Optional slug (3–5 words, leave blank for auto):",
++            message: "Optional slug (3–12 words, leave blank for auto):",
+         },
+         {
+             name: "model",
+diff -ruN a/dist/src/sessionManager.js b/dist/src/sessionManager.js
+--- a/dist/src/sessionManager.js	2026-09-07 15:19:24
++++ b/dist/src/sessionManager.js	2026-09-07 15:10:52
+@@ -23,6 +23,9 @@
+ const MAX_SLUG_WORDS = 5;
+ const MIN_CUSTOM_SLUG_WORDS = 3;
+ const MAX_SLUG_WORD_LENGTH = 10;
++const MAX_CUSTOM_SLUG_WORDS = 12;
++const MAX_CUSTOM_SLUG_WORD_LENGTH = 32;
++const MAX_CUSTOM_SLUG_LENGTH = 120;
+ // Session artifacts (prompt, attached file contents, model responses) are sensitive.
+ // Keep them owner-only, matching the meta.json / bridge-config posture (0o600/0o700).
+ const SESSION_DIR_MODE = 0o700;
+@@ -114,10 +117,18 @@
+     return slug.split("-").filter(Boolean).length;
+ }
+ function normalizeCustomSlug(candidate) {
+-    const slug = slugify(candidate, MAX_SLUG_WORDS);
++    const words = candidate?.toLowerCase().match(/[a-z0-9]+/g) ?? [];
++    const overlongWord = words.find((word) => word.length > MAX_CUSTOM_SLUG_WORD_LENGTH);
++    if (overlongWord) {
++        throw new Error(`Custom slug words must not exceed ${MAX_CUSTOM_SLUG_WORD_LENGTH} characters.`);
++    }
++    const slug = words.join("-");
+     const wordCount = countSlugWords(slug);
+-    if (wordCount < MIN_CUSTOM_SLUG_WORDS || wordCount > MAX_SLUG_WORDS) {
+-        throw new Error(`Custom slug must include between ${MIN_CUSTOM_SLUG_WORDS} and ${MAX_SLUG_WORDS} words.`);
++    if (wordCount < MIN_CUSTOM_SLUG_WORDS || wordCount > MAX_CUSTOM_SLUG_WORDS) {
++        throw new Error(`Custom slug must include between ${MIN_CUSTOM_SLUG_WORDS} and ${MAX_CUSTOM_SLUG_WORDS} words.`);
++    }
++    if (slug.length > MAX_CUSTOM_SLUG_LENGTH) {
++        throw new Error(`Custom slug must not exceed ${MAX_CUSTOM_SLUG_LENGTH} characters.`);
+     }
+     return slug;
+ }

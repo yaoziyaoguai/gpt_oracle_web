@@ -27,6 +27,15 @@ export ORACLE_WEB_STATE_DIR="$test_root/state"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F86C4FC_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F86C4FC_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "f86c4fc runtime unexpectedly matched the current manifest"
+[[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_F86C4FC_HASH_MANIFEST")" == "patched" ]] || \
+  oracle_web_die "legacy runtime did not match the f86c4fc manifest"
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_38F4BFF_UPGRADE_PATCH" >/dev/null
 patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_38F4BFF_UPGRADE_PATCH" >/dev/null
 [[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
@@ -71,6 +80,154 @@ patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F0EA8D6_UPGRADE_PATCH" >
   oracle_web_die "legacy runtime did not match the f0ea8d6 manifest"
 "$script_dir/install.sh"
 "$script_dir/verify.sh"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?terminal-fallback-test=${Date.now()}`);
+    let state = module.createTerminalGateState(0);
+    let decision = module.classifyTurnTerminal(state, {
+      now: 0,
+      len: 120,
+      contentKey: "message-1::complete answer",
+      stopVisible: false,
+      barVisible: false,
+      strongThinkingActive: false,
+    }, { barConfirmCycles: 3, minStableMs: 1_200, quietStableMs: 8_000 });
+    state = decision.state;
+    decision = module.classifyTurnTerminal(state, {
+      now: 8_100,
+      len: 120,
+      contentKey: "message-1::complete answer",
+      stopVisible: false,
+      barVisible: false,
+      strongThinkingActive: false,
+    }, { barConfirmCycles: 3, minStableMs: 1_200, quietStableMs: 8_000 });
+    if (!decision.terminal) {
+      throw new Error("stable complete assistant turn without an action bar never becomes terminal");
+    }
+    decision = module.classifyTurnTerminal(decision.state, {
+      now: 16_500,
+      len: 140,
+      contentKey: "message-1::answer still changing",
+      stopVisible: false,
+      barVisible: false,
+      strongThinkingActive: false,
+    }, { barConfirmCycles: 3, minStableMs: 1_200, quietStableMs: 8_000 });
+    if (decision.terminal) {
+      throw new Error("content changes bypassed the quiet terminal window");
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/assistantResponse.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?run-deadline-test=${Date.now()}`);
+    const deadline = module.createBrowserRunDeadlineForTest(25);
+    let failure = null;
+    try {
+      await deadline.promise;
+    } catch (error) {
+      failure = error;
+    } finally {
+      deadline.dispose();
+    }
+    if (!failure || failure.message !== "browser-run-deadline-exceeded" || deadline.expired !== true) {
+      throw new Error("browser run did not expose one shared hard deadline");
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/index.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const sessionManager = await import(`${pathToFileURL(process.argv[1]).href}?slug-test=${Date.now()}`);
+    const requested = "first-agent-core-next-slice-20260907-a";
+    const resolved = sessionManager.createSessionId("unused", requested);
+    if (resolved !== requested) {
+      throw new Error(`custom slug was silently changed: ${requested} -> ${resolved}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/sessionManager.js"
+
+grep -q '3–12 word slug' "$test_root/package/dist/src/cli/help.js" || \
+  oracle_web_die "CLI help still documents the truncating custom-slug limit"
+grep -q '3–12 words' "$test_root/package/dist/src/cli/tui/index.js" || \
+  oracle_web_die "TUI still documents the truncating custom-slug limit"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const thinking = await import(`${pathToFileURL(process.argv[1]).href}?thinking-evidence-test=${Date.now()}`);
+    const index = await import(`${pathToFileURL(process.argv[2]).href}?thinking-model-evidence-test=${Date.now()}`);
+    const evidence = await thinking.ensureThinkingTime({
+      evaluate: async () => ({ result: { value: {
+        status: "already-selected",
+        label: "Pro，第 5 项，共 5 项",
+      } } }),
+    }, "max", () => {}, null, {});
+    if (!evidence?.verified || evidence.resolvedLabel !== "Pro，第 5 项，共 5 项") {
+      throw new Error("visible five-position selection was not returned as structured evidence");
+    }
+    const modelEvidence = index.buildPowerControlModelSelectionEvidenceForTest(
+      "GPT-5.6 Sol",
+      "current",
+      evidence,
+    );
+    if (!modelEvidence.verified || modelEvidence.resolvedLabel !== evidence.resolvedLabel) {
+      throw new Error("visible five-position selection was not promoted into modelSelection metadata");
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/thinkingTime.js" \
+  "$test_root/package/dist/src/browser/index.js"
+
+node -e '
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    process.env.NODE_ENV = "test";
+    const lifecycle = await import(`${pathToFileURL(process.argv[1]).href}?signal-cleanup-test=${Date.now()}`);
+    const profile = fs.mkdtempSync(path.join(os.tmpdir(), "oracle-browser-signal-test-"));
+    const events = [];
+    const previousExitCode = process.exitCode;
+    const removeHooks = lifecycle.registerTerminationHooks({
+      kill: async () => events.push("kill"),
+    }, profile, false, () => {}, {
+      isInFlight: () => true,
+      forceProfileCleanup: true,
+      emitRuntimeHint: async (signal) => events.push(`persist:${signal}`),
+    });
+    process.emit("SIGINT", "SIGINT");
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    removeHooks();
+    process.exitCode = previousExitCode;
+    if (events.join(",") !== "persist:SIGINT,kill" || fs.existsSync(profile)) {
+      throw new Error(`SIGINT did not persist interruption before exact cleanup: ${events.join(",")}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/chromeLifecycle.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?runtime-hint-status-test=${Date.now()}`);
+    const update = module.buildRuntimeHintSessionUpdateForTest(
+      { timeoutMs: 2_700_000 },
+      { chromePid: 1234, interruptedSignal: "SIGINT" },
+      { verified: true, resolvedLabel: "Pro，第 5 项，共 5 项" },
+      "2026-09-07T00:00:00.000Z",
+    );
+    if (update.status !== "error" || update.completedAt !== "2026-09-07T00:00:00.000Z") {
+      throw new Error("interrupted runtime hint left session metadata running");
+    }
+    if (update.browser.modelSelection.verified !== true || update.response.incompleteReason !== "interrupted") {
+      throw new Error("interruption update lost browser evidence or response state");
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/cli/sessionRunner.js"
 
 node -e '
   const fs = require("node:fs");
@@ -1347,6 +1504,9 @@ default_wrapper_output="$(
 grep -q '^ARG=extra-high$' <<< "$default_wrapper_output"
 [[ "$(grep -c '^ARG=--browser-attachment-timeout$' <<< "$default_wrapper_output")" -eq 1 ]]
 grep -q '^ARG=300s$' <<< "$default_wrapper_output"
+[[ "$(grep -c '^ARG=--timeout$' <<< "$default_wrapper_output")" -eq 1 ]]
+[[ "$(grep -c '^ARG=--browser-timeout$' <<< "$default_wrapper_output")" -eq 1 ]]
+[[ "$(grep -c '^ARG=45m$' <<< "$default_wrapper_output")" -eq 2 ]]
 
 override_wrapper_output="$(
   ORACLE_WEB_ORACLE_BIN="$fake_oracle" \
@@ -1355,6 +1515,15 @@ override_wrapper_output="$(
 )"
 [[ "$(grep -c '^ARG=--browser-attachment-timeout$' <<< "$override_wrapper_output")" -eq 1 ]]
 grep -q '^ARG=90s$' <<< "$override_wrapper_output"
+
+timeout_override_output="$(
+  ORACLE_WEB_ORACLE_BIN="$fake_oracle" \
+  ORACLE_WEB_SESSION_DIR="$test_root/timeout-override-sessions" \
+  "$test_root/bin/oracle-web" --timeout 12m --browser-timeout 12m -p probe
+)"
+[[ "$(grep -c '^ARG=--timeout$' <<< "$timeout_override_output")" -eq 1 ]]
+[[ "$(grep -c '^ARG=--browser-timeout$' <<< "$timeout_override_output")" -eq 1 ]]
+[[ "$(grep -c '^ARG=12m$' <<< "$timeout_override_output")" -eq 2 ]]
 
 retention_override_output="$(
   ORACLE_WEB_ORACLE_BIN="$fake_oracle" \

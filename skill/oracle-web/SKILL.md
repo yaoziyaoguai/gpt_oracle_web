@@ -24,6 +24,7 @@ Use the installed `oracle-web` wrapper from a desktop Codex task to send a focus
 - Attachment readiness and send readiness are separate. For an attachment-bearing prompt, keep polling a visible disabled send button within the attachment timeout instead of pressing Enter early. `promptSubmitted` means only that a send attempt started; success requires a committed user turn in a ChatGPT conversation.
 - ChatGPT may omit the local filename from an attachment card. Require each upload to create a baseline-relative attachment UI delta; after every requested attachment passes that check, accept the confirmed UI while retaining the normal completion and committed-turn checks. A generated multi-file bundle is one attachment even when the card shows a contained-file count instead of `attachments-bundle.txt`.
 - The wrapper defaults attachment readiness waits to 300 seconds. A caller may explicitly override `--browser-attachment-timeout` for a known environment.
+- The wrapper defaults the whole browser run to one 45-minute deadline. Submission, answer capture, and recheck share that deadline; a completed answer ends the run early.
 - Never race the wrapper with a manual or system-level click. A delayed successful click could otherwise submit twice.
 - A visible system Chrome automation window is expected. Do not switch to the desktop app's in-app browser.
 - Prompt insertion and file attachment use CDP text/DOM operations. The runtime uses the visible power control's ARIA state and keyboard events first; pointer events are a verified fallback, not screenshot-coordinate automation.
@@ -60,7 +61,7 @@ oracle-web --dry-run summary --files-report \
 6. Start one consultation with a unique slug:
 
 ```bash
-oracle-web --timeout 20m --slug "<unique-readable-slug>" \
+oracle-web --timeout 45m --browser-timeout 45m --slug "<unique-readable-slug>" \
   --browser-thinking-time "<extra-high|max>" \
   -p "<focused task and requested output>" \
   --file "<relevant path or glob>" \

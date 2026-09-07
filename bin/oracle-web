@@ -24,6 +24,8 @@ session_retention_hours="${ORACLE_WEB_SESSION_RETENTION_HOURS:-24}"
 thinking_time_configured=false
 attachment_timeout_configured=false
 retention_configured=false
+timeout_configured=false
+browser_timeout_configured=false
 for argument in "$@"; do
   case "$argument" in
     --browser-keep-browser|--browser-keep-browser=*|\
@@ -42,6 +44,12 @@ for argument in "$@"; do
       ;;
     --retain-hours|--retain-hours=*)
       retention_configured=true
+      ;;
+    --timeout|--timeout=*)
+      timeout_configured=true
+      ;;
+    --browser-timeout|--browser-timeout=*)
+      browser_timeout_configured=true
       ;;
   esac
 done
@@ -63,6 +71,14 @@ fi
 
 if [[ "$retention_configured" == false ]]; then
   oracle_args+=(--retain-hours "$session_retention_hours")
+fi
+
+if [[ "$timeout_configured" == false ]]; then
+  oracle_args+=(--timeout 45m)
+fi
+
+if [[ "$browser_timeout_configured" == false ]]; then
+  oracle_args+=(--browser-timeout 45m)
 fi
 
 oracle_args+=(

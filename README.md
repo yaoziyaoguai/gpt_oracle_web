@@ -21,9 +21,14 @@
 - 在 Prompt 写入和 Enter 提交前重新回读当前焦点，避免页面重绘后继续使用过期的 editor 身份。
 - 修复发送按钮事件未被页面接受、草稿存在却没有真正提交的问题。
 - 用新会话和 committed user turn 验证发送成功，而不是只看 `promptSubmitted`。
+- 完整 assistant turn 没有渲染 action bar 时，以“内容持续稳定、无停止按钮、无强思考状态”的较长静默窗口确认完成，避免页面已有答案而进程仍在等待。
+- 把 45 分钟作为一次 browser run 的共享截止时间；提交、回答捕获和延迟复查不再分别重置计时。
+- 把网页五档控件的可见标签与位置写入 `browser.modelSelection`，运行日志与 session metadata 使用同一份验证证据。
+- 自定义 slug 支持 3–12 个词并保留末尾唯一后缀；超长值会明确报错，不再静默裁切。
 - 固定自动化 Chrome 的初始窗口尺寸，并在档位选择和提交前恢复该尺寸。
 - 每次 trusted pointer 操作前重新定位元素、核对 viewport 并执行 `elementFromPoint` 命中检查；窗口尺寸变化时丢弃旧坐标。
-- 为每次咨询绑定独立的 session、Chrome PID、CDP port、target ID 和临时 Profile；Chrome 启动后立即记录 identity，无论成功、失败、超时或恢复结束都只清理这组资源。
+- 为每次咨询绑定独立的 session、Chrome PID、CDP port、target ID 和临时 Profile；Chrome 启动后立即记录 identity，无论成功、失败、超时、中断或恢复结束都只清理这组资源。
+- 收到 `SIGINT`、`SIGTERM` 或 `SIGQUIT` 时，先把 session 和 model run 写成已中断，再关闭记录的 Chrome PID 并删除它的临时 Profile。
 - 即使 CDP 意外断开，copy-profile 模式仍会结束本次记录的 Chrome 并删除临时 Profile。
 - live smoke 会读取本次唯一 slug 的 session metadata，自动确认记录的 Chrome PID 已停止且临时 Profile 已删除。
 - 把本地修改保存为可校验、可回滚的版本化 patch，避免只存在于 Homebrew Cellar。
@@ -86,6 +91,8 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 ├── patches/
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
+│   ├── oracle-0.17.3-from-f86c4fc.patch   上一受管版本到当前版本的增量 patch
+│   ├── oracle-0.17.3-f86c4fc.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-38f4bff.patch   上一受管版本到当前版本的增量 patch
 │   ├── oracle-0.17.3-38f4bff.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-042d57f.patch   上一受管版本到当前版本的增量 patch
@@ -198,7 +205,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 wrapper 不写入个人绝对路径。需要时在启动 Codex 的环境中设置：
 
-wrapper 默认传入 `--browser-attachment-timeout 300s` 和 `--retain-hours 24`；调用者显式提供对应参数时，以调用者的值为准且不会重复添加。
+wrapper 默认同时传入 `--timeout 45m` 和 `--browser-timeout 45m`，并传入 `--browser-attachment-timeout 300s` 与 `--retain-hours 24`；调用者显式提供对应参数时，以调用者的值为准且不会重复添加。`--browser-timeout` 才控制 Chrome 内的执行和回答捕获。45 分钟从 Chrome browser run 开始计算，所有阶段共享同一个截止时间；答案提前完成时会立即进入清理。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -249,7 +256,7 @@ oracle-web --dry-run summary --files-report \
 确认文件范围和隐私后再发送：
 
 ```bash
-oracle-web --timeout 20m \
+oracle-web --timeout 45m --browser-timeout 45m \
   --slug "recovery-design-review-001" \
   --browser-thinking-time extra-high \
   -p "审查失败恢复设计，返回最小修改方案与验证要求" \
