@@ -93,7 +93,7 @@ diff -ruN a/dist/src/browser/actions/navigation.js b/dist/src/browser/actions/na
 diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
 --- a/dist/src/browser/actions/promptComposer.js
 +++ b/dist/src/browser/actions/promptComposer.js
-@@ -54,9 +54,35 @@
+@@ -54,9 +54,39 @@
            candidates.push(node);
          }
        }
@@ -113,9 +113,13 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        candidates[0];
        if (preferred && focusNode(preferred)) {
 -        return { focused: true };
++        const activeAfterFocus = document.activeElement;
 +        const rect = preferred.getBoundingClientRect();
 +        return {
 +          focused: true,
++          activeMatches:
++            preferred === activeAfterFocus ||
++            (activeAfterFocus instanceof Node && preferred.contains(activeAfterFocus)),
 +          kind: 'composer',
 +          x: rect.left + rect.width / 2,
 +          y: rect.top + rect.height / 2,
@@ -131,18 +135,44 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
        }
        return { focused: false };
      })()`,
-@@ -67,6 +93,10 @@
+@@ -67,6 +97,21 @@
          await logDomFailure(runtime, logger, "focus-textarea");
          throw new Error("Failed to focus prompt textarea");
      }
 +    const focusPoint = focusResult.result.value;
 +    if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
-+        await clickTrustedPoint(runtime, input, focusPoint);
++        try {
++            await clickTrustedPoint(runtime, input, focusPoint);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (focusPoint.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++            logger("Composer pointer target was covered; using verified editor focus");
++        }
 +    }
      await input.insertText({ text: prompt });
      // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
      // before the send button becomes enabled; give it a short breather to avoid races.
-@@ -169,26 +199,82 @@
+@@ -157,6 +202,14 @@
+     const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
+     const observedActive = postVerification.result?.value?.activeValue ?? "";
+     const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
++    if (observedLength === 0) {
++        await logDomFailure(runtime, logger, "prompt-insertion-unverified");
++        throw new BrowserAutomationError("Prompt insertion could not be verified in the focused composer.", {
++            stage: "submit-prompt",
++            code: "prompt-insertion-unverified",
++            promptLength,
++        });
++    }
+     if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
+         // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
+         await logDomFailure(runtime, logger, "prompt-too-large");
+@@ -169,25 +222,95 @@
      }
      const clicked = await attemptSendButton(runtime, input, logger, deps?.attachmentNames, deps?.attachmentTimeoutMs);
      if (!clicked) {
@@ -174,7 +204,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
      // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
      return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
- }
++}
 +async function submitViaEnter(Runtime, Input) {
 +    const focus = await Runtime.evaluate({
 +        expression: `(() => {
@@ -200,9 +230,13 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        candidates.find((node) => isVisible(node) && isEditable(node));
 +      if (!editor) return null;
 +      editor.focus?.();
++      const activeAfterFocus = document.activeElement;
 +      const rect = editor.getBoundingClientRect();
 +      return {
 +        kind: 'composer',
++        activeMatches:
++          editor === activeAfterFocus ||
++          (activeAfterFocus instanceof Node && editor.contains(activeAfterFocus)),
 +        x: rect.left + rect.width / 2,
 +        y: rect.top + rect.height / 2,
 +        viewport: {
@@ -219,7 +253,17 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +    });
 +    const point = focus.result?.value;
 +    if (point && typeof point.x === "number" && typeof point.y === "number") {
-+        await clickTrustedPoint(Runtime, Input, point);
++        try {
++            await clickTrustedPoint(Runtime, Input, point);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (point.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++        }
 +    }
 +    await Input.dispatchKeyEvent({
 +        type: "keyDown",
@@ -231,11 +275,10 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        type: "keyUp",
 +        ...ENTER_KEY_EVENT,
 +    });
-+}
+ }
  export async function clearPromptComposer(Runtime, logger) {
      const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
-     const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
-@@ -579,7 +665,6 @@
+@@ -579,7 +702,6 @@
  async function attemptSendButton(Runtime, Input, _logger, attachmentNames, attachmentTimeoutMs) {
      const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
      const script = `(() => {
@@ -243,7 +286,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
      const isVisible = (node) => {
        if (!(node instanceof HTMLElement)) return false;
-@@ -604,16 +689,28 @@
+@@ -604,16 +726,28 @@
      for (const selector of selectors) {
        candidates.push(...Array.from(document.querySelectorAll(selector)));
      }
@@ -278,7 +321,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
    })()`;
      // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
      // settle slowly for multi-file uploads, but plain text sends should keep the
-@@ -638,15 +735,21 @@
+@@ -638,14 +772,20 @@
              typeof value === "object" &&
              typeof value.x === "number" &&
              typeof value.y === "number") {
@@ -294,18 +337,17 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +            // Attachment readiness was verified above. Let the caller use its
 +            // existing one-shot Enter fallback, then verify a committed turn.
 +            return false;
-         }
++        }
 +        if (status === "disabled") {
 +            if (!needAttachment) {
 +                return false;
 +            }
 +            await delay(150);
 +            continue;
-+        }
+         }
          await delay(100);
      }
-     if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
-@@ -659,23 +762,179 @@
+@@ -659,23 +799,179 @@
      }
      return false;
  }

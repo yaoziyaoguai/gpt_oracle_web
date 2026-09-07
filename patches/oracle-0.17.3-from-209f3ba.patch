@@ -56,7 +56,89 @@ diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/a
 diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
 --- a/dist/src/browser/actions/promptComposer.js
 +++ b/dist/src/browser/actions/promptComposer.js
-@@ -808,9 +808,6 @@
+@@ -68,9 +68,13 @@
+         candidates.find((node) => isVisible(node)) ||
+         candidates[0];
+       if (preferred && focusNode(preferred)) {
++        const activeAfterFocus = document.activeElement;
+         const rect = preferred.getBoundingClientRect();
+         return {
+           focused: true,
++          activeMatches:
++            preferred === activeAfterFocus ||
++            (activeAfterFocus instanceof Node && preferred.contains(activeAfterFocus)),
+           kind: 'composer',
+           x: rect.left + rect.width / 2,
+           y: rect.top + rect.height / 2,
+@@ -95,7 +99,18 @@
+     }
+     const focusPoint = focusResult.result.value;
+     if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
+-        await clickTrustedPoint(runtime, input, focusPoint);
++        try {
++            await clickTrustedPoint(runtime, input, focusPoint);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (focusPoint.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++            logger("Composer pointer target was covered; using verified editor focus");
++        }
+     }
+     await input.insertText({ text: prompt });
+     // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
+@@ -187,6 +202,14 @@
+     const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
+     const observedActive = postVerification.result?.value?.activeValue ?? "";
+     const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
++    if (observedLength === 0) {
++        await logDomFailure(runtime, logger, "prompt-insertion-unverified");
++        throw new BrowserAutomationError("Prompt insertion could not be verified in the focused composer.", {
++            stage: "submit-prompt",
++            code: "prompt-insertion-unverified",
++            promptLength,
++        });
++    }
+     if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
+         // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
+         await logDomFailure(runtime, logger, "prompt-too-large");
+@@ -243,9 +266,13 @@
+         candidates.find((node) => isVisible(node) && isEditable(node));
+       if (!editor) return null;
+       editor.focus?.();
++      const activeAfterFocus = document.activeElement;
+       const rect = editor.getBoundingClientRect();
+       return {
+         kind: 'composer',
++        activeMatches:
++          editor === activeAfterFocus ||
++          (activeAfterFocus instanceof Node && editor.contains(activeAfterFocus)),
+         x: rect.left + rect.width / 2,
+         y: rect.top + rect.height / 2,
+         viewport: {
+@@ -262,7 +289,17 @@
+     });
+     const point = focus.result?.value;
+     if (point && typeof point.x === "number" && typeof point.y === "number") {
+-        await clickTrustedPoint(Runtime, Input, point);
++        try {
++            await clickTrustedPoint(Runtime, Input, point);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (point.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++        }
+     }
+     await Input.dispatchKeyEvent({
+         type: "keyDown",
+@@ -808,9 +845,6 @@
        }
        if (!target) return { status: 'missing', kind };
        const rect = target.getBoundingClientRect();
@@ -66,7 +148,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
        const viewport = {
          width: window.innerWidth,
          height: window.innerHeight,
-@@ -819,10 +816,24 @@
+@@ -819,10 +853,24 @@
          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
        };

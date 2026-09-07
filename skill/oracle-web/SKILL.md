@@ -27,6 +27,7 @@ Use the installed `oracle-web` wrapper from a desktop Codex task to send a focus
 - A visible system Chrome automation window is expected. Do not switch to the desktop app's in-app browser.
 - Prompt insertion and file attachment use CDP text/DOM operations. The runtime uses the visible power control's ARIA state and keyboard events first; pointer events are a verified fallback, not screenshot-coordinate automation.
 - The runtime fixes its owned Chrome window at `1280x720` before critical interaction. If the viewport changes, it discards the old point and re-locates the target. For the composer it searches several points inside the fresh target because attachment cards can cover its center; every accepted point must still pass `elementFromPoint` before pointer input is sent.
+- If attachment UI covers every sampled composer point, the runtime may skip the pointer click only when `document.activeElement` is the exact visible editor or its descendant. It then inserts text through CDP and verifies the composer readback. Empty readback fails closed as `prompt-insertion-unverified`; this exception never applies to the send button or a resized viewport.
 - Another application covering the Oracle window does not invalidate the DOM target. Do not minimize the Oracle Chrome or keep resizing it during selection/submission; Chrome can throttle or stop compositing, in which case the run must fail closed.
 
 ## Choose consultation strength

@@ -56,10 +56,17 @@ diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/a
 diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
 --- a/dist/src/browser/actions/promptComposer.js
 +++ b/dist/src/browser/actions/promptComposer.js
-@@ -71,8 +71,17 @@
+@@ -68,11 +68,24 @@
+         candidates.find((node) => isVisible(node)) ||
+         candidates[0];
+       if (preferred && focusNode(preferred)) {
++        const activeAfterFocus = document.activeElement;
          const rect = preferred.getBoundingClientRect();
          return {
            focused: true,
++          activeMatches:
++            preferred === activeAfterFocus ||
++            (activeAfterFocus instanceof Node && preferred.contains(activeAfterFocus)),
 +          kind: 'composer',
            x: rect.left + rect.width / 2,
            y: rect.top + rect.height / 2,
@@ -74,22 +81,53 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
          };
        }
        return { focused: false };
-@@ -86,7 +95,7 @@
+@@ -86,7 +99,18 @@
      }
      const focusPoint = focusResult.result.value;
      if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
 -        await clickTrustedPoint(runtime, input, focusPoint.x, focusPoint.y);
-+        await clickTrustedPoint(runtime, input, focusPoint);
++        try {
++            await clickTrustedPoint(runtime, input, focusPoint);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (focusPoint.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++            logger("Composer pointer target was covered; using verified editor focus");
++        }
      }
      await input.insertText({ text: prompt });
      // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
-@@ -235,13 +244,25 @@
+@@ -178,6 +202,14 @@
+     const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
+     const observedActive = postVerification.result?.value?.activeValue ?? "";
+     const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
++    if (observedLength === 0) {
++        await logDomFailure(runtime, logger, "prompt-insertion-unverified");
++        throw new BrowserAutomationError("Prompt insertion could not be verified in the focused composer.", {
++            stage: "submit-prompt",
++            code: "prompt-insertion-unverified",
++            promptLength,
++        });
++    }
+     if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
+         // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
+         await logDomFailure(runtime, logger, "prompt-too-large");
+@@ -234,14 +266,40 @@
+         candidates.find((node) => isVisible(node) && isEditable(node));
        if (!editor) return null;
        editor.focus?.();
++      const activeAfterFocus = document.activeElement;
        const rect = editor.getBoundingClientRect();
 -      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 +      return {
 +        kind: 'composer',
++        activeMatches:
++          editor === activeAfterFocus ||
++          (activeAfterFocus instanceof Node && editor.contains(activeAfterFocus)),
 +        x: rect.left + rect.width / 2,
 +        y: rect.top + rect.height / 2,
 +        viewport: {
@@ -107,11 +145,21 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      const point = focus.result?.value;
      if (point && typeof point.x === "number" && typeof point.y === "number") {
 -        await clickTrustedPoint(Runtime, Input, point.x, point.y);
-+        await clickTrustedPoint(Runtime, Input, point);
++        try {
++            await clickTrustedPoint(Runtime, Input, point);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (point.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++        }
      }
      await Input.dispatchKeyEvent({
          type: "keyDown",
-@@ -644,7 +665,6 @@
+@@ -644,7 +702,6 @@
  async function attemptSendButton(Runtime, Input, _logger, attachmentNames, attachmentTimeoutMs) {
      const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
      const script = `(() => {
@@ -119,7 +167,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
      const isVisible = (node) => {
        if (!(node instanceof HTMLElement)) return false;
-@@ -675,11 +695,22 @@
+@@ -675,11 +732,22 @@
      button.scrollIntoView({ block: 'center', inline: 'center' });
      const rect = button.getBoundingClientRect();
      if (rect.width > 0 && rect.height > 0) {
@@ -146,21 +194,19 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
    })()`;
      // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
      // settle slowly for multi-file uploads, but plain text sends should keep the
-@@ -704,12 +735,9 @@
+@@ -704,10 +772,7 @@
              typeof value === "object" &&
              typeof value.x === "number" &&
              typeof value.y === "number") {
 -            await clickTrustedPoint(Runtime, Input, value.x, value.y);
+-            return true;
+-        }
+-        if (status === "clicked") {
 +            await clickTrustedPoint(Runtime, Input, value);
              return true;
          }
--        if (status === "clicked") {
--            return true;
--        }
          if (status === "missing") {
-             // Attachment readiness was verified above. Let the caller use its
-             // existing one-shot Enter fallback, then verify a committed turn.
-@@ -734,20 +762,141 @@
+@@ -734,20 +799,141 @@
      }
      return false;
  }

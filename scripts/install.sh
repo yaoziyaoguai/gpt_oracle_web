@@ -83,6 +83,17 @@ fi
 
 patch_state="$(oracle_web_patch_state "$oracle_root")"
 if [[ "$patch_state" == "unknown" && \
+      -f "$ORACLE_WEB_042D57F_UPGRADE_PATCH" && \
+      -f "$ORACLE_WEB_042D57F_HASH_MANIFEST" && \
+      "$(oracle_web_patch_state "$oracle_root" "$ORACLE_WEB_042D57F_HASH_MANIFEST")" == "patched" ]]; then
+  patch -C -f -p1 -d "$oracle_root" -i "$ORACLE_WEB_042D57F_UPGRADE_PATCH" >/dev/null
+  patch -f -p1 -d "$oracle_root" -i "$ORACLE_WEB_042D57F_UPGRADE_PATCH" >/dev/null
+  patch_state="$(oracle_web_patch_state "$oracle_root")"
+  [[ "$patch_state" == "patched" ]] || \
+    oracle_web_die "upgrade from managed revision 042d57f did not reach the current patched state"
+  echo "Upgraded Oracle runtime from managed revision 042d57f"
+fi
+if [[ "$patch_state" == "unknown" && \
       -f "$ORACLE_WEB_2FE5969_UPGRADE_PATCH" && \
       -f "$ORACLE_WEB_2FE5969_HASH_MANIFEST" && \
       "$(oracle_web_patch_state "$oracle_root" "$ORACLE_WEB_2FE5969_HASH_MANIFEST")" == "patched" ]]; then

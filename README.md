@@ -16,7 +16,8 @@
 - 隔离多批咨询，避免把第二批材料串进第一批会话。
 - 修复附件已完成却被误判为仍在上传的问题。
 - 修复网页附件卡片不显示本地文件名时，普通附件和多文件自动合包被误判为附件缺失的问题。
-- 修复附件卡片遮住 composer 中心时，可信点击把有效输入框误判为目标不匹配的问题。
+- 修复附件卡片遮住 composer 采样点时，编辑器已精确聚焦却被误判为目标不匹配的问题。
+- 只在当前可见 editor 持有 `document.activeElement` 时绕过被遮挡的 pointer click；写入后必须回读 Prompt，否则以 `prompt-insertion-unverified` 停止。
 - 修复发送按钮事件未被页面接受、草稿存在却没有真正提交的问题。
 - 用新会话和 committed user turn 验证发送成功，而不是只看 `promptSubmitted`。
 - 固定自动化 Chrome 的初始窗口尺寸，并在档位选择和提交前恢复该尺寸。
@@ -82,6 +83,8 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 ├── patches/
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
+│   ├── oracle-0.17.3-from-042d57f.patch   上一受管版本到当前版本的增量 patch
+│   ├── oracle-0.17.3-042d57f.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-2fe5969.patch   上一受管版本到当前版本的增量 patch
 │   ├── oracle-0.17.3-2fe5969.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-209f3ba.patch   上一受管版本到当前版本的增量 patch

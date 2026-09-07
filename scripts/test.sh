@@ -27,6 +27,15 @@ export ORACLE_WEB_STATE_DIR="$test_root/state"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_042D57F_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_042D57F_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "042d57f runtime unexpectedly matched the current manifest"
+[[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_042D57F_HASH_MANIFEST")" == "patched" ]] || \
+  oracle_web_die "legacy runtime did not match the 042d57f manifest"
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_2FE5969_UPGRADE_PATCH" >/dev/null
 patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_2FE5969_UPGRADE_PATCH" >/dev/null
 [[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
@@ -482,6 +491,131 @@ node -e '
     if (events.join(",") !== "trusted-click,insertText") {
       throw new Error(`prompt insertion was not preceded by one trusted composer click: ${events.join(",")}`);
     }
+
+    class FocusFallbackError extends Error {
+      constructor(message, details) {
+        super(message);
+        this.details = details;
+      }
+    }
+    const buildFocusFallbackSubmitter = (activeMatches, fallbackEvents) => factory(
+      async () => {},
+      () => "",
+      ["#prompt-textarea", "textarea"],
+      "#prompt-textarea",
+      "textarea[name=prompt-textarea]",
+      async () => {},
+      async () => {},
+      FocusFallbackError,
+      async () => true,
+      async () => true,
+      async () => { fallbackEvents.push("enter"); },
+      async () => true,
+      async () => {
+        throw new FocusFallbackError("covered composer", {
+          stage: "submit-prompt",
+          code: "trusted-target-mismatch",
+          kind: "composer",
+        });
+      },
+    );
+    const buildFocusFallbackRuntime = (activeMatches) => {
+      let fallbackEvaluation = 0;
+      return {
+        evaluate: async () => {
+          fallbackEvaluation += 1;
+          if (fallbackEvaluation === 1) {
+            return { result: { value: {
+              focused: true,
+              activeMatches,
+              x: 20,
+              y: 30,
+            } } };
+          }
+          return { result: { value: {
+            editorText: "probe",
+            fallbackValue: "",
+            activeValue: "probe",
+          } } };
+        },
+      };
+    };
+
+    const focusFallbackEvents = [];
+    const focusFallbackSubmitter = buildFocusFallbackSubmitter(true, focusFallbackEvents);
+    await focusFallbackSubmitter({
+      runtime: buildFocusFallbackRuntime(true),
+      input: { insertText: async () => { focusFallbackEvents.push("insertText"); } },
+      baselineTurns: 0,
+    }, "probe", () => {});
+    if (focusFallbackEvents.join(",") !== "insertText") {
+      throw new Error(`verified composer focus did not recover a covered pointer target: ${focusFallbackEvents.join(",")}`);
+    }
+
+    const untrustedFocusEvents = [];
+    const untrustedFocusSubmitter = buildFocusFallbackSubmitter(false, untrustedFocusEvents);
+    let untrustedFocusError = null;
+    try {
+      await untrustedFocusSubmitter({
+        runtime: buildFocusFallbackRuntime(false),
+        input: { insertText: async () => { untrustedFocusEvents.push("insertText"); } },
+        baselineTurns: 0,
+      }, "probe", () => {});
+    } catch (error) {
+      untrustedFocusError = error;
+    }
+    if (
+      untrustedFocusError?.details?.code !== "trusted-target-mismatch" ||
+      untrustedFocusEvents.length !== 0
+    ) {
+      throw new Error("an unverified composer focus bypassed trusted pointer validation");
+    }
+
+    const unreadableEvents = [];
+    const unreadableSubmitter = factory(
+      async () => {},
+      () => "",
+      ["#prompt-textarea", "textarea"],
+      "#prompt-textarea",
+      "textarea[name=prompt-textarea]",
+      async () => {},
+      async () => {},
+      FocusFallbackError,
+      async () => true,
+      async () => true,
+      async () => { unreadableEvents.push("enter"); },
+      async () => true,
+      async () => {},
+    );
+    let unreadableEvaluation = 0;
+    let unreadableError = null;
+    try {
+      await unreadableSubmitter({
+        runtime: {
+          evaluate: async () => {
+            unreadableEvaluation += 1;
+            if (unreadableEvaluation === 1) {
+              return { result: { value: { focused: true } } };
+            }
+            return { result: { value: {
+              editorText: "",
+              fallbackValue: "",
+              activeValue: "",
+            } } };
+          },
+        },
+        input: { insertText: async () => { unreadableEvents.push("insertText"); } },
+        baselineTurns: 0,
+      }, "probe", () => {});
+    } catch (error) {
+      unreadableError = error;
+    }
+    if (
+      unreadableError?.details?.code !== "prompt-insertion-unverified" ||
+      unreadableEvents.join(",") !== "insertText"
+    ) {
+      throw new Error("an unreadable prompt insertion reached the send path");
+    }
   })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/actions/promptComposer.js"
 
@@ -763,14 +897,22 @@ node -e '
         "PROMPT_PRIMARY_SELECTOR",
         "ENTER_KEY_EVENT",
         "ENTER_KEY_TEXT",
+        "BrowserAutomationError",
         "clickTrustedPoint",
         `${source.slice(enterStart, enterEnd)}; return submitViaEnter;`,
       );
+      class EnterFallbackError extends Error {
+        constructor(message, details) {
+          super(message);
+          this.details = details;
+        }
+      }
       const submitViaEnter = factory(
         ["#prompt-textarea", "textarea"],
         "#prompt-textarea",
         { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
         "\\r",
+        EnterFallbackError,
         async (_runtime, _input, point) => {
           events.push(`mousePressed:${point.x}`);
           events.push(`mouseReleased:${point.x}`);
@@ -814,6 +956,7 @@ node -e '
             result: {
               value: vm.runInNewContext(expression, {
                 document,
+                Node: class {},
                 HTMLTextAreaElement: FakeTextarea,
                 HTMLInputElement: class {},
                 window: {
@@ -833,6 +976,56 @@ node -e '
       await submitViaEnter(runtime, input);
       if (focused !== primary || events.join(",") !== "focus,mousePressed:20,mouseReleased:20,keyDown,keyUp") {
         throw new Error(`Enter fallback did not focus and click the editor before submit: ${events.join(",")}`);
+      }
+
+      const coveredEvents = [];
+      const coveredSubmitViaEnter = factory(
+        ["#prompt-textarea"],
+        "#prompt-textarea",
+        { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+        "\\r",
+        EnterFallbackError,
+        async () => {
+          throw new EnterFallbackError("covered composer", {
+            stage: "submit-prompt",
+            code: "trusted-target-mismatch",
+            kind: "composer",
+          });
+        },
+      );
+      await coveredSubmitViaEnter(
+        { evaluate: async () => ({ result: { value: {
+          activeMatches: true,
+          kind: "composer",
+          x: 20,
+          y: 30,
+        } } }) },
+        { dispatchKeyEvent: async ({ type }) => coveredEvents.push(type) },
+      );
+      if (coveredEvents.join(",") !== "keyDown,keyUp") {
+        throw new Error(`verified Enter focus did not recover a covered pointer target: ${coveredEvents.join(",")}`);
+      }
+
+      const untrustedEnterEvents = [];
+      let untrustedEnterError = null;
+      try {
+        await coveredSubmitViaEnter(
+          { evaluate: async () => ({ result: { value: {
+            activeMatches: false,
+            kind: "composer",
+            x: 20,
+            y: 30,
+          } } }) },
+          { dispatchKeyEvent: async ({ type }) => untrustedEnterEvents.push(type) },
+        );
+      } catch (error) {
+        untrustedEnterError = error;
+      }
+      if (
+        untrustedEnterError?.details?.code !== "trusted-target-mismatch" ||
+        untrustedEnterEvents.length !== 0
+      ) {
+        throw new Error("an unverified Enter focus bypassed trusted pointer validation");
       }
     })()
     .catch((error) => { console.error(error.message); process.exit(1); });
