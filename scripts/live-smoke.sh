@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/lib/common.sh"
+
 if [[ "${ORACLE_WEB_LIVE_TEST:-}" != "1" ]]; then
   echo "Refusing to contact ChatGPT. Set ORACLE_WEB_LIVE_TEST=1 after reviewing this script." >&2
   exit 64
@@ -11,6 +14,8 @@ if [[ -z "$wrapper" || ! -x "$wrapper" ]]; then
   echo "oracle-web wrapper not found" >&2
   exit 69
 fi
+state_root="${XDG_STATE_HOME:-$HOME/.local/state}"
+session_dir="${ORACLE_WEB_SESSION_DIR:-$state_root/oracle-web}"
 
 level="${ORACLE_WEB_LIVE_LEVEL:-extra-high}"
 case "$level" in
@@ -60,7 +65,8 @@ case "$fixture" in
     exit 64
     ;;
 esac
-slug="oracle-web-live-$(date +%Y%m%d-%H%M%S)-$$"
+slug="ow-live-$(date +%Y%m%d-%H%M%S)-$$"
+[[ "${#slug}" -le 36 ]] || oracle_web_die "generated live-test slug exceeds Oracle's 36-character limit"
 oracle_args=(
   --force
   --timeout 5m
@@ -85,9 +91,22 @@ oracle_status=$?
 set -e
 printf '%s\n' "$output"
 
+cleanup_status=0
+meta_file="$session_dir/sessions/$slug/meta.json"
+if [[ -f "$meta_file" ]]; then
+  (oracle_web_assert_session_cleanup "$session_dir" "$slug") || cleanup_status=$?
+elif [[ "$oracle_status" -eq 0 ]]; then
+  echo "Live test did not find metadata for its exact session: $slug" >&2
+  cleanup_status=1
+fi
+
 if [[ "$oracle_status" -ne 0 ]]; then
   echo "Live Oracle invocation failed with exit $oracle_status" >&2
   exit "$oracle_status"
+fi
+if [[ "$cleanup_status" -ne 0 ]]; then
+  echo "Live Oracle session cleanup verification failed" >&2
+  exit "$cleanup_status"
 fi
 
 grep -Eq "$expected_position" <<< "$output" || {

@@ -1,63 +1,20 @@
 diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js	2026-09-07 10:09:46
+--- a/dist/src/browser/actions/promptComposer.js	2026-09-07 10:07:11
 +++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 10:12:09
-@@ -68,9 +68,13 @@
-         candidates.find((node) => isVisible(node)) ||
-         candidates[0];
-       if (preferred && focusNode(preferred)) {
-+        const activeAfterFocus = document.activeElement;
-         const rect = preferred.getBoundingClientRect();
-         return {
-           focused: true,
-+          activeMatches:
-+            preferred === activeAfterFocus ||
-+            (activeAfterFocus instanceof Node && preferred.contains(activeAfterFocus)),
-           kind: 'composer',
-           x: rect.left + rect.width / 2,
-           y: rect.top + rect.height / 2,
-@@ -95,7 +99,21 @@
-     }
-     const focusPoint = focusResult.result.value;
-     if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
--        await clickTrustedPoint(runtime, input, focusPoint);
-+        try {
-+            await clickTrustedPoint(runtime, input, focusPoint);
-+        }
-+        catch (error) {
-+            const details = error instanceof BrowserAutomationError ? error.details : null;
-+            if (focusPoint.activeMatches !== true ||
-+                details?.code !== "trusted-target-mismatch" ||
-+                details?.kind !== "composer") {
-+                throw error;
-+            }
+@@ -109,6 +109,9 @@
+                 details?.kind !== "composer") {
+                 throw error;
+             }
 +            if (!(await hasFocusedVisibleComposer(runtime))) {
 +                throw error;
 +            }
-+            logger("Composer pointer target was covered; using verified editor focus");
-+        }
+             logger("Composer pointer target was covered; using verified editor focus");
+         }
      }
-     await input.insertText({ text: prompt });
-     // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
-@@ -187,6 +205,14 @@
-     const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
-     const observedActive = postVerification.result?.value?.activeValue ?? "";
-     const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
-+    if (observedLength === 0) {
-+        await logDomFailure(runtime, logger, "prompt-insertion-unverified");
-+        throw new BrowserAutomationError("Prompt insertion could not be verified in the focused composer.", {
-+            stage: "submit-prompt",
-+            code: "prompt-insertion-unverified",
-+            promptLength,
-+        });
-+    }
-     if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
-         // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
-         await logDomFailure(runtime, logger, "prompt-too-large");
-@@ -217,6 +243,37 @@
-     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
+@@ -241,6 +244,37 @@
      // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
      return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
-+}
+ }
 +async function hasFocusedVisibleComposer(Runtime) {
 +    const result = await Runtime.evaluate({
 +        expression: `(() => {
@@ -88,47 +45,22 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        returnByValue: true,
 +    });
 +    return result.result?.value === true;
- }
++}
  async function submitViaEnter(Runtime, Input) {
      const focus = await Runtime.evaluate({
-@@ -243,9 +300,13 @@
-         candidates.find((node) => isVisible(node) && isEditable(node));
-       if (!editor) return null;
-       editor.focus?.();
-+      const activeAfterFocus = document.activeElement;
-       const rect = editor.getBoundingClientRect();
-       return {
-         kind: 'composer',
-+        activeMatches:
-+          editor === activeAfterFocus ||
-+          (activeAfterFocus instanceof Node && editor.contains(activeAfterFocus)),
-         x: rect.left + rect.width / 2,
-         y: rect.top + rect.height / 2,
-         viewport: {
-@@ -262,7 +323,20 @@
-     });
-     const point = focus.result?.value;
-     if (point && typeof point.x === "number" && typeof point.y === "number") {
--        await clickTrustedPoint(Runtime, Input, point);
-+        try {
-+            await clickTrustedPoint(Runtime, Input, point);
-+        }
-+        catch (error) {
-+            const details = error instanceof BrowserAutomationError ? error.details : null;
-+            if (point.activeMatches !== true ||
-+                details?.code !== "trusted-target-mismatch" ||
-+                details?.kind !== "composer") {
-+                throw error;
-+            }
+         expression: `(() => {
+@@ -299,6 +333,9 @@
+                 details?.kind !== "composer") {
+                 throw error;
+             }
 +            if (!(await hasFocusedVisibleComposer(Runtime))) {
 +                throw error;
 +            }
-+        }
+         }
      }
      await Input.dispatchKeyEvent({
-         type: "keyDown",
 diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
---- a/dist/src/browser/index.js	2026-09-07 10:08:26
+--- a/dist/src/browser/index.js	2026-09-07 10:07:11
 +++ b/dist/src/browser/index.js	2026-09-07 10:32:36
 @@ -79,7 +79,20 @@
      if (options.usingCopiedProfile)

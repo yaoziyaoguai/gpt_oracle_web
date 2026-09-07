@@ -18,11 +18,14 @@
 - 修复网页附件卡片不显示本地文件名时，普通附件和多文件自动合包被误判为附件缺失的问题。
 - 修复附件卡片遮住 composer 采样点时，编辑器已精确聚焦却被误判为目标不匹配的问题。
 - 只在当前可见 editor 持有 `document.activeElement` 时绕过被遮挡的 pointer click；写入后必须回读 Prompt，否则以 `prompt-insertion-unverified` 停止。
+- 在 Prompt 写入和 Enter 提交前重新回读当前焦点，避免页面重绘后继续使用过期的 editor 身份。
 - 修复发送按钮事件未被页面接受、草稿存在却没有真正提交的问题。
 - 用新会话和 committed user turn 验证发送成功，而不是只看 `promptSubmitted`。
 - 固定自动化 Chrome 的初始窗口尺寸，并在档位选择和提交前恢复该尺寸。
 - 每次 trusted pointer 操作前重新定位元素、核对 viewport 并执行 `elementFromPoint` 命中检查；窗口尺寸变化时丢弃旧坐标。
 - 为每次咨询绑定独立的 session、Chrome PID、CDP port、target ID 和临时 Profile；Chrome 启动后立即记录 identity，无论成功、失败、超时或恢复结束都只清理这组资源。
+- 即使 CDP 意外断开，copy-profile 模式仍会结束本次记录的 Chrome 并删除临时 Profile。
+- live smoke 会读取本次唯一 slug 的 session metadata，自动确认记录的 Chrome PID 已停止且临时 Profile 已删除。
 - 把本地修改保存为可校验、可回滚的版本化 patch，避免只存在于 Homebrew Cellar。
 
 ## 它不是什么
@@ -83,6 +86,8 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 ├── patches/
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
+│   ├── oracle-0.17.3-from-38f4bff.patch   上一受管版本到当前版本的增量 patch
+│   ├── oracle-0.17.3-38f4bff.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-042d57f.patch   上一受管版本到当前版本的增量 patch
 │   ├── oracle-0.17.3-042d57f.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-2fe5969.patch   上一受管版本到当前版本的增量 patch
@@ -96,7 +101,7 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 │   ├── verify.sh                          离线安装验证
 │   ├── uninstall.sh                       安全回滚和卸载
 │   ├── test.sh                            隔离安装/幂等/回滚测试
-│   └── live-smoke.sh                      显式授权后才运行的网页测试
+│   └── live-smoke.sh                      显式授权后运行，并核对 session 清理的网页测试
 └── .github/workflows/ci.yml               不接触 ChatGPT 的离线 CI
 ```
 

@@ -1,548 +1,6 @@
-diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/attachments.js
---- a/dist/src/browser/actions/attachments.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/actions/attachments.js	2026-09-06 21:34:39
-@@ -1032,7 +1032,9 @@
-         const inputNameCandidates = resolveInputNameCandidates();
-         const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
-             (lastInputValue && matchesExpectedName(lastInputValue));
--        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
-+        // This branch already requires a baseline-relative upload UI delta. Current
-+        // ChatGPT cards do not always expose the local filename, so a second exact-name
-+        // visibility probe would turn confirmed uploads into false negatives.
-         logger(inputHasFile
-             ? "Attachment queued (UI anchored, file input confirmed)"
-             : "Attachment queued (UI anchored)");
-@@ -1042,7 +1044,6 @@
-     const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
-         (lastInputValue && matchesExpectedName(lastInputValue));
-     if (await waitForAttachmentAnchored(runtime, expectedName, attachmentUiTimeoutMs)) {
--        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
-         logger(inputHasFile
-             ? "Attachment queued (UI anchored, file input confirmed)"
-             : "Attachment queued (UI anchored)");
-@@ -1171,9 +1172,17 @@
-         throw new Error("Existing attachments still present in composer; aborting to avoid duplicate uploads.");
-     }
- }
--export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedNames = [], logger) {
-+export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedAttachments = [], logger, options) {
-     const deadline = Date.now() + timeoutMs;
--    const expectedNormalized = expectedNames.map((name) => name.toLowerCase());
-+    const expectations = expectedAttachments
-+        .map((attachment) => typeof attachment === "string"
-+        ? { name: attachment, generatedBundle: false }
-+        : {
-+            name: typeof attachment?.name === "string" ? attachment.name : "",
-+            generatedBundle: attachment?.generatedBundle === true,
-+        })
-+        .filter((attachment) => attachment.name.length > 0);
-+    const expectedNormalized = expectations.map((attachment) => attachment.name.toLowerCase());
-     const expectedInputBasenames = expectedNormalized
-         .map((name) => name.split("/").pop()?.split("\\").pop() ?? name)
-         .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
-@@ -1450,7 +1459,11 @@
-                     return false;
-                 });
-             };
--            const missing = expectedNormalized.filter((expected) => !matchesExpected(expected));
-+            const genericAttachmentUiSatisfied = options?.appearanceConfirmed === true &&
-+                Boolean(value.filesAttached);
-+            const missing = genericAttachmentUiSatisfied
-+                ? []
-+                : expectedNormalized.filter((expected) => !matchesExpected(expected));
-             if (missing.length === 0 || fileCountSatisfied) {
-                 const stableThresholdMs = value.uploading ? 3000 : 1500;
-                 if (attachmentMatchSince === null) {
-@@ -1460,8 +1473,12 @@
-                 if (stable && value.state === "ready") {
-                     return;
-                 }
--                // Don't treat disabled button as complete - wait for it to become 'ready'.
--                // The spinner detection is unreliable, so a disabled button likely means upload is in progress.
-+                // 附件上传发生在 prompt 写入之前；此时发送按钮会因为编辑器为空而保持 disabled。
-+                // 文件名已稳定匹配且页面明确没有上传状态时，附件阶段已经完成，发送按钮应由后续
-+                // prompt 提交阶段单独校验。否则会把“空编辑器”误判为“仍在上传”。
-+                if (stable && !value.uploading && (value.filesAttached || fileCountSatisfied)) {
-+                    return;
-+                }
-                 if (value.state === "missing" && (value.filesAttached || fileCountSatisfied)) {
-                     return;
-                 }
-diff -ruN a/dist/src/browser/actions/navigation.js b/dist/src/browser/actions/navigation.js
---- a/dist/src/browser/actions/navigation.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/actions/navigation.js	2026-09-06 21:23:50
-@@ -37,7 +37,17 @@
- export async function navigateToChatGPT(Page, Runtime, url, logger) {
-     logger(`Navigating to ${url}`);
-     await Page.navigate({ url });
--    await waitForDocumentReady(Runtime, 45_000);
-+    try {
-+        await waitForDocumentReady(Runtime, 45_000);
-+    }
-+    catch (error) {
-+        if (typeof Page.reload !== "function") {
-+            throw error;
-+        }
-+        logger("[nav] initial document readiness timed out; reloading the isolated tab once.");
-+        await Page.reload({ ignoreCache: false });
-+        await waitForDocumentReady(Runtime, 45_000);
-+    }
- }
- async function dismissBlockingUi(Runtime, logger) {
-     const outcome = await Runtime.evaluate({
-diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js
-+++ b/dist/src/browser/actions/promptComposer.js
-@@ -54,9 +54,39 @@
-           candidates.push(node);
-         }
-       }
--      const preferred = candidates.find((node) => isVisible(node)) || candidates[0];
-+      const isEditable = (node) =>
-+        node instanceof HTMLTextAreaElement ||
-+        node instanceof HTMLInputElement ||
-+        node.isContentEditable ||
-+        node.getAttribute?.('contenteditable') === 'true';
-+      const active = document.activeElement;
-+      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
-+      const preferred =
-+        (isVisible(primary) && isEditable(primary) ? primary : null) ||
-+        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
-+        candidates.find((node) => isVisible(node) && isEditable(node)) ||
-+        candidates.find((node) => isVisible(node)) ||
-+        candidates[0];
-       if (preferred && focusNode(preferred)) {
--        return { focused: true };
-+        const activeAfterFocus = document.activeElement;
-+        const rect = preferred.getBoundingClientRect();
-+        return {
-+          focused: true,
-+          activeMatches:
-+            preferred === activeAfterFocus ||
-+            (activeAfterFocus instanceof Node && preferred.contains(activeAfterFocus)),
-+          kind: 'composer',
-+          x: rect.left + rect.width / 2,
-+          y: rect.top + rect.height / 2,
-+          viewport: {
-+            width: window.innerWidth,
-+            height: window.innerHeight,
-+            visualWidth: window.visualViewport?.width ?? window.innerWidth,
-+            visualHeight: window.visualViewport?.height ?? window.innerHeight,
-+            visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
-+            visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
-+          },
-+        };
-       }
-       return { focused: false };
-     })()`,
-@@ -67,6 +97,21 @@
-         await logDomFailure(runtime, logger, "focus-textarea");
-         throw new Error("Failed to focus prompt textarea");
-     }
-+    const focusPoint = focusResult.result.value;
-+    if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
-+        try {
-+            await clickTrustedPoint(runtime, input, focusPoint);
-+        }
-+        catch (error) {
-+            const details = error instanceof BrowserAutomationError ? error.details : null;
-+            if (focusPoint.activeMatches !== true ||
-+                details?.code !== "trusted-target-mismatch" ||
-+                details?.kind !== "composer") {
-+                throw error;
-+            }
-+            logger("Composer pointer target was covered; using verified editor focus");
-+        }
-+    }
-     await input.insertText({ text: prompt });
-     // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
-     // before the send button becomes enabled; give it a short breather to avoid races.
-@@ -157,6 +202,14 @@
-     const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
-     const observedActive = postVerification.result?.value?.activeValue ?? "";
-     const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
-+    if (observedLength === 0) {
-+        await logDomFailure(runtime, logger, "prompt-insertion-unverified");
-+        throw new BrowserAutomationError("Prompt insertion could not be verified in the focused composer.", {
-+            stage: "submit-prompt",
-+            code: "prompt-insertion-unverified",
-+            promptLength,
-+        });
-+    }
-     if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
-         // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
-         await logDomFailure(runtime, logger, "prompt-too-large");
-@@ -169,25 +222,95 @@
-     }
-     const clicked = await attemptSendButton(runtime, input, logger, deps?.attachmentNames, deps?.attachmentTimeoutMs);
-     if (!clicked) {
--        await input.dispatchKeyEvent({
--            type: "keyDown",
--            ...ENTER_KEY_EVENT,
--            text: ENTER_KEY_TEXT,
--            unmodifiedText: ENTER_KEY_TEXT,
--        });
--        await input.dispatchKeyEvent({
--            type: "keyUp",
--            ...ENTER_KEY_EVENT,
--        });
-+        await submitViaEnter(runtime, input);
-         logger("Submitted prompt via Enter key");
-     }
-     else {
-         logger("Clicked send button");
-+        // CDP can deliver a trusted mouse sequence without ChatGPT accepting the action.
-+        // Only retry when the composer still contains the prompt and no submission signal
-+        // appears, which avoids duplicating a click that actually succeeded.
-+        const clickStartedSubmission = await waitForSubmissionStart(runtime, deps.baselineTurns ?? undefined, 3_000);
-+        if (!clickStartedSubmission) {
-+            await submitViaEnter(runtime, input);
-+            logger("Send button produced no submission state; retried once via Enter key");
-+        }
-     }
-     await deps.onPromptSubmitted?.();
-     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
-     // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
-     return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
-+}
-+async function submitViaEnter(Runtime, Input) {
-+    const focus = await Runtime.evaluate({
-+        expression: `(() => {
-+      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
-+      const isVisible = (node) => {
-+        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-+        const rect = node.getBoundingClientRect();
-+        return rect.width > 0 && rect.height > 0;
-+      };
-+      const isEditable = (node) =>
-+        node instanceof HTMLTextAreaElement ||
-+        node instanceof HTMLInputElement ||
-+        node.isContentEditable ||
-+        node.getAttribute?.('contenteditable') === 'true';
-+      const candidates = selectors
-+        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-+        .filter((node, index, all) => all.indexOf(node) === index);
-+      const active = document.activeElement;
-+      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
-+      const editor =
-+        (isVisible(primary) && isEditable(primary) ? primary : null) ||
-+        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
-+        candidates.find((node) => isVisible(node) && isEditable(node));
-+      if (!editor) return null;
-+      editor.focus?.();
-+      const activeAfterFocus = document.activeElement;
-+      const rect = editor.getBoundingClientRect();
-+      return {
-+        kind: 'composer',
-+        activeMatches:
-+          editor === activeAfterFocus ||
-+          (activeAfterFocus instanceof Node && editor.contains(activeAfterFocus)),
-+        x: rect.left + rect.width / 2,
-+        y: rect.top + rect.height / 2,
-+        viewport: {
-+          width: window.innerWidth,
-+          height: window.innerHeight,
-+          visualWidth: window.visualViewport?.width ?? window.innerWidth,
-+          visualHeight: window.visualViewport?.height ?? window.innerHeight,
-+          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
-+          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
-+        },
-+      };
-+    })()`,
-+        returnByValue: true,
-+    });
-+    const point = focus.result?.value;
-+    if (point && typeof point.x === "number" && typeof point.y === "number") {
-+        try {
-+            await clickTrustedPoint(Runtime, Input, point);
-+        }
-+        catch (error) {
-+            const details = error instanceof BrowserAutomationError ? error.details : null;
-+            if (point.activeMatches !== true ||
-+                details?.code !== "trusted-target-mismatch" ||
-+                details?.kind !== "composer") {
-+                throw error;
-+            }
-+        }
-+    }
-+    await Input.dispatchKeyEvent({
-+        type: "keyDown",
-+        ...ENTER_KEY_EVENT,
-+        text: ENTER_KEY_TEXT,
-+        unmodifiedText: ENTER_KEY_TEXT,
-+    });
-+    await Input.dispatchKeyEvent({
-+        type: "keyUp",
-+        ...ENTER_KEY_EVENT,
-+    });
- }
- export async function clearPromptComposer(Runtime, logger) {
-     const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
-@@ -579,7 +702,6 @@
- async function attemptSendButton(Runtime, Input, _logger, attachmentNames, attachmentTimeoutMs) {
-     const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
-     const script = `(() => {
--    ${buildClickDispatcher()}
-     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
-     const isVisible = (node) => {
-       if (!(node instanceof HTMLElement)) return false;
-@@ -604,16 +726,28 @@
-     for (const selector of selectors) {
-       candidates.push(...Array.from(document.querySelectorAll(selector)));
-     }
--    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
--    if (!button) return { status: 'missing' };
-+    const visibleCandidates = candidates.filter((node) => isVisible(node));
-+    const button = visibleCandidates.find((node) => isEnabled(node)) || null;
-+    if (!button) return { status: visibleCandidates.length > 0 ? 'disabled' : 'missing' };
-     button.scrollIntoView({ block: 'center', inline: 'center' });
-     const rect = button.getBoundingClientRect();
-     if (rect.width > 0 && rect.height > 0) {
--      return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-+      return {
-+        status: 'point',
-+        kind: 'send',
-+        x: rect.left + rect.width / 2,
-+        y: rect.top + rect.height / 2,
-+        viewport: {
-+          width: window.innerWidth,
-+          height: window.innerHeight,
-+          visualWidth: window.visualViewport?.width ?? window.innerWidth,
-+          visualHeight: window.visualViewport?.height ?? window.innerHeight,
-+          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
-+          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
-+        },
-+      };
-     }
--    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
--    dispatchClickSequence(button);
--    return { status: 'clicked' };
-+    return { status: 'missing' };
-   })()`;
-     // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
-     // settle slowly for multi-file uploads, but plain text sends should keep the
-@@ -638,14 +772,20 @@
-             typeof value === "object" &&
-             typeof value.x === "number" &&
-             typeof value.y === "number") {
--            await clickTrustedPoint(Runtime, Input, value.x, value.y);
-+            await clickTrustedPoint(Runtime, Input, value);
-             return true;
-         }
--        if (status === "clicked") {
--            return true;
--        }
-         if (status === "missing") {
--            break;
-+            // Attachment readiness was verified above. Let the caller use its
-+            // existing one-shot Enter fallback, then verify a committed turn.
-+            return false;
-+        }
-+        if (status === "disabled") {
-+            if (!needAttachment) {
-+                return false;
-+            }
-+            await delay(150);
-+            continue;
-         }
-         await delay(100);
-     }
-@@ -659,23 +799,179 @@
-     }
-     return false;
- }
--async function clickTrustedPoint(Runtime, Input, x, y) {
--    if (Input && typeof Input.dispatchMouseEvent === "function") {
--        await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
--        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
--        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-+function buildTrustedPointExpression(kind) {
-+    return `(() => {
-+      const kind = ${JSON.stringify(kind)};
-+      const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
-+      const sendSelectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
-+      const isVisible = (node) => {
-+        if (!(node instanceof HTMLElement)) return false;
-+        const rect = node.getBoundingClientRect();
-+        if (rect.width <= 0 || rect.height <= 0) return false;
-+        const style = window.getComputedStyle(node);
-+        return style.display !== 'none' && style.visibility !== 'hidden';
-+      };
-+      const isEditable = (node) =>
-+        node instanceof HTMLTextAreaElement ||
-+        node instanceof HTMLInputElement ||
-+        node.isContentEditable ||
-+        node.getAttribute?.('contenteditable') === 'true';
-+      const isEnabled = (node) => {
-+        const style = window.getComputedStyle(node);
-+        return !(
-+          node.hasAttribute('disabled') ||
-+          node.getAttribute('aria-disabled') === 'true' ||
-+          node.getAttribute('data-disabled') === 'true' ||
-+          style.pointerEvents === 'none'
-+        );
-+      };
-+      let target = null;
-+      if (kind === 'composer') {
-+        const candidates = inputSelectors
-+          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-+          .filter((node, index, all) => all.indexOf(node) === index);
-+        const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
-+        target =
-+          (isVisible(primary) && isEditable(primary) ? primary : null) ||
-+          candidates.find((node) => node === document.activeElement && isVisible(node) && isEditable(node)) ||
-+          candidates.find((node) => isVisible(node) && isEditable(node)) ||
-+          null;
-+      } else if (kind === 'send') {
-+        const candidates = sendSelectors
-+          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-+          .filter((node, index, all) => all.indexOf(node) === index);
-+        target = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
-+        target?.scrollIntoView?.({ block: 'center', inline: 'center' });
-+      }
-+      if (!target) return { status: 'missing', kind };
-+      const rect = target.getBoundingClientRect();
-+      const viewport = {
-+        width: window.innerWidth,
-+        height: window.innerHeight,
-+        visualWidth: window.visualViewport?.width ?? window.innerWidth,
-+        visualHeight: window.visualViewport?.height ?? window.innerHeight,
-+        visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
-+        visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
-+      };
-+      const candidateFractions = kind === 'composer'
-+        ? [[0.5, 0.5], [0.2, 0.8], [0.5, 0.8], [0.8, 0.8], [0.2, 0.5], [0.8, 0.5]]
-+        : [[0.5, 0.5]];
-+      for (const [xFraction, yFraction] of candidateFractions) {
-+        const x = rect.left + rect.width * xFraction;
-+        const y = rect.top + rect.height * yFraction;
-+        const hit = document.elementFromPoint(x, y);
-+        if (hit instanceof Node && (target === hit || target.contains(hit))) {
-+          return { status: 'point', kind, x, y, viewport };
-+        }
-+      }
-+      return {
-+        status: 'target-mismatch',
-+        kind,
-+        x: rect.left + rect.width / 2,
-+        y: rect.top + rect.height / 2,
-+        viewport,
-+      };
-+    })()`;
-+}
-+function sameViewport(left, right) {
-+    if (!left || !right)
-+        return false;
-+    return left.width === right.width &&
-+        left.height === right.height &&
-+        left.visualWidth === right.visualWidth &&
-+        left.visualHeight === right.visualHeight &&
-+        left.visualOffsetLeft === right.visualOffsetLeft &&
-+        left.visualOffsetTop === right.visualOffsetTop;
-+}
-+async function clickTrustedPoint(Runtime, Input, target) {
-+    let expectedViewport = target?.viewport;
-+    const kind = target?.kind;
-+    if (kind !== "composer" && kind !== "send") {
-+        throw new BrowserAutomationError("Trusted click target was not identified.", {
-+            stage: "submit-prompt",
-+            code: "trusted-target-unidentified",
-+        });
-+    }
-+    for (let attempt = 0; attempt < 3; attempt += 1) {
-+        const { result } = await Runtime.evaluate({
-+            expression: buildTrustedPointExpression(kind),
-+            returnByValue: true,
-+        });
-+        const point = result?.value;
-+        if (point?.status !== "point") {
-+            throw new BrowserAutomationError(`Trusted ${kind} target failed hit testing (${point?.status ?? "unknown"}).`, {
-+                stage: "submit-prompt",
-+                code: "trusted-target-mismatch",
-+                kind,
-+                status: point?.status ?? "unknown",
-+            });
-+        }
-+        if (!sameViewport(expectedViewport, point.viewport)) {
-+            expectedViewport = point.viewport;
-+            continue;
-+        }
-+        const x = Number(point.x);
-+        const y = Number(point.y);
-+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
-+            throw new BrowserAutomationError(`Trusted ${kind} target returned invalid coordinates.`, {
-+                stage: "submit-prompt",
-+                code: "trusted-target-invalid-point",
-+                kind,
-+            });
-+        }
-+        if (!Input || typeof Input.dispatchMouseEvent !== "function") {
-+            throw new BrowserAutomationError(`Trusted ${kind} target requires CDP pointer input.`, {
-+                stage: "submit-prompt",
-+                code: "trusted-input-unavailable",
-+                kind,
-+            });
-+        }
-+        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
-+        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
-         return;
-     }
--    await Runtime.evaluate({
--        expression: `(() => {
--      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
--      if (!(el instanceof HTMLElement)) return false;
--      el.click();
--      return true;
--    })()`,
--        returnByValue: true,
-+    throw new BrowserAutomationError(`Trusted ${kind} target kept moving after a window resize.`, {
-+        stage: "submit-prompt",
-+        code: "trusted-target-resized",
-+        kind,
-     });
- }
-+async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
-+    const deadline = Date.now() + timeoutMs;
-+    const baseline = typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
-+        ? Math.max(0, Math.floor(baselineTurns))
-+        : -1;
-+    const expression = `(() => {
-+    const selectors = ${JSON.stringify(INPUT_SELECTORS)};
-+    const isVisible = (node) => {
-+      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
-+      const rect = node.getBoundingClientRect();
-+      return rect.width > 0 && rect.height > 0;
-+    };
-+    const readValue = (node) => {
-+      if (!node) return '';
-+      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) return node.value ?? '';
-+      return node.innerText ?? node.textContent ?? '';
-+    };
-+    const inputs = selectors
-+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
-+      .filter((node, index, all) => all.indexOf(node) === index && isVisible(node));
-+    const composerEmpty = inputs.length > 0 && inputs.every((node) => !String(readValue(node)).trim());
-+    const turnsCount = ${buildConversationTurnCountExpression()};
-+    const hasNewTurn = ${JSON.stringify(baseline)} >= 0 && turnsCount > ${JSON.stringify(baseline)};
-+    const stopVisible = Boolean(document.querySelector(${JSON.stringify(STOP_BUTTON_SELECTOR)}));
-+    const inConversation = /\\/c\\//.test(location.href);
-+    return { started: composerEmpty || hasNewTurn || stopVisible || inConversation };
-+  })()`;
-+    while (Date.now() < deadline) {
-+        const { result } = await Runtime.evaluate({ expression, returnByValue: true });
-+        if (result?.value?.started) {
-+            return true;
-+        }
-+        await delay(100);
-+    }
-+    return false;
-+}
- function sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs) {
-     if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
-         return 20_000;
 diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
---- a/dist/src/browser/actions/thinkingTime.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/actions/thinkingTime.js	2026-09-06 21:23:50
+--- a/dist/src/browser/actions/thinkingTime.js	2026-09-07 10:09:46
++++ b/dist/src/browser/actions/thinkingTime.js	2026-09-07 10:07:35
 @@ -2,6 +2,7 @@
  import { logDomFailure } from "../domDebug.js";
  import { buildClickDispatcher } from "./domEvents.js";
@@ -644,7 +102,7 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
          const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
          switch (result?.status) {
              case "already-selected":
-@@ -122,14 +147,243 @@
+@@ -122,13 +147,242 @@
          return false;
      }
  }
@@ -683,7 +141,7 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
 +        return { status: "blocked", result: current };
 +    }
 +    return { status: "ready", result: current };
- }
++}
 +async function evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input) {
 +    let lastResult;
 +    for (let attempt = 0; attempt < 16; attempt += 1) {
@@ -886,10 +344,9 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
 +        ...lastResult,
 +        status: "selection-unverified",
 +    };
-+}
+ }
  function buildThinkingTimeExpression(level, desiredModel) {
      const menuContainerLiteral = JSON.stringify(MENU_CONTAINER_SELECTOR);
-     const menuItemLiteral = JSON.stringify(MENU_ITEM_SELECTOR);
 @@ -137,6 +391,7 @@
      const targetLevelLiteral = JSON.stringify(level.toLowerCase());
      const targetModelKindLiteral = JSON.stringify(inferThinkingTargetModelKind(desiredModel));
@@ -1275,7 +732,7 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
            const proEffortResult = await selectProEffortFromSubmenu();
            if (proEffortResult) {
              return proEffortResult;
-@@ -1034,8 +1577,22 @@
+@@ -1034,10 +1577,24 @@
        modelBtn.getAttribute('aria-expanded') !== 'true' &&
        !legacyEffortOwnerIsReady()
      ) {
@@ -1292,177 +749,578 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
 +        rect.top + (rect.height / 2),
 +        { purpose: 'open-effort-picker' },
 +      );
-+    }
-+
+     }
+
 +    const powerSliderResult = await selectEffortFromPowerSlider(findVisibleEffortMenu(modelBtn));
 +    if (powerSliderResult) {
 +      return powerSliderResult;
-     }
-
++    }
++
      // ---------- COMPATIBILITY UI: unified "Intelligence" effort picker ----------
-diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
---- a/dist/src/browser/index.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/index.js	2026-09-06 21:34:39
-@@ -296,6 +296,31 @@
-  * window swallows the click while the automation still believes it clicked.
-  * Soft-fails: focus emulation is an optimization, never a hard requirement.
-  */
-+async function stabilizeChromeWindow(client, logger) {
-+    const width = 1280;
-+    const height = 720;
-+    try {
-+        const { windowId } = await client.Browser.getWindowForTarget();
-+        await client.Browser.setWindowBounds({
-+            windowId,
-+            bounds: { windowState: "normal" },
-+        });
-+        await client.Browser.setWindowBounds({
-+            windowId,
-+            bounds: { width, height },
-+        });
-+        const observed = await client.Browser.getWindowBounds({ windowId });
-+        const bounds = observed?.bounds;
-+        if (bounds?.windowState !== "normal" || bounds.width !== width || bounds.height !== height) {
-+            throw new Error(`observed ${bounds?.width ?? "?"}x${bounds?.height ?? "?"} (${bounds?.windowState ?? "unknown"})`);
-+        }
-+        logger(`Chrome window fixed at ${width}x${height}`);
-+    }
-+    catch (error) {
-+        const message = error instanceof Error ? error.message : String(error);
-+        throw new Error(`Failed to set stable Chrome window bounds: ${message}`);
-+    }
-+}
- async function enableFocusEmulation(client, logger, label) {
-     try {
-         await client.Emulation.setFocusEmulationEnabled({ enabled: true });
-@@ -741,6 +766,9 @@
-             chromePort: chrome.port,
-         });
+     // One observed ChatGPT layout replaced the per-model trailing buttons with a single
+     // "Intelligence" menu ([data-testid="composer-intelligence-picker-content"]),
+diff -ruN a/dist/src/browser/actions/attachments.js b/dist/src/browser/actions/attachments.js
+--- a/dist/src/browser/actions/attachments.js	2026-09-07 10:09:46
++++ b/dist/src/browser/actions/attachments.js	2026-09-07 10:07:35
+@@ -1032,7 +1032,9 @@
+         const inputNameCandidates = resolveInputNameCandidates();
+         const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
+             (lastInputValue && matchesExpectedName(lastInputValue));
+-        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
++        // This branch already requires a baseline-relative upload UI delta. Current
++        // ChatGPT cards do not always expose the local filename, so a second exact-name
++        // visibility probe would turn confirmed uploads into false negatives.
+         logger(inputHasFile
+             ? "Attachment queued (UI anchored, file input confirmed)"
+             : "Attachment queued (UI anchored)");
+@@ -1042,7 +1044,6 @@
+     const inputHasFile = inputNameCandidates.some((name) => matchesExpectedName(name)) ||
+         (lastInputValue && matchesExpectedName(lastInputValue));
+     if (await waitForAttachmentAnchored(runtime, expectedName, attachmentUiTimeoutMs)) {
+-        await waitForAttachmentVisible(runtime, expectedName, attachmentUiTimeoutMs, logger);
+         logger(inputHasFile
+             ? "Attachment queued (UI anchored, file input confirmed)"
+             : "Attachment queued (UI anchored)");
+@@ -1171,9 +1172,17 @@
+         throw new Error("Existing attachments still present in composer; aborting to avoid duplicate uploads.");
      }
-+    // Persist the owned runtime before navigation so even an early page-load
-+    // failure can be audited and cleaned by exact PID/Profile identity.
-+    await emitRuntimeHint();
-     let removeTerminationHooks = null;
-     try {
-         removeTerminationHooks = registerTerminationHooks(chrome, userDataDir, effectiveKeepBrowser, logger, {
-@@ -853,6 +881,7 @@
-             domainEnablers.push(DOM.enable());
+ }
+-export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedNames = [], logger) {
++export async function waitForAttachmentCompletion(Runtime, timeoutMs, expectedAttachments = [], logger, options) {
+     const deadline = Date.now() + timeoutMs;
+-    const expectedNormalized = expectedNames.map((name) => name.toLowerCase());
++    const expectations = expectedAttachments
++        .map((attachment) => typeof attachment === "string"
++        ? { name: attachment, generatedBundle: false }
++        : {
++            name: typeof attachment?.name === "string" ? attachment.name : "",
++            generatedBundle: attachment?.generatedBundle === true,
++        })
++        .filter((attachment) => attachment.name.length > 0);
++    const expectedNormalized = expectations.map((attachment) => attachment.name.toLowerCase());
+     const expectedInputBasenames = expectedNormalized
+         .map((name) => name.split("/").pop()?.split("\\").pop() ?? name)
+         .map((name) => name.toLowerCase().replace(/\s+/g, " ").trim())
+@@ -1450,7 +1459,11 @@
+                     return false;
+                 });
+             };
+-            const missing = expectedNormalized.filter((expected) => !matchesExpected(expected));
++            const genericAttachmentUiSatisfied = options?.appearanceConfirmed === true &&
++                Boolean(value.filesAttached);
++            const missing = genericAttachmentUiSatisfied
++                ? []
++                : expectedNormalized.filter((expected) => !matchesExpected(expected));
+             if (missing.length === 0 || fileCountSatisfied) {
+                 const stableThresholdMs = value.uploading ? 3000 : 1500;
+                 if (attachmentMatchSince === null) {
+@@ -1460,8 +1473,12 @@
+                 if (stable && value.state === "ready") {
+                     return;
+                 }
+-                // Don't treat disabled button as complete - wait for it to become 'ready'.
+-                // The spinner detection is unreliable, so a disabled button likely means upload is in progress.
++                // 附件上传发生在 prompt 写入之前；此时发送按钮会因为编辑器为空而保持 disabled。
++                // 文件名已稳定匹配且页面明确没有上传状态时，附件阶段已经完成，发送按钮应由后续
++                // prompt 提交阶段单独校验。否则会把“空编辑器”误判为“仍在上传”。
++                if (stable && !value.uploading && (value.filesAttached || fileCountSatisfied)) {
++                    return;
++                }
+                 if (value.state === "missing" && (value.filesAttached || fileCountSatisfied)) {
+                     return;
+                 }
+diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
+--- a/dist/src/browser/actions/promptComposer.js	2026-09-07 10:09:46
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 10:12:09
+@@ -54,9 +54,39 @@
+           candidates.push(node);
          }
-         await Promise.all(domainEnablers);
-+        await stabilizeChromeWindow(client, logger);
-         if (!config.headless && config.hideWindow) {
-             await positionChromeWindowOffscreen(client, logger);
-         }
-@@ -1078,8 +1107,9 @@
-         // Handle thinking time selection if specified. Deep Research owns its own effort flow.
-         const thinkingTime = config.thinkingTime;
-         if (thinkingTime && !deepResearch) {
-+            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
-             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
--            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
-+            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
-                 retries: 2,
-                 delayMs: 300,
-                 onRetry: (attempt, error) => {
-@@ -1107,6 +1137,7 @@
-             await handle.release().catch(() => undefined);
-         };
-         const submitOnce = async (prompt, submissionAttachments) => {
-+            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
-             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
-             const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
-             const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
-@@ -1136,7 +1167,9 @@
-                 const perFileTimeout = 20_000;
-                 const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
-                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
--                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
-+                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentExpectations, logger, {
-+                    appearanceConfirmed: !inputOnlyAttachments,
-+                });
-                 logger("All attachments uploaded");
-             }
-             if (deepResearch) {
-@@ -2397,7 +2430,7 @@
-         const thinkingTime = config.thinkingTime;
-         if (thinkingTime && !deepResearch) {
-             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
--            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
-+            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
-                 retries: 2,
-                 delayMs: 300,
-                 onRetry: (attempt, error) => {
-diff -ruN a/dist/src/browser/profileCopy.js b/dist/src/browser/profileCopy.js
---- a/dist/src/browser/profileCopy.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/profileCopy.js	2026-09-06 21:23:50
-@@ -1,5 +1,5 @@
- import { spawn } from "node:child_process";
--import { cp, mkdir, readFile, rm } from "node:fs/promises";
-+import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
- import path from "node:path";
- /**
-  * Cache/derived subdirectories that bloat the copy and carry no signed-in-session
-@@ -52,13 +52,19 @@
-             args.push("--exclude", exclude);
-         }
-         args.push(`${srcProfile}/`, `${destProfile}/`);
--        await new Promise((resolve, reject) => {
-+        const rsyncExitCode = await new Promise((resolve, reject) => {
-             const child = spawn("rsync", args, { stdio: "ignore" });
-             child.on("error", (err) => reject(new Error(`--copy-profile requires rsync on PATH (spawn failed): ${err.message}`)));
--            child.on("close", (code) => code === 0 || code === 24
--                ? resolve()
--                : reject(new Error(`rsync failed copying Chrome profile (exit ${code})`)));
-+            child.on("close", (code) => resolve(code));
-         });
-+        const partialCopyHasSessionMaterial = rsyncExitCode === 23 && (await hasCopiedCookieDatabase(destProfile));
-+        if (rsyncExitCode !== 0 && rsyncExitCode !== 24 && !partialCopyHasSessionMaterial) {
-+            throw new Error(`rsync failed copying Chrome profile (exit ${rsyncExitCode})`);
-+        }
-+        // A live Chrome profile commonly records exit_type=Crashed while it is
-+        // running. The throwaway copy must not inherit that stale session marker,
-+        // or every Oracle window opens with a misleading restore-pages bubble.
-+        await markCopiedProfileExitedCleanly(destProfile);
-         return profileDirectory;
+       }
+-      const preferred = candidates.find((node) => isVisible(node)) || candidates[0];
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const active = document.activeElement;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++      const preferred =
++        (isVisible(primary) && isEditable(primary) ? primary : null) ||
++        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node)) ||
++        candidates[0];
+       if (preferred && focusNode(preferred)) {
+-        return { focused: true };
++        const activeAfterFocus = document.activeElement;
++        const rect = preferred.getBoundingClientRect();
++        return {
++          focused: true,
++          activeMatches:
++            preferred === activeAfterFocus ||
++            (activeAfterFocus instanceof Node && preferred.contains(activeAfterFocus)),
++          kind: 'composer',
++          x: rect.left + rect.width / 2,
++          y: rect.top + rect.height / 2,
++          viewport: {
++            width: window.innerWidth,
++            height: window.innerHeight,
++            visualWidth: window.visualViewport?.width ?? window.innerWidth,
++            visualHeight: window.visualViewport?.height ?? window.innerHeight,
++            visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++            visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++          },
++        };
+       }
+       return { focused: false };
+     })()`,
+@@ -67,6 +97,24 @@
+         await logDomFailure(runtime, logger, "focus-textarea");
+         throw new Error("Failed to focus prompt textarea");
      }
-     catch (error) {
-@@ -66,6 +72,33 @@
-         // session-bearing copies before surfacing setup failures.
-         await rm(destDir, { recursive: true, force: true }).catch(() => undefined);
-         throw error;
-+    }
-+}
-+async function hasCopiedCookieDatabase(profileDir) {
-+    for (const relativePath of [path.join("Network", "Cookies"), "Cookies"]) {
++    const focusPoint = focusResult.result.value;
++    if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
 +        try {
-+            await access(path.join(profileDir, relativePath));
++            await clickTrustedPoint(runtime, input, focusPoint);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (focusPoint.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++            if (!(await hasFocusedVisibleComposer(runtime))) {
++                throw error;
++            }
++            logger("Composer pointer target was covered; using verified editor focus");
++        }
++    }
+     await input.insertText({ text: prompt });
+     // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
+     // before the send button becomes enabled; give it a short breather to avoid races.
+@@ -157,6 +205,14 @@
+     const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
+     const observedActive = postVerification.result?.value?.activeValue ?? "";
+     const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
++    if (observedLength === 0) {
++        await logDomFailure(runtime, logger, "prompt-insertion-unverified");
++        throw new BrowserAutomationError("Prompt insertion could not be verified in the focused composer.", {
++            stage: "submit-prompt",
++            code: "prompt-insertion-unverified",
++            promptLength,
++        });
++    }
+     if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
+         // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
+         await logDomFailure(runtime, logger, "prompt-too-large");
+@@ -169,26 +225,130 @@
+     }
+     const clicked = await attemptSendButton(runtime, input, logger, deps?.attachmentNames, deps?.attachmentTimeoutMs);
+     if (!clicked) {
+-        await input.dispatchKeyEvent({
+-            type: "keyDown",
+-            ...ENTER_KEY_EVENT,
+-            text: ENTER_KEY_TEXT,
+-            unmodifiedText: ENTER_KEY_TEXT,
+-        });
+-        await input.dispatchKeyEvent({
+-            type: "keyUp",
+-            ...ENTER_KEY_EVENT,
+-        });
++        await submitViaEnter(runtime, input);
+         logger("Submitted prompt via Enter key");
+     }
+     else {
+         logger("Clicked send button");
++        // CDP can deliver a trusted mouse sequence without ChatGPT accepting the action.
++        // Only retry when the composer still contains the prompt and no submission signal
++        // appears, which avoids duplicating a click that actually succeeded.
++        const clickStartedSubmission = await waitForSubmissionStart(runtime, deps.baselineTurns ?? undefined, 3_000);
++        if (!clickStartedSubmission) {
++            await submitViaEnter(runtime, input);
++            logger("Send button produced no submission state; retried once via Enter key");
++        }
+     }
+     await deps.onPromptSubmitted?.();
+     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
+     // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
+     return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
+ }
++async function hasFocusedVisibleComposer(Runtime) {
++    const result = await Runtime.evaluate({
++        expression: `(() => {
++      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const isVisible = (node) => {
++        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++        const rect = node.getBoundingClientRect();
++        return rect.width > 0 && rect.height > 0;
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const active = document.activeElement;
++      if (!(active instanceof Node)) return false;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++      const candidates = [
++        primary,
++        ...selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))),
++      ].filter((node, index, all) => node && all.indexOf(node) === index);
++      return candidates.some((node) =>
++        isVisible(node) &&
++        isEditable(node) &&
++        (node === active || node.contains(active))
++      );
++    })()`,
++        returnByValue: true,
++    });
++    return result.result?.value === true;
++}
++async function submitViaEnter(Runtime, Input) {
++    const focus = await Runtime.evaluate({
++        expression: `(() => {
++      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const isVisible = (node) => {
++        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++        const rect = node.getBoundingClientRect();
++        return rect.width > 0 && rect.height > 0;
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const candidates = selectors
++        .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++        .filter((node, index, all) => all.indexOf(node) === index);
++      const active = document.activeElement;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++      const editor =
++        (isVisible(primary) && isEditable(primary) ? primary : null) ||
++        candidates.find((node) => node === active && isVisible(node) && isEditable(node)) ||
++        candidates.find((node) => isVisible(node) && isEditable(node));
++      if (!editor) return null;
++      editor.focus?.();
++      const activeAfterFocus = document.activeElement;
++      const rect = editor.getBoundingClientRect();
++      return {
++        kind: 'composer',
++        activeMatches:
++          editor === activeAfterFocus ||
++          (activeAfterFocus instanceof Node && editor.contains(activeAfterFocus)),
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport: {
++          width: window.innerWidth,
++          height: window.innerHeight,
++          visualWidth: window.visualViewport?.width ?? window.innerWidth,
++          visualHeight: window.visualViewport?.height ?? window.innerHeight,
++          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++        },
++      };
++    })()`,
++        returnByValue: true,
++    });
++    const point = focus.result?.value;
++    if (point && typeof point.x === "number" && typeof point.y === "number") {
++        try {
++            await clickTrustedPoint(Runtime, Input, point);
++        }
++        catch (error) {
++            const details = error instanceof BrowserAutomationError ? error.details : null;
++            if (point.activeMatches !== true ||
++                details?.code !== "trusted-target-mismatch" ||
++                details?.kind !== "composer") {
++                throw error;
++            }
++            if (!(await hasFocusedVisibleComposer(Runtime))) {
++                throw error;
++            }
++        }
++    }
++    await Input.dispatchKeyEvent({
++        type: "keyDown",
++        ...ENTER_KEY_EVENT,
++        text: ENTER_KEY_TEXT,
++        unmodifiedText: ENTER_KEY_TEXT,
++    });
++    await Input.dispatchKeyEvent({
++        type: "keyUp",
++        ...ENTER_KEY_EVENT,
++    });
++}
+ export async function clearPromptComposer(Runtime, logger) {
+     const primarySelectorLiteral = JSON.stringify(PROMPT_PRIMARY_SELECTOR);
+     const fallbackSelectorLiteral = JSON.stringify(PROMPT_FALLBACK_SELECTOR);
+@@ -579,7 +739,6 @@
+ async function attemptSendButton(Runtime, Input, _logger, attachmentNames, attachmentTimeoutMs) {
+     const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
+     const script = `(() => {
+-    ${buildClickDispatcher()}
+     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
+     const isVisible = (node) => {
+       if (!(node instanceof HTMLElement)) return false;
+@@ -604,16 +763,28 @@
+     for (const selector of selectors) {
+       candidates.push(...Array.from(document.querySelectorAll(selector)));
+     }
+-    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
+-    if (!button) return { status: 'missing' };
++    const visibleCandidates = candidates.filter((node) => isVisible(node));
++    const button = visibleCandidates.find((node) => isEnabled(node)) || null;
++    if (!button) return { status: visibleCandidates.length > 0 ? 'disabled' : 'missing' };
+     button.scrollIntoView({ block: 'center', inline: 'center' });
+     const rect = button.getBoundingClientRect();
+     if (rect.width > 0 && rect.height > 0) {
+-      return { status: 'point', x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
++      return {
++        status: 'point',
++        kind: 'send',
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport: {
++          width: window.innerWidth,
++          height: window.innerHeight,
++          visualWidth: window.visualViewport?.width ?? window.innerWidth,
++          visualHeight: window.visualViewport?.height ?? window.innerHeight,
++          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++        },
++      };
+     }
+-    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
+-    dispatchClickSequence(button);
+-    return { status: 'clicked' };
++    return { status: 'missing' };
+   })()`;
+     // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
+     // settle slowly for multi-file uploads, but plain text sends should keep the
+@@ -638,15 +809,21 @@
+             typeof value === "object" &&
+             typeof value.x === "number" &&
+             typeof value.y === "number") {
+-            await clickTrustedPoint(Runtime, Input, value.x, value.y);
++            await clickTrustedPoint(Runtime, Input, value);
+             return true;
+         }
+-        if (status === "clicked") {
+-            return true;
+-        }
+         if (status === "missing") {
+-            break;
++            // Attachment readiness was verified above. Let the caller use its
++            // existing one-shot Enter fallback, then verify a committed turn.
++            return false;
+         }
++        if (status === "disabled") {
++            if (!needAttachment) {
++                return false;
++            }
++            await delay(150);
++            continue;
++        }
+         await delay(100);
+     }
+     if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
+@@ -659,23 +836,179 @@
+     }
+     return false;
+ }
+-async function clickTrustedPoint(Runtime, Input, x, y) {
+-    if (Input && typeof Input.dispatchMouseEvent === "function") {
+-        await Input.dispatchMouseEvent({ type: "mouseMoved", x, y });
+-        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", clickCount: 1 });
+-        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", clickCount: 1 });
++function buildTrustedPointExpression(kind) {
++    return `(() => {
++      const kind = ${JSON.stringify(kind)};
++      const inputSelectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const sendSelectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
++      const isVisible = (node) => {
++        if (!(node instanceof HTMLElement)) return false;
++        const rect = node.getBoundingClientRect();
++        if (rect.width <= 0 || rect.height <= 0) return false;
++        const style = window.getComputedStyle(node);
++        return style.display !== 'none' && style.visibility !== 'hidden';
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const isEnabled = (node) => {
++        const style = window.getComputedStyle(node);
++        return !(
++          node.hasAttribute('disabled') ||
++          node.getAttribute('aria-disabled') === 'true' ||
++          node.getAttribute('data-disabled') === 'true' ||
++          style.pointerEvents === 'none'
++        );
++      };
++      let target = null;
++      if (kind === 'composer') {
++        const candidates = inputSelectors
++          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++          .filter((node, index, all) => all.indexOf(node) === index);
++        const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++        target =
++          (isVisible(primary) && isEditable(primary) ? primary : null) ||
++          candidates.find((node) => node === document.activeElement && isVisible(node) && isEditable(node)) ||
++          candidates.find((node) => isVisible(node) && isEditable(node)) ||
++          null;
++      } else if (kind === 'send') {
++        const candidates = sendSelectors
++          .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++          .filter((node, index, all) => all.indexOf(node) === index);
++        target = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
++        target?.scrollIntoView?.({ block: 'center', inline: 'center' });
++      }
++      if (!target) return { status: 'missing', kind };
++      const rect = target.getBoundingClientRect();
++      const viewport = {
++        width: window.innerWidth,
++        height: window.innerHeight,
++        visualWidth: window.visualViewport?.width ?? window.innerWidth,
++        visualHeight: window.visualViewport?.height ?? window.innerHeight,
++        visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
++        visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
++      };
++      const candidateFractions = kind === 'composer'
++        ? [[0.5, 0.5], [0.2, 0.8], [0.5, 0.8], [0.8, 0.8], [0.2, 0.5], [0.8, 0.5]]
++        : [[0.5, 0.5]];
++      for (const [xFraction, yFraction] of candidateFractions) {
++        const x = rect.left + rect.width * xFraction;
++        const y = rect.top + rect.height * yFraction;
++        const hit = document.elementFromPoint(x, y);
++        if (hit instanceof Node && (target === hit || target.contains(hit))) {
++          return { status: 'point', kind, x, y, viewport };
++        }
++      }
++      return {
++        status: 'target-mismatch',
++        kind,
++        x: rect.left + rect.width / 2,
++        y: rect.top + rect.height / 2,
++        viewport,
++      };
++    })()`;
++}
++function sameViewport(left, right) {
++    if (!left || !right)
++        return false;
++    return left.width === right.width &&
++        left.height === right.height &&
++        left.visualWidth === right.visualWidth &&
++        left.visualHeight === right.visualHeight &&
++        left.visualOffsetLeft === right.visualOffsetLeft &&
++        left.visualOffsetTop === right.visualOffsetTop;
++}
++async function clickTrustedPoint(Runtime, Input, target) {
++    let expectedViewport = target?.viewport;
++    const kind = target?.kind;
++    if (kind !== "composer" && kind !== "send") {
++        throw new BrowserAutomationError("Trusted click target was not identified.", {
++            stage: "submit-prompt",
++            code: "trusted-target-unidentified",
++        });
++    }
++    for (let attempt = 0; attempt < 3; attempt += 1) {
++        const { result } = await Runtime.evaluate({
++            expression: buildTrustedPointExpression(kind),
++            returnByValue: true,
++        });
++        const point = result?.value;
++        if (point?.status !== "point") {
++            throw new BrowserAutomationError(`Trusted ${kind} target failed hit testing (${point?.status ?? "unknown"}).`, {
++                stage: "submit-prompt",
++                code: "trusted-target-mismatch",
++                kind,
++                status: point?.status ?? "unknown",
++            });
++        }
++        if (!sameViewport(expectedViewport, point.viewport)) {
++            expectedViewport = point.viewport;
++            continue;
++        }
++        const x = Number(point.x);
++        const y = Number(point.y);
++        if (!Number.isFinite(x) || !Number.isFinite(y)) {
++            throw new BrowserAutomationError(`Trusted ${kind} target returned invalid coordinates.`, {
++                stage: "submit-prompt",
++                code: "trusted-target-invalid-point",
++                kind,
++            });
++        }
++        if (!Input || typeof Input.dispatchMouseEvent !== "function") {
++            throw new BrowserAutomationError(`Trusted ${kind} target requires CDP pointer input.`, {
++                stage: "submit-prompt",
++                code: "trusted-input-unavailable",
++                kind,
++            });
++        }
++        await Input.dispatchMouseEvent({ type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
++        await Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+         return;
+     }
+-    await Runtime.evaluate({
+-        expression: `(() => {
+-      const el = document.elementFromPoint(${JSON.stringify(x)}, ${JSON.stringify(y)});
+-      if (!(el instanceof HTMLElement)) return false;
+-      el.click();
+-      return true;
+-    })()`,
+-        returnByValue: true,
++    throw new BrowserAutomationError(`Trusted ${kind} target kept moving after a window resize.`, {
++        stage: "submit-prompt",
++        code: "trusted-target-resized",
++        kind,
+     });
+ }
++async function waitForSubmissionStart(Runtime, baselineTurns, timeoutMs) {
++    const deadline = Date.now() + timeoutMs;
++    const baseline = typeof baselineTurns === "number" && Number.isFinite(baselineTurns)
++        ? Math.max(0, Math.floor(baselineTurns))
++        : -1;
++    const expression = `(() => {
++    const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++    const isVisible = (node) => {
++      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++      const rect = node.getBoundingClientRect();
++      return rect.width > 0 && rect.height > 0;
++    };
++    const readValue = (node) => {
++      if (!node) return '';
++      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) return node.value ?? '';
++      return node.innerText ?? node.textContent ?? '';
++    };
++    const inputs = selectors
++      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
++      .filter((node, index, all) => all.indexOf(node) === index && isVisible(node));
++    const composerEmpty = inputs.length > 0 && inputs.every((node) => !String(readValue(node)).trim());
++    const turnsCount = ${buildConversationTurnCountExpression()};
++    const hasNewTurn = ${JSON.stringify(baseline)} >= 0 && turnsCount > ${JSON.stringify(baseline)};
++    const stopVisible = Boolean(document.querySelector(${JSON.stringify(STOP_BUTTON_SELECTOR)}));
++    const inConversation = /\\/c\\//.test(location.href);
++    return { started: composerEmpty || hasNewTurn || stopVisible || inConversation };
++  })()`;
++    while (Date.now() < deadline) {
++        const { result } = await Runtime.evaluate({ expression, returnByValue: true });
++        if (result?.value?.started) {
 +            return true;
 +        }
-+        catch {
-+            // Continue checking legacy and current Chrome cookie locations.
-+        }
++        await delay(100);
 +    }
 +    return false;
 +}
-+async function markCopiedProfileExitedCleanly(profileDir) {
-+    const preferencesPath = path.join(profileDir, "Preferences");
-+    try {
-+        const raw = await readFile(preferencesPath, "utf8");
-+        const preferences = JSON.parse(raw);
-+        preferences.profile ||= {};
-+        preferences.profile.exit_type = "Normal";
-+        preferences.profile.exited_cleanly = true;
-+        await writeFile(preferencesPath, JSON.stringify(preferences));
-+    }
-+    catch {
-+        // The launch flag also suppresses the bubble; a missing or temporarily
-+        // unreadable Preferences file must not make profile copying fail.
-     }
- }
- function resolveChromeProfileDirectory(srcUserDataDir, localState, requestedProfile) {
+ function sendButtonTimeoutMs(attachmentNames, attachmentTimeoutMs) {
+     if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
+         return 20_000;
 diff -ruN a/dist/src/browser/reattach.js b/dist/src/browser/reattach.js
---- a/dist/src/browser/reattach.js	1985-10-26 16:15:00
-+++ b/dist/src/browser/reattach.js	2026-09-06 21:23:50
+--- a/dist/src/browser/reattach.js	2026-09-07 10:09:46
++++ b/dist/src/browser/reattach.js	2026-09-07 10:07:35
 @@ -3,13 +3,14 @@
  import path from "node:path";
  import { mkdtemp, mkdir, rm } from "node:fs/promises";
@@ -1701,3 +1559,231 @@ diff -ruN a/dist/src/browser/reattach.js b/dist/src/browser/reattach.js
 +    createRecoveryCleanup,
 +    createAttachedRuntimeCleanup,
  };
+diff -ruN a/dist/src/browser/profileCopy.js b/dist/src/browser/profileCopy.js
+--- a/dist/src/browser/profileCopy.js	2026-09-07 10:09:46
++++ b/dist/src/browser/profileCopy.js	2026-09-07 10:07:35
+@@ -1,5 +1,5 @@
+ import { spawn } from "node:child_process";
+-import { cp, mkdir, readFile, rm } from "node:fs/promises";
++import { access, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+ import path from "node:path";
+ /**
+  * Cache/derived subdirectories that bloat the copy and carry no signed-in-session
+@@ -52,13 +52,19 @@
+             args.push("--exclude", exclude);
+         }
+         args.push(`${srcProfile}/`, `${destProfile}/`);
+-        await new Promise((resolve, reject) => {
++        const rsyncExitCode = await new Promise((resolve, reject) => {
+             const child = spawn("rsync", args, { stdio: "ignore" });
+             child.on("error", (err) => reject(new Error(`--copy-profile requires rsync on PATH (spawn failed): ${err.message}`)));
+-            child.on("close", (code) => code === 0 || code === 24
+-                ? resolve()
+-                : reject(new Error(`rsync failed copying Chrome profile (exit ${code})`)));
++            child.on("close", (code) => resolve(code));
+         });
++        const partialCopyHasSessionMaterial = rsyncExitCode === 23 && (await hasCopiedCookieDatabase(destProfile));
++        if (rsyncExitCode !== 0 && rsyncExitCode !== 24 && !partialCopyHasSessionMaterial) {
++            throw new Error(`rsync failed copying Chrome profile (exit ${rsyncExitCode})`);
++        }
++        // A live Chrome profile commonly records exit_type=Crashed while it is
++        // running. The throwaway copy must not inherit that stale session marker,
++        // or every Oracle window opens with a misleading restore-pages bubble.
++        await markCopiedProfileExitedCleanly(destProfile);
+         return profileDirectory;
+     }
+     catch (error) {
+@@ -68,6 +74,33 @@
+         throw error;
+     }
+ }
++async function hasCopiedCookieDatabase(profileDir) {
++    for (const relativePath of [path.join("Network", "Cookies"), "Cookies"]) {
++        try {
++            await access(path.join(profileDir, relativePath));
++            return true;
++        }
++        catch {
++            // Continue checking legacy and current Chrome cookie locations.
++        }
++    }
++    return false;
++}
++async function markCopiedProfileExitedCleanly(profileDir) {
++    const preferencesPath = path.join(profileDir, "Preferences");
++    try {
++        const raw = await readFile(preferencesPath, "utf8");
++        const preferences = JSON.parse(raw);
++        preferences.profile ||= {};
++        preferences.profile.exit_type = "Normal";
++        preferences.profile.exited_cleanly = true;
++        await writeFile(preferencesPath, JSON.stringify(preferences));
++    }
++    catch {
++        // The launch flag also suppresses the bubble; a missing or temporarily
++        // unreadable Preferences file must not make profile copying fail.
++    }
++}
+ function resolveChromeProfileDirectory(srcUserDataDir, localState, requestedProfile) {
+     let profile = requestedProfile?.trim();
+     if (!profile) {
+diff -ruN a/dist/src/browser/actions/navigation.js b/dist/src/browser/actions/navigation.js
+--- a/dist/src/browser/actions/navigation.js	2026-09-07 10:09:46
++++ b/dist/src/browser/actions/navigation.js	2026-09-07 10:07:35
+@@ -37,7 +37,17 @@
+ export async function navigateToChatGPT(Page, Runtime, url, logger) {
+     logger(`Navigating to ${url}`);
+     await Page.navigate({ url });
+-    await waitForDocumentReady(Runtime, 45_000);
++    try {
++        await waitForDocumentReady(Runtime, 45_000);
++    }
++    catch (error) {
++        if (typeof Page.reload !== "function") {
++            throw error;
++        }
++        logger("[nav] initial document readiness timed out; reloading the isolated tab once.");
++        await Page.reload({ ignoreCache: false });
++        await waitForDocumentReady(Runtime, 45_000);
++    }
+ }
+ async function dismissBlockingUi(Runtime, logger) {
+     const outcome = await Runtime.evaluate({
+diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
+--- a/dist/src/browser/index.js	2026-09-07 10:09:46
++++ b/dist/src/browser/index.js	2026-09-07 10:32:36
+@@ -80,6 +80,19 @@
+         return false;
+     return options.effectiveKeepBrowser || options.preserveBrowserOnError;
+ }
++async function terminateLocalChromeAfterRun(options) {
++    if (options.connectionClosedUnexpectedly && !options.usingCopiedProfile) {
++        return false;
++    }
++    if (options.terminatedRecordedChrome) {
++        return false;
++    }
++    await options.chrome.kill();
++    return true;
++}
++export async function terminateLocalChromeAfterRunForTest(options) {
++    return terminateLocalChromeAfterRun(options);
++}
+ export function shouldPreserveBrowserOnErrorForTest(error, headless) {
+     return shouldPreserveBrowserOnError(error, headless);
+ }
+@@ -296,6 +309,31 @@
+  * window swallows the click while the automation still believes it clicked.
+  * Soft-fails: focus emulation is an optimization, never a hard requirement.
+  */
++async function stabilizeChromeWindow(client, logger) {
++    const width = 1280;
++    const height = 720;
++    try {
++        const { windowId } = await client.Browser.getWindowForTarget();
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { windowState: "normal" },
++        });
++        await client.Browser.setWindowBounds({
++            windowId,
++            bounds: { width, height },
++        });
++        const observed = await client.Browser.getWindowBounds({ windowId });
++        const bounds = observed?.bounds;
++        if (bounds?.windowState !== "normal" || bounds.width !== width || bounds.height !== height) {
++            throw new Error(`observed ${bounds?.width ?? "?"}x${bounds?.height ?? "?"} (${bounds?.windowState ?? "unknown"})`);
++        }
++        logger(`Chrome window fixed at ${width}x${height}`);
++    }
++    catch (error) {
++        const message = error instanceof Error ? error.message : String(error);
++        throw new Error(`Failed to set stable Chrome window bounds: ${message}`);
++    }
++}
+ async function enableFocusEmulation(client, logger, label) {
+     try {
+         await client.Emulation.setFocusEmulationEnabled({ enabled: true });
+@@ -741,6 +779,9 @@
+             chromePort: chrome.port,
+         });
+     }
++    // Persist the owned runtime before navigation so even an early page-load
++    // failure can be audited and cleaned by exact PID/Profile identity.
++    await emitRuntimeHint();
+     let removeTerminationHooks = null;
+     try {
+         removeTerminationHooks = registerTerminationHooks(chrome, userDataDir, effectiveKeepBrowser, logger, {
+@@ -853,6 +894,7 @@
+             domainEnablers.push(DOM.enable());
+         }
+         await Promise.all(domainEnablers);
++        await stabilizeChromeWindow(client, logger);
+         if (!config.headless && config.hideWindow) {
+             await positionChromeWindowOffscreen(client, logger);
+         }
+@@ -1078,8 +1120,9 @@
+         // Handle thinking time selection if specified. Deep Research owns its own effort flow.
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            await raceWithDisconnect(withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {
+@@ -1107,6 +1150,7 @@
+             await handle.release().catch(() => undefined);
+         };
+         const submitOnce = async (prompt, submissionAttachments) => {
++            await raceWithDisconnect(stabilizeChromeWindow(client, logger));
+             const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+             const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
+             const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
+@@ -1136,7 +1180,9 @@
+                 const perFileTimeout = 20_000;
+                 const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
+                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
+-                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
++                await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentExpectations, logger, {
++                    appearanceConfirmed: !inputOnlyAttachments,
++                });
+                 logger("All attachments uploaded");
+             }
+             if (deepResearch) {
+@@ -1917,15 +1963,16 @@
+         removeDialogHandler?.();
+         removeTerminationHooks?.();
+         if (!keepBrowserOpen) {
+-            if (!connectionClosedUnexpectedly) {
+-                try {
+-                    if (!terminatedRecordedChrome) {
+-                        await chrome.kill();
+-                    }
+-                }
+-                catch {
+-                    // ignore kill failures
+-                }
++            try {
++                await terminateLocalChromeAfterRun({
++                    connectionClosedUnexpectedly,
++                    usingCopiedProfile,
++                    terminatedRecordedChrome,
++                    chrome,
++                });
++            }
++            catch {
++                // ignore kill failures
+             }
+             if (manualLogin) {
+                 const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
+@@ -2397,7 +2444,7 @@
+         const thinkingTime = config.thinkingTime;
+         if (thinkingTime && !deepResearch) {
+             const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
+-            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
++            await withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel, Input), {
+                 retries: 2,
+                 delayMs: 300,
+                 onRetry: (attempt, error) => {

@@ -13,6 +13,7 @@ Use the installed `oracle-web` wrapper from a desktop Codex task to send a focus
 - Use only the repository-supported Oracle runtime version. Do not upgrade or replace it during a consultation.
 - The wrapper copies the configured Chrome profile into a temporary directory and removes that copy after the run. Never inspect or print cookies, credentials, or Profile contents.
 - Every consultation owns one new session, temporary Profile, Chrome process, CDP port, and target. Identify it from that session's recorded `chromePid`, `chromePort`, `chromeTargetId`, and `userDataDir`; never choose a window by title, process name, or creation time.
+- A copied-profile run owns its launched Chrome even if CDP disconnects. The runtime must terminate that exact Chrome and remove the temporary Profile; a disconnect must not leave a recoverable copied-profile browser behind.
 - Runtime identity is persisted immediately after Chrome launch, so navigation failures must still be auditable by the exact recorded PID and temporary Profile.
 - Do not pass `--browser-keep-browser`, `--browser-tab`, `--browser-attach-running`, `--followup`, or `--browser-follow-up`. The wrapper rejects them so a new consultation cannot retain or reuse an old page.
 - The wrapper uses `--browser-model-strategy current`. The model already selected in ChatGPT wins; the requested CLI model is not proof of the web model.
@@ -27,7 +28,7 @@ Use the installed `oracle-web` wrapper from a desktop Codex task to send a focus
 - A visible system Chrome automation window is expected. Do not switch to the desktop app's in-app browser.
 - Prompt insertion and file attachment use CDP text/DOM operations. The runtime uses the visible power control's ARIA state and keyboard events first; pointer events are a verified fallback, not screenshot-coordinate automation.
 - The runtime fixes its owned Chrome window at `1280x720` before critical interaction. If the viewport changes, it discards the old point and re-locates the target. For the composer it searches several points inside the fresh target because attachment cards can cover its center; every accepted point must still pass `elementFromPoint` before pointer input is sent.
-- If attachment UI covers every sampled composer point, the runtime may skip the pointer click only when `document.activeElement` is the exact visible editor or its descendant. It then inserts text through CDP and verifies the composer readback. Empty readback fails closed as `prompt-insertion-unverified`; this exception never applies to the send button or a resized viewport.
+- If attachment UI covers every sampled composer point, the runtime may skip the pointer click only when `document.activeElement` is the exact visible editor or its descendant. It rechecks that focus immediately before CDP text insertion or Enter submission, then verifies the composer readback. Empty readback fails closed as `prompt-insertion-unverified`; this exception never applies to the send button or a resized viewport.
 - Another application covering the Oracle window does not invalidate the DOM target. Do not minimize the Oracle Chrome or keep resizing it during selection/submission; Chrome can throttle or stop compositing, in which case the run must fail closed.
 
 ## Choose consultation strength

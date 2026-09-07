@@ -5,6 +5,8 @@ readonly ORACLE_WEB_COMMON_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}
 readonly ORACLE_WEB_REPO_ROOT="$(CDPATH= cd -- "$ORACLE_WEB_COMMON_DIR/../.." && pwd)"
 readonly ORACLE_WEB_PATCH_FILE="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.patch"
 readonly ORACLE_WEB_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.sha256"
+readonly ORACLE_WEB_38F4BFF_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-38f4bff.patch"
+readonly ORACLE_WEB_38F4BFF_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-38f4bff.sha256"
 readonly ORACLE_WEB_042D57F_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-042d57f.patch"
 readonly ORACLE_WEB_042D57F_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-042d57f.sha256"
 readonly ORACLE_WEB_2FE5969_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-2fe5969.patch"
@@ -145,4 +147,43 @@ oracle_web_default_bin_dir() {
 
 oracle_web_default_state_dir() {
   printf '%s\n' "${ORACLE_WEB_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gpt-oracle-web}"
+}
+
+oracle_web_assert_session_cleanup() {
+  local session_root="$1"
+  local slug="$2"
+  local timeout_seconds="${3:-5}"
+  [[ "$timeout_seconds" =~ ^[0-9]+$ && "$timeout_seconds" -le 60 ]] || \
+    oracle_web_die "cleanup verification timeout must be an integer from 0 to 60 seconds"
+
+  local meta_file="$session_root/sessions/$slug/meta.json"
+  [[ -f "$meta_file" ]] || oracle_web_die "session metadata not found for cleanup verification: $slug"
+
+  local fields chrome_pid user_data_dir
+  fields="$(node -e '
+    const fs = require("node:fs");
+    const meta = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const runtime = meta?.browser?.runtime ?? {};
+    const values = [
+      Number.isInteger(runtime.chromePid) ? String(runtime.chromePid) : "",
+      typeof runtime.userDataDir === "string" ? runtime.userDataDir : "",
+    ];
+    process.stdout.write(values.join("\t"));
+  ' "$meta_file")" || oracle_web_die "could not read session metadata for cleanup verification: $slug"
+  IFS=$'\t' read -r chrome_pid user_data_dir <<< "$fields"
+
+  [[ "$chrome_pid" =~ ^[1-9][0-9]*$ ]] || oracle_web_die "session $slug has no valid recorded Chrome PID"
+  [[ -n "$user_data_dir" ]] || oracle_web_die "session $slug has no recorded temporary Profile"
+
+  local deadline=$((SECONDS + timeout_seconds))
+  while ps -p "$chrome_pid" -o pid= >/dev/null 2>&1 || [[ -e "$user_data_dir" ]]; do
+    if ((SECONDS >= deadline)); then
+      break
+    fi
+    sleep 0.1
+  done
+
+  ! ps -p "$chrome_pid" -o pid= >/dev/null 2>&1 || \
+    oracle_web_die "session $slug left recorded Chrome PID $chrome_pid alive"
+  [[ ! -e "$user_data_dir" ]] || oracle_web_die "session $slug left its temporary Profile behind"
 }

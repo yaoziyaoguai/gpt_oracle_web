@@ -15,6 +15,7 @@ Use the session metadata and concise browser log as evidence. Do not print promp
 - `trusted-target-resized`: the viewport kept changing across three fresh probes. Old coordinates were discarded and no pointer click was sent.
 - `prompt-insertion-unverified`: the runtime used the verified focused composer but could not read the inserted prompt back from the editor. No send action was attempted.
 - `prompt-commit-timeout`: a send action was attempted but no committed user turn appeared. `promptSubmitted=true` is not success.
+- `connection-lost`: CDP disconnected before completion. A copied-profile run is not retained for recovery; verify that its recorded Chrome PID stopped and its temporary Profile was removed.
 
 ## Safe checks
 

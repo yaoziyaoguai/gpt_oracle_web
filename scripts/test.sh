@@ -27,6 +27,15 @@ export ORACLE_WEB_STATE_DIR="$test_root/state"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_38F4BFF_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_38F4BFF_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "38f4bff runtime unexpectedly matched the current manifest"
+[[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_38F4BFF_HASH_MANIFEST")" == "patched" ]] || \
+  oracle_web_die "legacy runtime did not match the 38f4bff manifest"
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_042D57F_UPGRADE_PATCH" >/dev/null
 patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_042D57F_UPGRADE_PATCH" >/dev/null
 [[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
@@ -87,6 +96,51 @@ node -e '
   if (inputAwareCalls.length !== 2) {
     throw new Error(`local and remote thinking-time flows did not both receive CDP Input: ${inputAwareCalls.length}`);
   }
+' "$test_root/package/dist/src/browser/index.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?disconnect-cleanup-test=${Date.now()}`);
+    const terminate = module.terminateLocalChromeAfterRunForTest;
+    if (typeof terminate !== "function") {
+      throw new Error("local Chrome disconnect cleanup is not testable");
+    }
+    const calls = [];
+    const chrome = { kill: async () => calls.push("kill") };
+    if (!await terminate({
+      connectionClosedUnexpectedly: true,
+      usingCopiedProfile: true,
+      terminatedRecordedChrome: false,
+      chrome,
+    }) || calls.length !== 1) {
+      throw new Error("copy-profile Chrome would survive an unexpected CDP disconnect");
+    }
+    if (await terminate({
+      connectionClosedUnexpectedly: true,
+      usingCopiedProfile: false,
+      terminatedRecordedChrome: false,
+      chrome,
+    }) || calls.length !== 1) {
+      throw new Error("persistent Chrome would be terminated after a recoverable disconnect");
+    }
+    if (!await terminate({
+      connectionClosedUnexpectedly: false,
+      usingCopiedProfile: false,
+      terminatedRecordedChrome: false,
+      chrome,
+    }) || calls.length !== 2) {
+      throw new Error("normal local Chrome cleanup was disabled");
+    }
+    if (await terminate({
+      connectionClosedUnexpectedly: false,
+      usingCopiedProfile: true,
+      terminatedRecordedChrome: true,
+      chrome,
+    }) || calls.length !== 2) {
+      throw new Error("an already-terminated recorded Chrome was killed twice");
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/index.js"
 
 node -e '
@@ -532,6 +586,9 @@ node -e '
               y: 30,
             } } };
           }
+          if (fallbackEvaluation === 2) {
+            return { result: { value: true } };
+          }
           return { result: { value: {
             editorText: "probe",
             fallbackValue: "",
@@ -569,6 +626,38 @@ node -e '
       untrustedFocusEvents.length !== 0
     ) {
       throw new Error("an unverified composer focus bypassed trusted pointer validation");
+    }
+
+    const staleFocusEvents = [];
+    let staleFocusEvaluation = 0;
+    let staleFocusError = null;
+    try {
+      await focusFallbackSubmitter({
+        runtime: {
+          evaluate: async () => {
+            staleFocusEvaluation += 1;
+            if (staleFocusEvaluation === 1) {
+              return { result: { value: {
+                focused: true,
+                activeMatches: true,
+                x: 20,
+                y: 30,
+              } } };
+            }
+            return { result: { value: false } };
+          },
+        },
+        input: { insertText: async () => { staleFocusEvents.push("insertText"); } },
+        baselineTurns: 0,
+      }, "probe", () => {});
+    } catch (error) {
+      staleFocusError = error;
+    }
+    if (
+      staleFocusError?.details?.code !== "trusted-target-mismatch" ||
+      staleFocusEvents.length !== 0
+    ) {
+      throw new Error("a stale composer focus reached prompt insertion");
     }
 
     const unreadableEvents = [];
@@ -898,6 +987,7 @@ node -e '
         "ENTER_KEY_EVENT",
         "ENTER_KEY_TEXT",
         "BrowserAutomationError",
+        "hasFocusedVisibleComposer",
         "clickTrustedPoint",
         `${source.slice(enterStart, enterEnd)}; return submitViaEnter;`,
       );
@@ -913,6 +1003,7 @@ node -e '
         { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
         "\\r",
         EnterFallbackError,
+        async () => true,
         async (_runtime, _input, point) => {
           events.push(`mousePressed:${point.x}`);
           events.push(`mouseReleased:${point.x}`);
@@ -985,6 +1076,7 @@ node -e '
         { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
         "\\r",
         EnterFallbackError,
+        async () => true,
         async () => {
           throw new EnterFallbackError("covered composer", {
             stage: "submit-prompt",
@@ -1026,6 +1118,43 @@ node -e '
         untrustedEnterEvents.length !== 0
       ) {
         throw new Error("an unverified Enter focus bypassed trusted pointer validation");
+      }
+
+      const staleEnterEvents = [];
+      const staleSubmitViaEnter = factory(
+        ["#prompt-textarea"],
+        "#prompt-textarea",
+        { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+        "\\r",
+        EnterFallbackError,
+        async () => false,
+        async () => {
+          throw new EnterFallbackError("covered composer", {
+            stage: "submit-prompt",
+            code: "trusted-target-mismatch",
+            kind: "composer",
+          });
+        },
+      );
+      let staleEnterError = null;
+      try {
+        await staleSubmitViaEnter(
+          { evaluate: async () => ({ result: { value: {
+            activeMatches: true,
+            kind: "composer",
+            x: 20,
+            y: 30,
+          } } }) },
+          { dispatchKeyEvent: async ({ type }) => staleEnterEvents.push(type) },
+        );
+      } catch (error) {
+        staleEnterError = error;
+      }
+      if (
+        staleEnterError?.details?.code !== "trusted-target-mismatch" ||
+        staleEnterEvents.length !== 0
+      ) {
+        throw new Error("a stale Enter focus reached keyboard submission");
       }
     })()
     .catch((error) => { console.error(error.message); process.exit(1); });
@@ -1249,6 +1378,48 @@ do
     oracle_web_die "wrapper accepted state-reusing option $forbidden_arg"
   fi
 done
+
+cleanup_state="$test_root/cleanup-state"
+cleanup_slug="completed-cleanup-probe"
+cleanup_profile="$test_root/already-removed-profile"
+mkdir -p "$cleanup_state/sessions/$cleanup_slug"
+node -e '
+  const fs = require("node:fs");
+  fs.writeFileSync(process.argv[1], JSON.stringify({
+    status: "completed",
+    browser: { runtime: {
+      promptSubmitted: true,
+      chromePid: 99999999,
+      chromeTargetId: "target-cleanup-probe",
+      userDataDir: process.argv[2],
+    } },
+  }));
+' "$cleanup_state/sessions/$cleanup_slug/meta.json" "$cleanup_profile"
+oracle_web_assert_session_cleanup "$cleanup_state" "$cleanup_slug" 1
+
+alive_cleanup_slug="alive-cleanup-probe"
+mkdir -p "$cleanup_state/sessions/$alive_cleanup_slug"
+node -e '
+  const fs = require("node:fs");
+  fs.writeFileSync(process.argv[1], JSON.stringify({
+    status: "completed",
+    browser: { runtime: {
+      promptSubmitted: true,
+      chromePid: process.ppid,
+      chromeTargetId: "target-alive-probe",
+      userDataDir: process.argv[2],
+    } },
+  }));
+' "$cleanup_state/sessions/$alive_cleanup_slug/meta.json" "$cleanup_profile"
+if (oracle_web_assert_session_cleanup "$cleanup_state" "$alive_cleanup_slug" 1) \
+  >"$test_root/alive-cleanup.log" 2>&1; then
+  oracle_web_die "session cleanup verification accepted a live recorded Chrome PID"
+fi
+grep -q 'left recorded Chrome PID' "$test_root/alive-cleanup.log" || \
+  oracle_web_die "session cleanup verification did not explain the live Chrome failure"
+
+grep -Fq 'oracle_web_assert_session_cleanup "$session_dir" "$slug"' "$script_dir/live-smoke.sh" || \
+  oracle_web_die "live smoke does not verify its exact session cleanup"
 
 if grep -R -nE '/Users/[[:alnum:]_.-]+/' \
   "$ORACLE_WEB_REPO_ROOT/README.md" \

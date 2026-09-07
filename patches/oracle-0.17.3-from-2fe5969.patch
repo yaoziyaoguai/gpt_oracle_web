@@ -1,6 +1,6 @@
 diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js
-+++ b/dist/src/browser/actions/promptComposer.js
+--- a/dist/src/browser/actions/promptComposer.js	2026-09-07 10:09:46
++++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 10:12:09
 @@ -68,9 +68,13 @@
          candidates.find((node) => isVisible(node)) ||
          candidates[0];
@@ -15,7 +15,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
            kind: 'composer',
            x: rect.left + rect.width / 2,
            y: rect.top + rect.height / 2,
-@@ -95,7 +99,18 @@
+@@ -95,7 +99,21 @@
      }
      const focusPoint = focusResult.result.value;
      if (typeof focusPoint.x === "number" && typeof focusPoint.y === "number") {
@@ -30,12 +30,15 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +                details?.kind !== "composer") {
 +                throw error;
 +            }
++            if (!(await hasFocusedVisibleComposer(runtime))) {
++                throw error;
++            }
 +            logger("Composer pointer target was covered; using verified editor focus");
 +        }
      }
      await input.insertText({ text: prompt });
      // Some pages (notably ChatGPT when subscriptions/widgets load) need a brief settle
-@@ -187,6 +202,14 @@
+@@ -187,6 +205,14 @@
      const observedFallback = postVerification.result?.value?.fallbackValue ?? "";
      const observedActive = postVerification.result?.value?.activeValue ?? "";
      const observedLength = Math.max(observedEditor.length, observedFallback.length, observedActive.length);
@@ -50,7 +53,45 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
          // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
          await logDomFailure(runtime, logger, "prompt-too-large");
-@@ -243,9 +266,13 @@
+@@ -218,6 +244,37 @@
+     // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
+     return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
+ }
++async function hasFocusedVisibleComposer(Runtime) {
++    const result = await Runtime.evaluate({
++        expression: `(() => {
++      const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++      const isVisible = (node) => {
++        if (!node || typeof node.getBoundingClientRect !== 'function') return false;
++        const rect = node.getBoundingClientRect();
++        return rect.width > 0 && rect.height > 0;
++      };
++      const isEditable = (node) =>
++        node instanceof HTMLTextAreaElement ||
++        node instanceof HTMLInputElement ||
++        node.isContentEditable ||
++        node.getAttribute?.('contenteditable') === 'true';
++      const active = document.activeElement;
++      if (!(active instanceof Node)) return false;
++      const primary = document.querySelector(${JSON.stringify(PROMPT_PRIMARY_SELECTOR)});
++      const candidates = [
++        primary,
++        ...selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))),
++      ].filter((node, index, all) => node && all.indexOf(node) === index);
++      return candidates.some((node) =>
++        isVisible(node) &&
++        isEditable(node) &&
++        (node === active || node.contains(active))
++      );
++    })()`,
++        returnByValue: true,
++    });
++    return result.result?.value === true;
++}
+ async function submitViaEnter(Runtime, Input) {
+     const focus = await Runtime.evaluate({
+         expression: `(() => {
+@@ -243,9 +300,13 @@
          candidates.find((node) => isVisible(node) && isEditable(node));
        if (!editor) return null;
        editor.focus?.();
@@ -64,7 +105,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
          x: rect.left + rect.width / 2,
          y: rect.top + rect.height / 2,
          viewport: {
-@@ -262,7 +289,17 @@
+@@ -262,7 +323,20 @@
      });
      const point = focus.result?.value;
      if (point && typeof point.x === "number" && typeof point.y === "number") {
@@ -79,11 +120,14 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +                details?.kind !== "composer") {
 +                throw error;
 +            }
++            if (!(await hasFocusedVisibleComposer(Runtime))) {
++                throw error;
++            }
 +        }
      }
      await Input.dispatchKeyEvent({
          type: "keyDown",
-@@ -808,9 +845,6 @@
+@@ -808,9 +882,6 @@
        }
        if (!target) return { status: 'missing', kind };
        const rect = target.getBoundingClientRect();
@@ -93,7 +137,7 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
        const viewport = {
          width: window.innerWidth,
          height: window.innerHeight,
-@@ -819,10 +853,24 @@
+@@ -819,10 +890,24 @@
          visualOffsetLeft: window.visualViewport?.offsetLeft ?? 0,
          visualOffsetTop: window.visualViewport?.offsetTop ?? 0,
        };
@@ -121,3 +165,54 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      })()`;
  }
  function sameViewport(left, right) {
+diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
+--- a/dist/src/browser/index.js	2026-09-07 10:08:44
++++ b/dist/src/browser/index.js	2026-09-07 10:32:36
+@@ -79,7 +79,20 @@
+     if (options.usingCopiedProfile)
+         return false;
+     return options.effectiveKeepBrowser || options.preserveBrowserOnError;
++}
++async function terminateLocalChromeAfterRun(options) {
++    if (options.connectionClosedUnexpectedly && !options.usingCopiedProfile) {
++        return false;
++    }
++    if (options.terminatedRecordedChrome) {
++        return false;
++    }
++    await options.chrome.kill();
++    return true;
+ }
++export async function terminateLocalChromeAfterRunForTest(options) {
++    return terminateLocalChromeAfterRun(options);
++}
+ export function shouldPreserveBrowserOnErrorForTest(error, headless) {
+     return shouldPreserveBrowserOnError(error, headless);
+ }
+@@ -1950,16 +1963,17 @@
+         removeDialogHandler?.();
+         removeTerminationHooks?.();
+         if (!keepBrowserOpen) {
+-            if (!connectionClosedUnexpectedly) {
+-                try {
+-                    if (!terminatedRecordedChrome) {
+-                        await chrome.kill();
+-                    }
+-                }
+-                catch {
+-                    // ignore kill failures
+-                }
++            try {
++                await terminateLocalChromeAfterRun({
++                    connectionClosedUnexpectedly,
++                    usingCopiedProfile,
++                    terminatedRecordedChrome,
++                    chrome,
++                });
+             }
++            catch {
++                // ignore kill failures
++            }
+             if (manualLogin) {
+                 const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
+                     connectionClosedUnexpectedly,
