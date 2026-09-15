@@ -1,11 +1,11 @@
 ---
 name: oracle-web
-description: Use the verified oracle-web wrapper from desktop Codex for adaptive-strength external planning, audit, or a second opinion through the user's signed-in Chrome. Apply when the user requests Oracle or a difficult task benefits from independent analysis; do not use for routine edits that Codex can handle directly.
+description: Use the verified oracle-web wrapper from Claude Code for adaptive-strength external planning, audit, or a second opinion through the user's signed-in Chrome. Apply when the user requests Oracle or a difficult task benefits from independent analysis; do not use for routine edits that Claude Code can handle directly.
 ---
 
 # Oracle Web
 
-Use the installed `oracle-web` wrapper from a desktop Codex task to send a focused prompt and selected files to ChatGPT through a temporary copy of the user's signed-in Chrome profile. Oracle is advisory: the current Codex validates the response, implements authorized changes, and runs verification.
+Use the installed `oracle-web` wrapper from Claude Code to send a focused prompt and selected files to ChatGPT through a temporary copy of the user's signed-in Chrome profile. Oracle is advisory: the current Claude Code session validates the response, implements authorized changes, and runs verification.
 
 ## Invariants
 
@@ -28,7 +28,7 @@ Use the installed `oracle-web` wrapper from a desktop Codex task to send a focus
 - The wrapper defaults attachment readiness waits to 300 seconds. A caller may explicitly override `--browser-attachment-timeout` for a known environment.
 - The wrapper defaults the whole browser run to one 45-minute deadline. Submission, answer capture, and recheck share that deadline; a completed answer ends the run early.
 - Never race the wrapper with a manual or system-level click. A delayed successful click could otherwise submit twice.
-- A visible system Chrome automation window is expected. Do not switch to the desktop app's in-app browser.
+- A visible system Chrome automation window is expected. Do not attach Claude in Chrome or another browser controller to that window.
 - Prompt insertion and file attachment use CDP text/DOM operations. The runtime uses the visible power control's ARIA state and keyboard events first; pointer events are a verified fallback, not screenshot-coordinate automation.
 - The runtime fixes its owned Chrome window at `1280x720` before critical interaction. If the viewport changes, it discards the old point and re-locates the target. For the composer it searches several points inside the fresh target because attachment cards can cover its center; every accepted point must still pass `elementFromPoint` before pointer input is sent.
 - If attachment UI covers every sampled composer point, the runtime may skip the pointer click only when `document.activeElement` is the exact visible editor or its descendant. It rechecks that focus immediately before CDP text insertion or Enter submission, then verifies the composer readback. Empty readback fails closed as `prompt-insertion-unverified`; this exception never applies to the send button or a resized viewport.
@@ -47,7 +47,7 @@ Do not choose position 5 merely because the prompt is long. Before sending, tell
 ## Workflow
 
 1. Define the exact question and choose the smallest evidence-bearing file set.
-2. Write a self-contained prompt with project context, constraints, observed errors, prior attempts, desired output, and realistic Codex execution capabilities. For implementation recommendations, read [references/execution-advice.md](references/execution-advice.md).
+2. Write a self-contained prompt with project context, constraints, observed errors, prior attempts, desired output, and realistic Claude Code execution capabilities. For implementation recommendations, read [references/execution-advice.md](references/execution-advice.md).
 3. Verify the installed wrapper and configured Chrome Profile without opening ChatGPT or reading cookie contents:
 
 ```bash
@@ -91,7 +91,7 @@ Reduce the file set before splitting. If independent batches are still necessary
 - Give every batch a unique slug and a new ChatGPT conversation.
 - Make every prompt self-contained with `Batch: <index>/<total>`, scope, exclusions, exact question, and expected output.
 - Do not use `--followup`, `--browser-follow-up`, `--browser-tab`, or a saved conversation URL to carry a separate batch.
-- Run browser consultations serially. Let the current Codex synthesize results only after all batches finish.
+- Run browser consultations serially. Let the current Claude Code session synthesize results after all batches finish.
 - Recover only the exact submitted batch that timed out; never attach new material to another batch's session.
 
 ## Recovery
@@ -102,8 +102,7 @@ After confirmed selection and submission, recover the same session rather than s
 oracle session "<session-id>" --render
 ```
 
-Use the same `ORACLE_HOME_DIR` configured by the wrapper when invoking the upstream recovery command directly.
-Recovery is valid only for a committed prompt whose answer capture timed out. It must target that exact session ID; when capture ends, the patched runtime closes the owned temporary Chrome and removes its temporary Profile.
+Use the same `ORACLE_HOME_DIR` configured by the wrapper when invoking the upstream recovery command directly. Recovery is valid only for a committed prompt whose answer capture timed out. It must target that exact session ID; when capture ends, the patched runtime closes the owned temporary Chrome and removes its temporary Profile.
 
 ## File safety
 

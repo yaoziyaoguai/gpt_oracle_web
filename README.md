@@ -1,18 +1,18 @@
 # gpt-oracle-web
 
-一个面向 Codex Desktop 的可安装 Skill：通过用户已经登录的 Chrome，把复杂规划、代码审查、根因分析和第二意见交给 ChatGPT 网页端，再由当前 Codex 负责实现与验证。
+一个面向 Codex Desktop 和 Claude Code 的可安装 Skill：通过用户已经登录的 Chrome，把复杂规划、代码审查、根因分析和第二意见交给 ChatGPT 网页端，再由当前编程 Agent 负责实现与验证。
 
-> English summary: an installable Codex Skill and a verified browser wrapper for high-effort ChatGPT consultations. It keeps the current Codex in charge of implementation, pins the supported Oracle runtime, and fails closed when the web UI cannot prove the selected effort or submitted message.
+> English summary: installable Codex Desktop and Claude Code Skills plus a verified browser wrapper for high-effort ChatGPT consultations. The current coding agent remains in charge of implementation while the wrapper pins the supported Oracle runtime and fails closed when the web UI cannot prove the selected effort or submitted message.
 
 ## 为什么有这个项目
 
-上游 [Oracle](https://github.com/steipete/oracle) 已经提供了把 prompt 和文件送入模型的 CLI。本项目不重写 Oracle，也不提供新的模型；它补的是 Codex Desktop 与 ChatGPT 网页之间缺少的“可靠工作流”层：
+上游 [Oracle](https://github.com/steipete/oracle) 已经提供了把 prompt 和文件送入模型的 CLI。本项目不重写 Oracle，也不提供新的模型；它补的是编程 Agent 与 ChatGPT 网页之间缺少的“可靠工作流”层：
 
 - 根据任务复杂度在网页五档强度中的第 4、5 档之间自动选择。
 - 只相信网页实际显示的标签和位置，不把 CLI 请求值冒充为网页模型证据。
 - 强度无法确认时 fail closed，禁止静默降级后继续发送。
 - 页面首次未进入 ready state 时，只在同一个隔离 tab 内做一次有界 reload；仍不可验证就 fail closed。
-- 把网页版限定为 planner/reviewer，把实现、测试和最终判断留给当前 Codex。
+- 把网页版限定为 planner/reviewer，把实现、测试和最终判断留给当前 Codex Desktop 或 Claude Code 会话。
 - 隔离多批咨询，避免把第二批材料串进第一批会话。
 - 修复附件已完成却被误判为仍在上传的问题。
 - 修复网页附件卡片不显示本地文件名时，普通附件和多文件自动合包被误判为附件缺失的问题。
@@ -37,14 +37,14 @@
 
 - 不是 OpenAI、ChatGPT、Chrome 或上游 Oracle 的官方项目。
 - 不是新的模型、API 代理或绕过订阅限制的工具。
-- 不会让正在运行的 Codex 主任务原地切换模型或 reasoning effort。
-- 不会自动执行 Oracle 的建议；当前 Codex 仍需检查范围、安全性和代码证据。
+- 不会让正在运行的 Codex 或 Claude Code 主任务原地切换模型或 reasoning effort。
+- 不会自动执行 Oracle 的建议；当前编程 Agent 仍需检查范围、安全性和代码证据。
 - 不保证 ChatGPT 网页内部实际使用了某个不可见的后端模型。
 
 ## 工作方式
 
 ```text
-Codex Desktop
+Codex Desktop / Claude Code
   │
   │ 读取 oracle-web Skill，选择第 4 或第 5 档
   ▼
@@ -56,7 +56,7 @@ patched @steipete/oracle 0.17.3
   │ 启动即记录 Chrome PID / CDP port / target ID / userDataDir
   │ 验证五档强度、附件状态、发送动作和 committed turn
   ▼
-ChatGPT Web ──返回规划/审查/执行建议──▶ 当前 Codex 实现并验证
+ChatGPT Web ──返回规划/审查/执行建议──▶ 当前编程 Agent 实现并验证
   │
   └── finally：关闭本次 Chrome，删除本次临时 Profile
 ```
@@ -88,9 +88,15 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 │   └── references/
 │       ├── execution-advice.md            Oracle 输出给 Codex 的建议格式
 │       └── troubleshooting.md             fail-closed 故障解释
+├── skill/claude-code/oracle-web/
+│   ├── SKILL.md                           Claude Code 全局 Skill 入口
+│   └── references/
+│       ├── execution-advice.md            Oracle 输出给 Claude Code 的建议格式
+│       └── troubleshooting.md             与 Codex 入口共用的故障合同
 ├── patches/
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
+│   ├── oracle-0.17.3-npm.sha256           npm 发行包的原始/修改后校验和
 │   ├── oracle-0.17.3-from-f86c4fc.patch   上一受管版本到当前版本的增量 patch
 │   ├── oracle-0.17.3-f86c4fc.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-38f4bff.patch   上一受管版本到当前版本的增量 patch
@@ -118,13 +124,14 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 
 - macOS。
 - Codex Desktop。
+- Claude Code（需支持全局 `~/.claude/skills`；已在 2.1.266 验证）。
 - Google Chrome，且目标 Profile 已登录 ChatGPT。
 - `@steipete/oracle` **准确版本 `0.17.3`**。
 - Node.js 24 或更高版本，这是上游 `0.17.3` 的要求。
 - 当前 ChatGPT 五档 power control；Oracle 咨询只使用第 4、5 档。
 - `bash`、`patch`、`rsync` 和 `shasum`。
 
-安装器不会下载、安装或升级 Oracle。如果版本、文件内容或 patch anchor 不符合预期，它会停止，不会覆盖未知 runtime。
+安装器不会下载、安装或升级 Oracle。Homebrew 与 npm 的 `0.17.3` 在一个 Chrome 启动参数上存在已知差异，两种发行基线各有精确 hash manifest。其他版本、文件内容或 patch anchor 不符合预期时，安装会停止，不会覆盖未知 runtime。
 
 ## 安装前准备
 
@@ -161,6 +168,14 @@ cd gpt_oracle_web
 - 安装回执：`${XDG_STATE_HOME:-$HOME/.local/state}/gpt-oracle-web/install-receipt.tsv`
 - Oracle session：`${XDG_STATE_HOME:-$HOME/.local/state}/oracle-web`
 
+需要同时安装 Claude Code 全局 Skill 时，显式传入 Claude home：
+
+```bash
+./scripts/install.sh --claude-home "$HOME/.claude"
+```
+
+该参数会把 Claude Code 入口安装到 `$HOME/.claude/skills/oracle-web`。Wrapper 和 Runtime 与 Codex 入口共用，不启动第二套浏览器服务。
+
 如果 `$HOME/.local/bin` 不在 `PATH`：
 
 ```bash
@@ -187,6 +202,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ./scripts/install.sh \
   --oracle-root "/path/to/@steipete/oracle" \
   --codex-home "/path/to/codex-home" \
+  --claude-home "/path/to/claude-home" \
   --bin-dir "/path/to/bin" \
   --state-dir "/path/to/state"
 ```
@@ -198,6 +214,7 @@ export PATH="$HOME/.local/bin:$PATH"
 | `ORACLE_WEB_ORACLE_ROOT` | 上游 npm package 根目录，必须含 `package.json` |
 | `ORACLE_WEB_ORACLE_BIN` | wrapper 实际执行的上游 `oracle` |
 | `ORACLE_WEB_CODEX_HOME` | 安装 Skill 的 Codex home |
+| `ORACLE_WEB_CLAUDE_HOME` | 可选；安装全局 Skill 的 Claude Code home |
 | `ORACLE_WEB_BIN_DIR` | 安装 wrapper 的目录 |
 | `ORACLE_WEB_STATE_DIR` | 安装回执目录 |
 
@@ -241,9 +258,25 @@ Skill 会自动判断：
 
 网页标签可能随语言变化，因此日志必须同时证明位置。即使 CLI 输出 `requested=gpt-5.6-sol`，也不能据此声称网页实际选中了 GPT-5.6 Sol。
 
+## 在 Claude Code 中使用
+
+安装后可显式调用：
+
+```text
+/oracle-web 审查这个复杂任务。选择支撑结论的文件，让网页返回规划、风险和执行建议，再由当前 Claude Code 会话实现并测试。
+```
+
+Claude Code 与 Codex 使用同一套档位、提交、会话身份和清理规则。两个宿主的差异只在实现建议格式和 subagent 能力描述。
+
 ## 直接使用 wrapper
 
-先预检；预检不会打开 ChatGPT，也不会上传文件：
+先检查 wrapper 和 Chrome Profile 配置；该检查不会启动 Chrome、读取 Cookie 内容或验证登录状态：
+
+```bash
+oracle-web --doctor
+```
+
+再预检材料；预检不会打开 ChatGPT，也不会上传文件：
 
 ```bash
 oracle-web --dry-run summary --files-report \
@@ -263,18 +296,18 @@ oracle-web --timeout 45m --browser-timeout 45m \
   --file "src/recovery/**"
 ```
 
-每次独立咨询都应使用新的 slug。wrapper 会拒绝 `--browser-keep-browser`、`--browser-tab`、`--browser-attach-running`、`--followup` 和 `--browser-follow-up`，防止保留或复用旧网页。已确认提交后若只差回答捕获，按 Skill 使用上游 `oracle session <session-id>` 恢复同一会话；恢复完成也会清理它拥有的临时 Chrome。
+每次独立咨询都应使用新的 slug。wrapper 会拒绝浏览器 Profile、copy-profile、manual-login、cookie、`--browser-keep-browser`、`--browser-tab`、`--browser-attach-running`、`--followup` 和 `--browser-follow-up` 参数，防止调用方覆盖 wrapper 的浏览器身份或复用旧网页。需要更换 Chrome Profile 时只设置 `ORACLE_WEB_CHROME_USER_DATA_DIR` 与 `ORACLE_WEB_CHROME_PROFILE`，并先用 `--doctor` 核对。已确认提交后若只差回答捕获，按 Skill 使用上游 `oracle session <session-id>` 恢复同一会话；恢复完成也会清理它拥有的临时 Chrome。
 
-## 强度、模型与 subagent 的边界
+## 强度、宿主模型与 subagent 的边界
 
-`oracle-web` 能调整的是外部 ChatGPT 咨询强度，不能改变已经运行中的 Codex 主任务。Oracle 可以建议后续实现使用哪个 Codex 模型、reasoning effort 或可选 subagent，但这些只是建议：
+`oracle-web` 能调整的是外部 ChatGPT 咨询强度，不能改变运行中的 Codex 或 Claude Code 主任务。Oracle 可以建议后续实现使用的模型、reasoning effort 或可选 subagent，但这些只是建议：
 
-- 当前 Codex 必须检查建议是否可用、必要且在授权范围内。
+- 当前宿主必须检查建议是否可用、必要且在授权范围内。
 - 不需要不同上下文或独立审查时，`optional_subagents` 应为空。
 - 如果启动 implement subagent，必须限定文件或模块所有权。
-- 当前 Codex 始终负责合并、回归测试和最终报告。
+- 当前宿主始终负责合并、回归测试和最终报告。
 
-输出契约见 [`skill/oracle-web/references/execution-advice.md`](skill/oracle-web/references/execution-advice.md)。
+Codex 输出契约见 [`skill/oracle-web/references/execution-advice.md`](skill/oracle-web/references/execution-advice.md)；Claude Code 输出契约见 [`skill/claude-code/oracle-web/references/execution-advice.md`](skill/claude-code/oracle-web/references/execution-advice.md)。
 
 ## 多批咨询与防串线
 
@@ -338,6 +371,12 @@ oracle-web --timeout 45m --browser-timeout 45m \
 ./scripts/verify.sh
 ```
 
+同时验证 Claude Code 全局 Skill：
+
+```bash
+./scripts/verify.sh --claude-home "$HOME/.claude"
+```
+
 运行完整离线测试：
 
 ```bash
@@ -348,6 +387,8 @@ oracle-web --timeout 45m --browser-timeout 45m \
 
 - 下载准确版本 `@steipete/oracle@0.17.3` 到临时目录，或使用 `ORACLE_TEST_PACKAGE_ROOT` 指定的副本。
 - 安装 patch、wrapper 和 Skill。
+- 从 npm 发行基线安装、验证、卸载，并确认原始 hash 恢复。
+- 校验 Codex Desktop 与 Claude Code 两个 Skill 入口，并防止共用故障合同发生偏移。
 - 模拟双编辑器 DOM，确认写入和 Enter 始终落在真实 `#prompt-textarea`。
 - 验证窗口尺寸变化后旧坐标不会收到 pointer 事件，重新定位成功后只点击新坐标。
 - 验证 `elementFromPoint` 与预期目标不一致时不点击，且判断不依赖 `document.visibilityState`。
@@ -413,12 +454,18 @@ git pull --ff-only
 
 安装器为受管提交 `2fe5969` 提供精确迁移，用于升级已经包含无文件名附件修复的安装。
 
-Skill 安装到 Codex home 后，已有 Codex 任务在下一次调用 `oracle-web` 时读取当前安装版本。正在执行的咨询不会中途热更新；让该次运行结束，再发起一次新调用即可。
+Skill 安装到 Codex 或 Claude Code home 后，已有任务在下一次调用 `oracle-web` 时读取当前安装版本。正在执行的咨询不会中途热更新；让该次运行结束，再发起一次新调用即可。
 
 ## 卸载与回滚
 
 ```bash
 ./scripts/uninstall.sh
+```
+
+安装过 Claude Code 全局 Skill 时，卸载也要传入同一个 home：
+
+```bash
+./scripts/uninstall.sh --claude-home "$HOME/.claude"
 ```
 
 卸载器会：
@@ -427,7 +474,7 @@ Skill 安装到 Codex home 后，已有 Codex 任务在下一次调用 `oracle-w
 - 仅删除仍与仓库版本相同的 wrapper 和 Skill 文件。
 - 遇到未知 runtime 或用户改过的托管文件时会在修改 runtime 之前停止，避免半卸载；不会盲目覆盖。
 
-自定义安装路径时，卸载应传入相同的 `--oracle-root`、`--codex-home`、`--bin-dir` 和 `--state-dir`。只有明确检查并接受覆盖时才使用 `--force`。
+自定义安装路径时，卸载应传入相同的 `--oracle-root`、`--codex-home`、`--claude-home`、`--bin-dir` 和 `--state-dir`。只有明确检查并接受覆盖时才使用 `--force`。
 
 ## 开发与贡献
 

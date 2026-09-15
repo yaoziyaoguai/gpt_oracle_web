@@ -15,17 +15,38 @@ else
     cd "$test_root"
     npm pack --silent "@steipete/oracle@$ORACLE_WEB_SUPPORTED_VERSION" >/dev/null
     tar -xzf "steipete-oracle-$ORACLE_WEB_SUPPORTED_VERSION.tgz"
+    cd package
+    npm install --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null
   )
 fi
 
 export ORACLE_WEB_ORACLE_ROOT="$test_root/package"
 export ORACLE_WEB_CODEX_HOME="$test_root/codex-home"
+export ORACLE_WEB_CLAUDE_HOME="$test_root/claude-home"
 export ORACLE_WEB_BIN_DIR="$test_root/bin"
 export ORACLE_WEB_STATE_DIR="$test_root/state"
 
 "$script_dir/install.sh" --force
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
+
+if [[ "$(oracle_web_current_manifest "$test_root/package")" == "$ORACLE_WEB_NPM_HASH_MANIFEST" ]]; then
+  "$script_dir/uninstall.sh"
+  node -e '
+    const fs = require("node:fs");
+    const path = process.argv[1];
+    const source = fs.readFileSync(path, "utf8");
+    const anchor = `        "--disable-hang-monitor",\n`;
+    if (source.split(anchor).length !== 2) {
+      throw new Error("npm fixture Chrome flag anchor was not unique");
+    }
+    fs.writeFileSync(path, source.replace(anchor, `${anchor}        "--hide-crash-restore-bubble",\n`));
+  ' "$test_root/package/dist/src/browser/chromeLifecycle.js"
+  [[ "$(oracle_web_patch_state "$test_root/package")" == "pristine" ]] || \
+    oracle_web_die "npm fixture normalization did not reach the Homebrew pristine manifest"
+  "$script_dir/install.sh"
+  "$script_dir/verify.sh"
+fi
 
 patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F86C4FC_UPGRADE_PATCH" >/dev/null
 patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_F86C4FC_UPGRADE_PATCH" >/dev/null
@@ -1474,6 +1495,28 @@ printf 'ARG=%s\n' "$@"
 SCRIPT
 chmod 0755 "$fake_oracle"
 
+mkdir -p "$test_root/chrome/Profile 2/Network"
+printf '%s\n' '{}' > "$test_root/chrome/Local State"
+printf '%s\n' 'placeholder' > "$test_root/chrome/Profile 2/Network/Cookies"
+
+doctor_output="$(
+  ORACLE_WEB_ORACLE_BIN="$fake_oracle" \
+  ORACLE_WEB_CHROME_USER_DATA_DIR="$test_root/chrome" \
+  ORACLE_WEB_CHROME_PROFILE="Profile 2" \
+  "$test_root/bin/oracle-web" --doctor
+)"
+grep -Fq "wrapper=$test_root/bin/oracle-web" <<< "$doctor_output"
+grep -Fq "chromeUserDataDir=$test_root/chrome" <<< "$doctor_output"
+grep -Fq 'chromeProfile=Profile 2' <<< "$doctor_output"
+grep -Fq 'cookieDb=Network/Cookies' <<< "$doctor_output"
+grep -Fq 'loginState=not-tested' <<< "$doctor_output"
+
+if ORACLE_WEB_ORACLE_BIN="$fake_oracle" \
+  ORACLE_WEB_CHROME_USER_DATA_DIR="$test_root/missing-chrome" \
+  "$test_root/bin/oracle-web" --doctor >"$test_root/doctor-failure.log" 2>&1; then
+  oracle_web_die "wrapper doctor accepted a missing Chrome profile"
+fi
+
 wrapper_output="$(
   ORACLE_WEB_ORACLE_BIN="$fake_oracle" \
   ORACLE_WEB_SESSION_DIR="$test_root/sessions" \
@@ -1537,6 +1580,11 @@ for forbidden_arg in \
   --browser-keep-browser \
   --browser-tab=current \
   --browser-attach-running \
+  --browser-chrome-profile=Default \
+  --copy-profile="$test_root/chrome" \
+  --browser-manual-login \
+  --browser-cookie-path="$test_root/chrome/Profile 2/Cookies" \
+  --browser-inline-cookies='[]' \
   --followup=old-session \
   --browser-follow-up=next
 do
@@ -1624,6 +1672,8 @@ fi
 [[ ! -e "$test_root/bin/oracle-web" ]] || oracle_web_die "uninstall left the wrapper behind"
 [[ ! -e "$test_root/codex-home/skills/oracle-web/SKILL.md" ]] || \
   oracle_web_die "uninstall left managed Skill files behind"
+[[ ! -e "$test_root/claude-home/skills/oracle-web/SKILL.md" ]] || \
+  oracle_web_die "uninstall left managed Claude Skill files behind"
 
 mkdir -p "$test_root/bin"
 printf '%s\n' '#!/usr/bin/env bash' 'echo user-owned wrapper' > "$test_root/bin/oracle-web"
@@ -1634,6 +1684,16 @@ fi
 [[ "$(oracle_web_patch_state "$test_root/package")" == "pristine" ]] || \
   oracle_web_die "installer modified runtime before reporting a destination conflict"
 rm -f "$test_root/bin/oracle-web"
+
+mkdir -p "$test_root/claude-home/skills/oracle-web"
+printf '%s\n' 'user-owned Claude Skill' > "$test_root/claude-home/skills/oracle-web/SKILL.md"
+if "$script_dir/install.sh" >"$test_root/claude-conflict.log" 2>&1; then
+  oracle_web_die "installer overwrote a conflicting Claude Skill without --force"
+fi
+[[ "$(oracle_web_patch_state "$test_root/package")" == "pristine" ]] || \
+  oracle_web_die "installer modified runtime before reporting a Claude Skill conflict"
+rm -f "$test_root/claude-home/skills/oracle-web/SKILL.md"
+rmdir "$test_root/claude-home/skills/oracle-web" 2>/dev/null || true
 
 printf '%s\n' '// unknown local drift' >> "$test_root/package/dist/src/browser/actions/attachments.js"
 if "$script_dir/install.sh" --force >"$test_root/drift.log" 2>&1; then

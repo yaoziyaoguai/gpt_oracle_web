@@ -21,6 +21,48 @@ chrome_profile="${ORACLE_WEB_CHROME_PROFILE:-Default}"
 requested_model="${ORACLE_WEB_REQUEST_MODEL:-gpt-5.6-sol}"
 session_retention_hours="${ORACLE_WEB_SESSION_RETENTION_HOURS:-24}"
 
+if [[ "${1:-}" == "--doctor" ]]; then
+  [[ "$#" -eq 1 ]] || {
+    echo "oracle-web: --doctor does not accept consultation arguments." >&2
+    exit 64
+  }
+
+  wrapper_path="${BASH_SOURCE[0]}"
+  if [[ "$wrapper_path" != /* ]]; then
+    wrapper_path="$(CDPATH= cd -- "$(dirname -- "$wrapper_path")" && pwd -P)/$(basename -- "$wrapper_path")"
+  fi
+
+  doctor_status=0
+  profile_dir="$chrome_user_data_dir/$chrome_profile"
+  cookie_db="missing"
+  if [[ -f "$profile_dir/Network/Cookies" ]]; then
+    cookie_db="Network/Cookies"
+  elif [[ -f "$profile_dir/Cookies" ]]; then
+    cookie_db="Cookies"
+  fi
+
+  [[ -d "$chrome_user_data_dir" ]] || doctor_status=1
+  [[ -f "$chrome_user_data_dir/Local State" ]] || doctor_status=1
+  [[ -d "$profile_dir" ]] || doctor_status=1
+  [[ "$cookie_db" != "missing" ]] || doctor_status=1
+
+  printf '%s\n' \
+    "oracle-web doctor" \
+    "wrapper=$wrapper_path" \
+    "oracle=$oracle_bin" \
+    "chromeUserDataDir=$chrome_user_data_dir" \
+    "chromeProfile=$chrome_profile" \
+    "profileDir=$profile_dir" \
+    "cookieDb=$cookie_db" \
+    "loginState=not-tested"
+
+  if [[ "$doctor_status" -ne 0 ]]; then
+    echo "oracle-web: doctor failed; the configured Chrome profile is incomplete or unavailable." >&2
+    exit 78
+  fi
+  exit 0
+fi
+
 thinking_time_configured=false
 attachment_timeout_configured=false
 retention_configured=false
@@ -31,9 +73,17 @@ for argument in "$@"; do
     --browser-keep-browser|--browser-keep-browser=*|\
     --browser-tab|--browser-tab=*|\
     --browser-attach-running|--browser-attach-running=*|\
+    --browser-chrome-profile|--browser-chrome-profile=*|\
+    --copy-profile|--copy-profile=*|\
+    --browser-manual-login|--browser-manual-login=*|\
+    --browser-manual-login-profile-dir|--browser-manual-login-profile-dir=*|\
+    --browser-manual-login-cookie-sync|--browser-manual-login-cookie-sync=*|\
+    --browser-cookie-path|--browser-cookie-path=*|\
+    --browser-inline-cookies|--browser-inline-cookies=*|\
+    --browser-inline-cookies-file|--browser-inline-cookies-file=*|\
     --followup|--followup=*|\
     --browser-follow-up|--browser-follow-up=*)
-      echo "oracle-web: $argument reuses or preserves browser state; start a fresh consultation instead." >&2
+      echo "oracle-web: $argument overrides wrapper-owned browser identity or state; configure the wrapper environment instead." >&2
       exit 64
       ;;
     --browser-thinking-time|--browser-thinking-time=*)

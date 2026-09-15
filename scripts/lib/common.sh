@@ -5,6 +5,7 @@ readonly ORACLE_WEB_COMMON_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}
 readonly ORACLE_WEB_REPO_ROOT="$(CDPATH= cd -- "$ORACLE_WEB_COMMON_DIR/../.." && pwd)"
 readonly ORACLE_WEB_PATCH_FILE="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.patch"
 readonly ORACLE_WEB_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3.sha256"
+readonly ORACLE_WEB_NPM_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-npm.sha256"
 readonly ORACLE_WEB_F86C4FC_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-f86c4fc.patch"
 readonly ORACLE_WEB_F86C4FC_HASH_MANIFEST="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-f86c4fc.sha256"
 readonly ORACLE_WEB_38F4BFF_UPGRADE_PATCH="$ORACLE_WEB_REPO_ROOT/patches/oracle-0.17.3-from-38f4bff.patch"
@@ -137,6 +138,20 @@ oracle_web_patch_state() {
   else
     printf '%s\n' "mixed"
   fi
+}
+
+oracle_web_current_manifest() {
+  local oracle_root="$1"
+  local manifest state
+  for manifest in "$ORACLE_WEB_HASH_MANIFEST" "$ORACLE_WEB_NPM_HASH_MANIFEST"; do
+    [[ -f "$manifest" ]] || continue
+    state="$(oracle_web_patch_state "$oracle_root" "$manifest")"
+    if [[ "$state" == "pristine" || "$state" == "patched" ]]; then
+      printf '%s\n' "$manifest"
+      return
+    fi
+  done
+  printf '%s\n' "$ORACLE_WEB_HASH_MANIFEST"
 }
 
 oracle_web_default_codex_home() {
