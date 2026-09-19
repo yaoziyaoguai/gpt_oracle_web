@@ -1,6 +1,5 @@
-diff -ruN a/dist/src/browser/actions/assistantResponse.js b/dist/src/browser/actions/assistantResponse.js
---- a/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/actions/assistantResponse.js	2026-09-07 15:09:02
+--- a/dist/src/browser/actions/assistantResponse.js
++++ b/dist/src/browser/actions/assistantResponse.js
 @@ -15,6 +15,7 @@
  const TERMINAL_GATE_CONFIG = {
      barConfirmCycles: readPositiveIntEnv("ORACLE_BAR_CONFIRM_CYCLES", 3),
@@ -30,9 +29,99 @@ diff -ruN a/dist/src/browser/actions/assistantResponse.js b/dist/src/browser/act
      }
      return { state: next, terminal };
  }
-diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/actions/promptComposer.js
---- a/dist/src/browser/actions/promptComposer.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/actions/promptComposer.js	2026-09-07 15:03:25
+--- a/dist/src/browser/actions/navigation.js
++++ b/dist/src/browser/actions/navigation.js
+@@ -334,6 +334,9 @@
+         return;
+     }
+     const welcomeBack = await attemptWelcomeBackLogin(Runtime, logger, preferredChatGptAccountEmail());
++    // The final failure report must describe the most recent probe: after a failed
++    // Welcome back retry, the pre-click probe is stale evidence.
++    let failureProbe = probe;
+     if (welcomeBack.accepted) {
+         // Learned: "Welcome back" account picker needs a click even when cookies are valid,
+         // and the redirect can lag, so re-probe before failing hard.
+@@ -348,17 +351,28 @@
+             logger("Login restored via Welcome back account picker");
+             return;
+         }
++        failureProbe = retryProbe;
+         logger(`Login retry after Welcome back failed (sessionStatus=${retryProbe.status}, sessionAuthenticated=${Boolean(retryProbe.sessionAuthenticated)}, backendStatus=${retryProbe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(retryProbe.domLoginCta)}, appAuthenticated=${Boolean(retryProbe.appAuthenticated)})`);
+     }
+-    logger(`Login probe failed (sessionStatus=${probe.status}, sessionAuthenticated=${Boolean(probe.sessionAuthenticated)}, sessionResolved=${Boolean(probe.sessionResolved)}, backendStatus=${probe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(probe.domLoginCta)}, onAuthPage=${Boolean(probe.onAuthPage)}, appAuthenticated=${Boolean(probe.appAuthenticated)}, cfBlocked=${Boolean(probe.cfBlocked)}, url=${probe.pageUrl ?? "n/a"}, error=${probe.error ?? "none"})`);
+-    const domLabel = probe.domLoginCta ? " Login button detected on page." : "";
++    const sanitizedUrl = failureProbe.pageUrl
++        ? failureProbe.pageUrl.split(/[?#]/)[0]
++        : "n/a";
++    logger(`Login probe failed (sessionStatus=${failureProbe.status}, sessionAuthenticated=${Boolean(failureProbe.sessionAuthenticated)}, sessionResolved=${Boolean(failureProbe.sessionResolved)}, backendStatus=${failureProbe.backendStatus ?? "n/a"}, domLoginCta=${Boolean(failureProbe.domLoginCta)}, onAuthPage=${Boolean(failureProbe.onAuthPage)}, appAuthenticated=${Boolean(failureProbe.appAuthenticated)}, cfBlocked=${Boolean(failureProbe.cfBlocked)}, url=${sanitizedUrl}, error=${failureProbe.error ?? "none"})`);
++    const domLabel = failureProbe.domLoginCta ? " Login button detected on page." : "";
+     const cookieHint = options.remoteSession
+         ? "The remote Chrome session is not signed into ChatGPT. Sign in there, then rerun."
+-        : (options.appliedCookies ?? 0) === 0
+-            ? "No ChatGPT cookies were applied; sign in to chatgpt.com in Chrome or pass inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON)."
+-            : "ChatGPT login appears missing; open chatgpt.com in Chrome to refresh the session or provide inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON).";
++        : options.preSignedProfile
++            ? "The copied Chrome profile did not yield a verifiable ChatGPT login; confirm chatgpt.com is signed in in your Chrome profile, then rerun."
++            : (options.appliedCookies ?? 0) === 0
++                ? "No ChatGPT cookies were applied; sign in to chatgpt.com in Chrome or pass inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON)."
++                : "ChatGPT login appears missing; open chatgpt.com in Chrome to refresh the session or provide inline cookies (--browser-inline-cookies[(-file)] / ORACLE_BROWSER_COOKIES_JSON).";
+     const accountHint = welcomeBack.hint ? ` ${welcomeBack.hint}` : "";
+-    throw new Error(`ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint}`);
++    // The probe detail below is the only post-mortem evidence for copied-profile runs:
++    // the logger line is not persisted, so these fields must ride on the thrown error.
++    // The URL is stripped to origin+path so auth callback query/fragment values never
++    // reach persisted session logs.
++    const probeSummary = `(probe: sessionStatus=${failureProbe.status}, sessionAuthenticated=${failureProbe.sessionAuthenticated}, sessionResolved=${failureProbe.sessionResolved}, backendStatus=${failureProbe.backendStatus ?? "n/a"}, domLoginCta=${failureProbe.domLoginCta}, onAuthPage=${failureProbe.onAuthPage}, appAuthenticated=${failureProbe.appAuthenticated}, cfBlocked=${failureProbe.cfBlocked}, appliedCookies=${options.appliedCookies ?? 0}, preSignedProfile=${Boolean(options.preSignedProfile)}, url=${sanitizedUrl}, error=${failureProbe.error ?? "none"})`;
++    throw new Error(`ChatGPT session not detected.${domLabel}${accountHint} ${cookieHint}${probeSummary}`);
+ }
+ async function attemptWelcomeBackLogin(Runtime, logger, preferredEmail = null) {
+     const deadline = Date.now() + 30_000;
+@@ -476,7 +490,7 @@
+     };
+   })()`;
+ }
+-export async function ensurePromptReady(Runtime, timeoutMs, logger) {
++export async function ensurePromptReady(Runtime, timeoutMs, logger, options = {}) {
+     const ready = await waitForPrompt(Runtime, timeoutMs);
+     if (!ready) {
+         const authUrl = await currentUrl(Runtime);
+@@ -492,7 +506,34 @@
+         await logDomFailure(Runtime, logger, "prompt-textarea");
+         throw new Error("Prompt textarea did not appear before timeout");
+     }
++    if (options.requireFreshConversation) {
++        await assertFreshConversation(Runtime, logger);
++    }
+ }
++// A copied Chrome profile can carry ChatGPT's client-side routing state, so the
++// first navigation may land on the source profile's last conversation instead of
++// a fresh chat. Submitting there would append to a conversation this run does not
++// own and its stale answer could be captured as the result. Opt in via
++// `requireFreshConversation` at first-submission checkpoints only: later
++// recheck/follow-up calls legitimately run inside this run's own /c/<id> URL.
++async function assertFreshConversation(Runtime, logger) {
++    const url = await currentUrl(Runtime);
++    if (!url) {
++        return;
++    }
++    let pathname = "";
++    try {
++        pathname = new URL(url).pathname;
++    }
++    catch {
++        return;
++    }
++    if (/^\/c\/[^/]+/.test(pathname)) {
++        logger(`Refusing to submit: ChatGPT restored an existing conversation at ${pathname}.`);
++        throw new Error(`ChatGPT landed in an existing conversation (${pathname}) instead of a fresh chat; ` +
++            "refusing to submit into a conversation this run does not own. Rerun the consultation.");
++    }
++}
+ function conversationIdFromUrl(value) {
+     if (!value)
+         return null;
+--- a/dist/src/browser/actions/promptComposer.js
++++ b/dist/src/browser/actions/promptComposer.js
 @@ -68,9 +68,13 @@
          candidates.find((node) => isVisible(node)) ||
          candidates[0];
@@ -85,10 +174,11 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      if (promptLength >= 50_000 && observedLength > 0 && observedLength < promptLength - 2_000) {
          // Learned: very large prompts can truncate silently; fail fast so we can fall back to file uploads.
          await logDomFailure(runtime, logger, "prompt-too-large");
-@@ -218,6 +244,37 @@
+@@ -217,6 +243,37 @@
+     const commitTimeoutMs = Math.max(60_000, deps.inputTimeoutMs ?? 0);
      // Learned: the send button can succeed but the turn doesn't appear immediately; verify commit via turns/stop button.
      return await verifyPromptCommitted(runtime, prompt, commitTimeoutMs, logger, deps.baselineTurns ?? undefined);
- }
++}
 +async function hasFocusedVisibleComposer(Runtime) {
 +    const result = await Runtime.evaluate({
 +        expression: `(() => {
@@ -119,10 +209,9 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
 +        returnByValue: true,
 +    });
 +    return result.result?.value === true;
-+}
+ }
  async function submitViaEnter(Runtime, Input) {
      const focus = await Runtime.evaluate({
-         expression: `(() => {
 @@ -243,9 +300,13 @@
          candidates.find((node) => isVisible(node) && isEditable(node));
        if (!editor) return null;
@@ -159,13 +248,13 @@ diff -ruN a/dist/src/browser/actions/promptComposer.js b/dist/src/browser/action
      }
      await Input.dispatchKeyEvent({
          type: "keyDown",
-diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/thinkingTime.js
---- a/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/actions/thinkingTime.js	2026-09-07 15:10:06
-@@ -21,6 +21,16 @@
+--- a/dist/src/browser/actions/thinkingTime.js
++++ b/dist/src/browser/actions/thinkingTime.js
+@@ -20,6 +20,16 @@
+         return;
      }
      logger(`[browser] Model picker diagnostic: ${JSON.stringify(diagnostic)}`);
- }
++}
 +function buildThinkingSelectionEvidence(level, result, verified) {
 +    return {
 +        requestedLevel: level,
@@ -175,10 +264,9 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
 +        source: "thinking-time-control",
 +        capturedAt: new Date().toISOString(),
 +    };
-+}
+ }
  /**
   * Selects a thinking-time level in ChatGPT's composer.
-  *
 @@ -66,10 +76,10 @@
      switch (result?.status) {
          case "already-selected":
@@ -210,9 +298,8 @@ diff -ruN a/dist/src/browser/actions/thinkingTime.js b/dist/src/browser/actions/
          }
      }
  }
-diff -ruN a/dist/src/browser/chromeLifecycle.js b/dist/src/browser/chromeLifecycle.js
---- a/dist/src/browser/chromeLifecycle.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/chromeLifecycle.js	2026-09-07 15:09:51
+--- a/dist/src/browser/chromeLifecycle.js
++++ b/dist/src/browser/chromeLifecycle.js
 @@ -79,9 +79,11 @@
              logger(`Received ${signal}; terminating Chrome process`);
          }
@@ -227,9 +314,23 @@ diff -ruN a/dist/src/browser/chromeLifecycle.js b/dist/src/browser/chromeLifecyc
                  if (inFlight) {
                      logger('Session still in flight; reattach with "oracle session <slug>" to continue.');
                  }
-diff -ruN a/dist/src/browser/config.js b/dist/src/browser/config.js
---- a/dist/src/browser/config.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/config.js	2026-09-07 15:11:29
+@@ -543,14 +545,6 @@
+         "--disable-features=TranslateUI,AutomationControlled",
+         "--mute-audio",
+         "--window-size=1280,720",
+-        // Chrome that *we* launch is pinned to English, so ChatGPT renders the labels
+-        // our selectors were written against. This does not make English the only case
+-        // to handle: --browser-attach-running and --remote-chrome never build these
+-        // flags (see controlPlan.ts), so those runs inherit the user's own Chrome
+-        // locale, and a ChatGPT account language setting can localize the UI even here.
+-        // That is why the model/effort matchers must stay language-tolerant.
+-        "--lang=en-US",
+-        "--accept-lang=en-US,en",
+     ];
+     if (process.platform !== "win32" && !isWsl()) {
+         flags.push("--password-store=basic", "--use-mock-keychain");
+--- a/dist/src/browser/config.js
++++ b/dist/src/browser/config.js
 @@ -23,7 +23,7 @@
      browserTabRef: null,
      url: CHATGPT_URL,
@@ -239,9 +340,8 @@ diff -ruN a/dist/src/browser/config.js b/dist/src/browser/config.js
      debugPort: null,
      inputTimeoutMs: 60_000,
      attachmentTimeoutMs: 45_000,
-diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
---- a/dist/src/browser/index.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/index.js	2026-09-07 15:10:37
+--- a/dist/src/browser/index.js
++++ b/dist/src/browser/index.js
 @@ -38,6 +38,49 @@
  export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
  export { parseDuration, delay, normalizeChatgptUrl, isTemporaryChatUrl } from "./utils.js";
@@ -346,7 +446,44 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          const { Network, Page, Runtime, Input, DOM, Target } = client;
          const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
          if (DOM && typeof DOM.enable === "function") {
-@@ -1109,7 +1167,7 @@
+@@ -958,8 +1016,11 @@
+                 await raceWithDisconnect(navigateToChatGPT(Page, Runtime, config.resumeConversationUrl, logger));
+             }
+             await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
+-            await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
+-            await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
++            await raceWithDisconnect(ensureLoggedIn(Runtime, logger, {
++                appliedCookies,
++                preSignedProfile: usingCopiedProfile,
++            }));
++            await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger, { requireFreshConversation: true }));
+             if (isResumingConversation) {
+                 await raceWithDisconnect(waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
+                     requirePriorTurns: true,
+@@ -982,11 +1043,12 @@
+                 timeoutMs: config.timeoutMs,
+                 profileDir: userDataDir,
+                 keepBrowser: effectiveKeepBrowser,
++                preSignedProfile: usingCopiedProfile,
+             }));
+             if (isResumingConversation) {
+                 await raceWithDisconnect(navigateToChatGPT(Page, Runtime, config.resumeConversationUrl, logger));
+                 await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
+-                await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
++                await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger, { allowExistingConversation: true }));
+             }
+             else if (config.url !== baseUrl) {
+                 await raceWithDisconnect(navigateToPromptReadyWithFallback(Page, Runtime, {
+@@ -998,7 +1060,7 @@
+                 }));
+             }
+             else {
+-                await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
++                await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger, { requireFreshConversation: true }));
+             }
+             if (isResumingConversation) {
+                 // A resumed thread loads its prior history after navigation; ChatGPT can reset the
+@@ -1109,7 +1171,7 @@
          if (thinkingTime && !deepResearch) {
              await raceWithDisconnect(stabilizeChromeWindow(client, logger));
              const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
@@ -355,7 +492,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
                  retries: 2,
                  delayMs: 300,
                  onRetry: (attempt, error) => {
-@@ -1118,6 +1176,10 @@
+@@ -1118,6 +1180,10 @@
                      }
                  },
              }));
@@ -366,7 +503,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          }
          const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
          let profileLock = null;
-@@ -1759,7 +1821,23 @@
+@@ -1759,7 +1825,23 @@
          };
      }
      catch (error) {
@@ -391,7 +528,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
          connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
          const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
-@@ -1845,6 +1923,7 @@
+@@ -1845,6 +1927,7 @@
          }, normalizedError);
      }
      finally {
@@ -399,7 +536,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          await conversationUrlMonitor?.stop();
          try {
              if (!connectionClosedUnexpectedly) {
-@@ -1950,16 +2029,17 @@
+@@ -1950,15 +2033,16 @@
          removeDialogHandler?.();
          removeTerminationHooks?.();
          if (!keepBrowserOpen) {
@@ -419,14 +556,43 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
 +                    terminatedRecordedChrome,
 +                    chrome,
 +                });
-             }
++            }
 +            catch {
 +                // ignore kill failures
-+            }
+             }
              if (manualLogin) {
                  const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
-                     connectionClosedUnexpectedly,
-@@ -2430,7 +2510,7 @@
+@@ -2033,9 +2117,9 @@
+         });
+     });
+ }
+-async function waitForLogin({ runtime, logger, appliedCookies, manualLogin, timeoutMs, profileDir, keepBrowser, }) {
++async function waitForLogin({ runtime, logger, appliedCookies, manualLogin, timeoutMs, profileDir, keepBrowser, preSignedProfile, }) {
+     if (!manualLogin) {
+-        await ensureLoggedIn(runtime, logger, { appliedCookies });
++        await ensureLoggedIn(runtime, logger, { appliedCookies, preSignedProfile });
+         return;
+     }
+     const waitMs = resolveManualLoginWaitMs(timeoutMs, Boolean(keepBrowser));
+@@ -2043,7 +2127,7 @@
+     let lastNotice = 0;
+     while (Date.now() < deadline) {
+         try {
+-            await ensureLoggedIn(runtime, logger, { appliedCookies });
++            await ensureLoggedIn(runtime, logger, { appliedCookies, preSignedProfile });
+             return;
+         }
+         catch (error) {
+@@ -2372,7 +2456,7 @@
+         }
+         await ensureNotBlocked(Runtime, config.headless, logger);
+         await ensureLoggedIn(Runtime, logger, { remoteSession: true });
+-        await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
++        await ensurePromptReady(Runtime, config.inputTimeoutMs, logger, { requireFreshConversation: !config.resumeConversationUrl });
+         if (config.resumeConversationUrl) {
+             await waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
+                 requirePriorTurns: true,
+@@ -2430,7 +2514,7 @@
          const thinkingTime = config.thinkingTime;
          if (thinkingTime && !deepResearch) {
              const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
@@ -435,7 +601,7 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
                  retries: 2,
                  delayMs: 300,
                  onRetry: (attempt, error) => {
-@@ -2439,6 +2519,10 @@
+@@ -2439,6 +2523,10 @@
                      }
                  },
              });
@@ -446,9 +612,25 @@ diff -ruN a/dist/src/browser/index.js b/dist/src/browser/index.js
          }
          const submitOnce = async (prompt, submissionAttachments) => {
              const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
-diff -ruN a/dist/src/browser/sessionRunner.js b/dist/src/browser/sessionRunner.js
---- a/dist/src/browser/sessionRunner.js	2026-09-07 15:19:24
-+++ b/dist/src/browser/sessionRunner.js	2026-09-07 15:26:44
+--- a/dist/src/browser/profileCopy.js
++++ b/dist/src/browser/profileCopy.js
+@@ -16,6 +16,14 @@
+     "Service Worker/CacheStorage/",
+     "Service Worker/ScriptCache/",
+     "Service Worker/Database/",
++    // Client-side site state can carry ChatGPT's last routed conversation, so a
++    // copied profile would reopen the source profile's previous chat and a new
++    // consultation could submit into (and capture an answer from) a conversation
++    // it does not own. Sign-in survives via cookies; these stores only hold UI
++    // and routing state.
++    "Local Storage/",
++    "Session Storage/",
++    "Sessions/",
+ ];
+ /**
+  * Copy a signed-in Chrome user-data directory into `destDir` so a throwaway
+--- a/dist/src/browser/sessionRunner.js
++++ b/dist/src/browser/sessionRunner.js
 @@ -99,7 +99,7 @@
      automationLogger.verbose = Boolean(runOptions.verbose);
      automationLogger.sessionLog = runOptions.verbose ? log : () => { };
@@ -458,9 +640,8 @@ diff -ruN a/dist/src/browser/sessionRunner.js b/dist/src/browser/sessionRunner.j
      if (runOptions.verbose) {
          log(chalk.dim("Chrome automation does not stream output; this may take a minute..."));
      }
-diff -ruN a/dist/src/cli/browserConfig.js b/dist/src/cli/browserConfig.js
---- a/dist/src/cli/browserConfig.js	2026-09-07 15:19:24
-+++ b/dist/src/cli/browserConfig.js	2026-09-07 15:11:29
+--- a/dist/src/cli/browserConfig.js
++++ b/dist/src/cli/browserConfig.js
 @@ -7,7 +7,7 @@
  import { parseDuration } from "../duration.js";
  import { normalizeBrowserModelStrategy } from "../browser/modelStrategy.js";
@@ -470,9 +651,8 @@ diff -ruN a/dist/src/cli/browserConfig.js b/dist/src/cli/browserConfig.js
  const DEFAULT_BROWSER_INPUT_TIMEOUT_MS = 60_000;
  const DEFAULT_BROWSER_ATTACHMENT_TIMEOUT_MS = 45_000;
  const DEFAULT_BROWSER_RECHECK_TIMEOUT_MS = 120_000;
-diff -ruN a/dist/src/cli/help.js b/dist/src/cli/help.js
---- a/dist/src/cli/help.js	2026-09-07 15:19:24
-+++ b/dist/src/cli/help.js	2026-09-07 15:35:04
+--- a/dist/src/cli/help.js
++++ b/dist/src/cli/help.js
 @@ -52,7 +52,7 @@
          `${colors.bullet("•")} Oracle is one-shot by default. Continue saved API or ChatGPT browser sessions with ${colors.accent("--followup <sessionId|responseId>")}; use repeated ${colors.accent("--browser-follow-up")} for planned same-run ChatGPT turns.`,
          `${colors.bullet("•")} Run ${colors.accent("--files-report")} to inspect token spend before hitting the API.`,
@@ -482,9 +662,8 @@ diff -ruN a/dist/src/cli/help.js b/dist/src/cli/help.js
          `${colors.bullet("•")} Finished sessions auto-hide preamble logs when reattached; raw timestamps remain in the saved log file.`,
          `${colors.bullet("•")} Need hidden flags? Run ${colors.accent(`${program.name()} --help --verbose`)} to list search/token/browser overrides.`,
          `${colors.bullet("•")} If any Oracle session is already running, do not start new API runs. Attach to the existing browser session instead; only trigger API calls when you explicitly mean to.`,
-diff -ruN a/dist/src/cli/sessionRunner.js b/dist/src/cli/sessionRunner.js
---- a/dist/src/cli/sessionRunner.js	2026-09-07 15:19:24
-+++ b/dist/src/cli/sessionRunner.js	2026-09-07 15:27:45
+--- a/dist/src/cli/sessionRunner.js
++++ b/dist/src/cli/sessionRunner.js
 @@ -27,6 +27,35 @@
  import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
  const isTty = process.stdout.isTTY;
@@ -549,9 +728,8 @@ diff -ruN a/dist/src/cli/sessionRunner.js b/dist/src/cli/sessionRunner.js
                  },
              };
              const result = await runBrowserSessionExecution({
-diff -ruN a/dist/src/cli/tui/index.js b/dist/src/cli/tui/index.js
---- a/dist/src/cli/tui/index.js	2026-09-07 15:19:23
-+++ b/dist/src/cli/tui/index.js	2026-09-07 15:35:04
+--- a/dist/src/cli/tui/index.js
++++ b/dist/src/cli/tui/index.js
 @@ -317,7 +317,7 @@
          {
              name: "slug",
@@ -561,9 +739,8 @@ diff -ruN a/dist/src/cli/tui/index.js b/dist/src/cli/tui/index.js
          },
          {
              name: "model",
-diff -ruN a/dist/src/sessionManager.js b/dist/src/sessionManager.js
---- a/dist/src/sessionManager.js	2026-09-07 15:19:24
-+++ b/dist/src/sessionManager.js	2026-09-07 15:10:52
+--- a/dist/src/sessionManager.js
++++ b/dist/src/sessionManager.js
 @@ -23,6 +23,9 @@
  const MAX_SLUG_WORDS = 5;
  const MIN_CUSTOM_SLUG_WORDS = 3;
@@ -574,7 +751,7 @@ diff -ruN a/dist/src/sessionManager.js b/dist/src/sessionManager.js
  // Session artifacts (prompt, attached file contents, model responses) are sensitive.
  // Keep them owner-only, matching the meta.json / bridge-config posture (0o600/0o700).
  const SESSION_DIR_MODE = 0o700;
-@@ -114,10 +117,18 @@
+@@ -114,11 +117,19 @@
      return slug.split("-").filter(Boolean).length;
  }
  function normalizeCustomSlug(candidate) {
@@ -590,9 +767,10 @@ diff -ruN a/dist/src/sessionManager.js b/dist/src/sessionManager.js
 -        throw new Error(`Custom slug must include between ${MIN_CUSTOM_SLUG_WORDS} and ${MAX_SLUG_WORDS} words.`);
 +    if (wordCount < MIN_CUSTOM_SLUG_WORDS || wordCount > MAX_CUSTOM_SLUG_WORDS) {
 +        throw new Error(`Custom slug must include between ${MIN_CUSTOM_SLUG_WORDS} and ${MAX_CUSTOM_SLUG_WORDS} words.`);
-+    }
+     }
 +    if (slug.length > MAX_CUSTOM_SLUG_LENGTH) {
 +        throw new Error(`Custom slug must not exceed ${MAX_CUSTOM_SLUG_LENGTH} characters.`);
-     }
++    }
      return slug;
  }
+ export function createSessionId(prompt, customSlug) {

@@ -12,6 +12,7 @@
 - 只相信网页实际显示的标签和位置，不把 CLI 请求值冒充为网页模型证据。
 - 强度无法确认时 fail closed，禁止静默降级后继续发送。
 - 页面首次未进入 ready state 时，只在同一个隔离 tab 内做一次有界 reload；仍不可验证就 fail closed。
+- Oracle Chrome 不再强制 `en-US`，网页语言跟随系统、Profile 与 ChatGPT 账号设置。
 - 把网页版限定为 planner/reviewer，把实现、测试和最终判断留给当前 Codex Desktop 或 Claude Code 会话。
 - 隔离多批咨询，避免把第二批材料串进第一批会话。
 - 修复附件已完成却被误判为仍在上传的问题。

@@ -30,6 +30,142 @@ export ORACLE_WEB_STATE_DIR="$test_root/state"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const policies = await import(`${pathToFileURL(process.argv[1]).href}?copied-profile-cookie-sync=${Date.now()}`);
+    const shouldSync = policies.shouldSyncBrowserCookies(
+      { cookieSync: true },
+      { manualLogin: false, profileIsPreSigned: true, usingCopiedProfile: true },
+    );
+    if (shouldSync) {
+      throw new Error("copied-profile runs unexpectedly require source-profile cookie decryption");
+    }
+
+    const lifecycle = await import(`${pathToFileURL(process.argv[2]).href}?browser-language=${Date.now()}`);
+    const flags = lifecycle.buildChromeFlagsForTest(false, undefined, false);
+    if (flags.some((flag) => flag.startsWith("--lang=") || flag.startsWith("--accept-lang="))) {
+      throw new Error("Oracle Chrome still forces an English browser language");
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/policies.js" \
+  "$test_root/package/dist/src/browser/chromeLifecycle.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?login-probe-evidence-test=${Date.now()}`);
+    const runtime = {
+      evaluate: async ({ expression }) => {
+        if (expression.includes("/api/auth/session")) {
+          return { result: { value: {
+            ok: false, status: 401, sessionAuthenticated: false, sessionResolved: false,
+            domLoginCta: false, onAuthPage: false, appAuthenticated: false, cfBlocked: false,
+            pageUrl: "https://chatgpt.com/", error: null,
+          } } };
+        }
+        throw new Error("cdp unavailable");
+      },
+    };
+    let failure = null;
+    try {
+      await module.ensureLoggedIn(runtime, () => {}, { appliedCookies: 0, preSignedProfile: true });
+    } catch (error) {
+      failure = error;
+    }
+    if (!failure) {
+      throw new Error("an unverified copied-profile login did not fail closed");
+    }
+    const message = String(failure.message);
+    if (
+      !/probe: sessionStatus=401/.test(message) ||
+      !/appliedCookies=0/.test(message) ||
+      !/preSignedProfile=true/.test(message)
+    ) {
+      throw new Error(`login failure did not carry probe evidence for post-mortem: ${message}`);
+    }
+    if (!message.includes("copied Chrome profile did not yield a verifiable ChatGPT login")) {
+      throw new Error("copied-profile login failure retained the misleading cookie-sync hint");
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/navigation.js"
+
+node -e '
+  const fs = require("node:fs");
+  (async () => {
+    const source = fs.readFileSync(process.argv[1], "utf8");
+    const start = source.indexOf("async function waitForLogin");
+    const end = source.indexOf("async function maybeRecoverLongAssistantResponse", start);
+    if (start < 0 || end < 0) throw new Error("waitForLogin source not found");
+    const calls = [];
+    const waitForLogin = new Function(
+      "ensureLoggedIn",
+      "resolveManualLoginWaitMs",
+      "formatManualLoginSetupCommand",
+      "defaultManualLoginProfileDir",
+      `${source.slice(start, end)}; return waitForLogin;`,
+    )(
+      async (runtime, logger, options) => { calls.push(options); },
+      () => 0,
+      () => "setup",
+      () => "/default",
+    );
+    await waitForLogin({
+      runtime: {}, logger: () => {}, appliedCookies: 3, manualLogin: false,
+      timeoutMs: 1000, profileDir: "/p", keepBrowser: false, preSignedProfile: true,
+    });
+    await waitForLogin({
+      runtime: {}, logger: () => {}, appliedCookies: 3, manualLogin: false,
+      timeoutMs: 1000, profileDir: "/p", keepBrowser: false,
+    });
+    if (calls.length !== 2) {
+      throw new Error(`waitForLogin did not reach ensureLoggedIn twice: ${calls.length}`);
+    }
+    if (calls[0].preSignedProfile !== true || calls[1].preSignedProfile !== undefined) {
+      throw new Error(`waitForLogin did not forward preSignedProfile to ensureLoggedIn: ${JSON.stringify(calls)}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/index.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?fresh-conversation-guard=${Date.now()}`);
+    const makeRuntime = (pathname) => ({
+      evaluate: async ({ expression }) => {
+        if (expression.includes("location.href")) {
+          return { result: { value: pathname === "/" ? "https://chatgpt.com/" : `https://chatgpt.com${pathname}` } };
+        }
+        return { result: { value: true } };
+      },
+    });
+    let threw = null;
+    try {
+      await module.ensurePromptReady(
+        makeRuntime("/c/6aaa63dc-58c4-83eb-9422-58a90bc556dd"), 1000, () => {},
+        { requireFreshConversation: true },
+      );
+    } catch (error) { threw = error; }
+    if (!threw || !/existing conversation/.test(threw.message)) {
+      throw new Error("a restored existing conversation was not refused before first submission");
+    }
+    await module.ensurePromptReady(makeRuntime("/"), 1000, () => {}, { requireFreshConversation: true });
+    await module.ensurePromptReady(makeRuntime("/c/own-run-conversation"), 1000, () => {});
+    console.log("fresh-conversation guard ok");
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/navigation.js"
+
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_A6D4E88_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_A6D4E88_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "a6d4e88 runtime unexpectedly matched the current manifest"
+if [[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_A6D4E88_HASH_MANIFEST")" != "patched" && \
+      "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_A6D4E88_NPM_HASH_MANIFEST")" != "patched" ]]; then
+  oracle_web_die "legacy runtime did not match either a6d4e88 manifest"
+fi
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 if [[ "$(oracle_web_current_manifest "$test_root/package")" == "$ORACLE_WEB_NPM_HASH_MANIFEST" ]]; then
   "$script_dir/uninstall.sh"
   node -e '
@@ -1452,10 +1588,12 @@ node -e '
 
 profile_source="$test_root/profile-source"
 profile_dest="$test_root/profile-dest"
-mkdir -p "$profile_source/Default/Network" "$test_root/fake-path"
+mkdir -p "$profile_source/Default/Network" "$profile_source/Default/Local Storage/leveldb" "$profile_source/Default/Sessions" "$test_root/fake-path"
 printf '%s\n' '{"profile":{"last_used":"Default"}}' > "$profile_source/Local State"
 printf '%s\n' '{"profile":{"exit_type":"Crashed","exited_cleanly":false}}' > "$profile_source/Default/Preferences"
 printf '%s\n' 'test-cookie-database-placeholder' > "$profile_source/Default/Network/Cookies"
+printf '%s\n' 'routing-state-must-not-cross' > "$profile_source/Default/Local Storage/leveldb/000003.log"
+printf '%s\n' 'tab-restore-must-not-cross' > "$profile_source/Default/Sessions/Tabs"
 real_rsync="$(command -v rsync)"
 cat > "$test_root/fake-path/rsync" <<SCRIPT
 #!/usr/bin/env bash
@@ -1473,6 +1611,10 @@ PATH="$test_root/fake-path:$PATH" node -e '
 [[ -f "$profile_dest/Default/Network/Cookies" ]] || oracle_web_die "guarded rsync exit 23 lost the cookie database"
 grep -q '"exit_type":"Normal"' "$profile_dest/Default/Preferences" || \
   oracle_web_die "copied Profile was not marked as a clean exit"
+[[ ! -e "$profile_dest/Default/Local Storage" ]] || \
+  oracle_web_die "copied Profile carried client-side Local Storage (conversation-routing state)"
+[[ ! -e "$profile_dest/Default/Sessions" ]] || \
+  oracle_web_die "copied Profile carried session restore data"
 
 profile_without_cookie="$test_root/profile-without-cookie"
 mkdir -p "$profile_without_cookie/Default"
@@ -1531,6 +1673,7 @@ grep -q '^ARG=browser$' <<< "$wrapper_output"
 grep -q '^ARG=--browser-model-strategy$' <<< "$wrapper_output"
 grep -q '^ARG=current$' <<< "$wrapper_output"
 grep -q '^ARG=Profile 2$' <<< "$wrapper_output"
+[[ "$(grep -c '^ARG=--browser-cookie-path$' <<< "$wrapper_output")" -eq 0 ]]
 [[ "$(grep -c '^ARG=--browser-thinking-time$' <<< "$wrapper_output")" -eq 1 ]]
 grep -q '^ARG=max$' <<< "$wrapper_output"
 [[ "$(grep -c '^ARG=--browser-attachment-timeout$' <<< "$wrapper_output")" -eq 1 ]]
@@ -1544,7 +1687,7 @@ default_wrapper_output="$(
   "$test_root/bin/oracle-web" -p probe
 )"
 [[ "$(grep -c '^ARG=--browser-thinking-time$' <<< "$default_wrapper_output")" -eq 1 ]]
-grep -q '^ARG=extra-high$' <<< "$default_wrapper_output"
+grep -q '^ARG=max$' <<< "$default_wrapper_output"
 [[ "$(grep -c '^ARG=--browser-attachment-timeout$' <<< "$default_wrapper_output")" -eq 1 ]]
 grep -q '^ARG=300s$' <<< "$default_wrapper_output"
 [[ "$(grep -c '^ARG=--timeout$' <<< "$default_wrapper_output")" -eq 1 ]]

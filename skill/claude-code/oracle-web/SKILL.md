@@ -14,6 +14,7 @@ Use the installed `oracle-web` wrapper from Claude Code to send a focused prompt
 - Do not pass `--copy-profile`, `--browser-chrome-profile`, manual-login flags, cookie flags, or another browser/profile path. The wrapper owns those arguments. If the selected Chrome Profile must change, use `ORACLE_WEB_CHROME_USER_DATA_DIR` and `ORACLE_WEB_CHROME_PROFILE` in the host environment, then rerun `--doctor`.
 - Use only the repository-supported Oracle runtime version. Do not upgrade or replace it during a consultation.
 - The wrapper copies the configured Chrome profile into a temporary directory and removes that copy after the run. Never inspect or print cookies, credentials, or Profile contents.
+- The Oracle Chrome does not force an English locale. Treat the account's visible language as normal and keep all UI matching language-tolerant.
 - Every consultation owns one new session, temporary Profile, Chrome process, CDP port, and target. Identify it from that session's recorded `chromePid`, `chromePort`, `chromeTargetId`, and `userDataDir`; never choose a window by title, process name, or creation time.
 - A copied-profile run owns its launched Chrome even if CDP disconnects. The runtime must terminate that exact Chrome and remove the temporary Profile; a disconnect must not leave a recoverable copied-profile browser behind.
 - Runtime identity is persisted immediately after Chrome launch, so navigation failures must still be auditable by the exact recorded PID and temporary Profile.

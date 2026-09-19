@@ -112,7 +112,7 @@ oracle_args=(
 )
 
 if [[ "$thinking_time_configured" == false ]]; then
-  oracle_args+=(--browser-thinking-time extra-high)
+  oracle_args+=(--browser-thinking-time max)
 fi
 
 if [[ "$attachment_timeout_configured" == false ]]; then
