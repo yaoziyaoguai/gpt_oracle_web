@@ -25,10 +25,28 @@ export ORACLE_WEB_CODEX_HOME="$test_root/codex-home"
 export ORACLE_WEB_CLAUDE_HOME="$test_root/claude-home"
 export ORACLE_WEB_BIN_DIR="$test_root/bin"
 export ORACLE_WEB_STATE_DIR="$test_root/state"
+export XDG_CONFIG_HOME="$test_root/config"
 
 "$script_dir/install.sh" --force
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
+
+node "$script_dir/test-cli.mjs" "$test_root/package" "$test_root/bin/oracle-web"
+node "$script_dir/test-browser-source.mjs" "$test_root/bin/oracle-web"
+node "$script_dir/test-attachments.mjs" "$test_root/package"
+node "$script_dir/test-composer-dom.mjs" "$test_root/package"
+node "$script_dir/test-answer-wait.mjs" "$test_root/package"
+
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_E13EA4C_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_E13EA4C_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "e13ea4c runtime unexpectedly matched the current manifest"
+if [[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_E13EA4C_HASH_MANIFEST")" != "patched" && \
+      "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_E13EA4C_NPM_HASH_MANIFEST")" != "patched" ]]; then
+  oracle_web_die "legacy runtime did not match either e13ea4c manifest"
+fi
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
 
 node -e '
   const { pathToFileURL } = require("node:url");
@@ -260,8 +278,8 @@ node -e '
       barVisible: false,
       strongThinkingActive: false,
     }, { barConfirmCycles: 3, minStableMs: 1_200, quietStableMs: 8_000 });
-    if (!decision.terminal) {
-      throw new Error("stable complete assistant turn without an action bar never becomes terminal");
+    if (decision.terminal) {
+      throw new Error("a quiet candidate without completion evidence became terminal");
     }
     decision = module.classifyTurnTerminal(decision.state, {
       now: 16_500,
@@ -272,7 +290,7 @@ node -e '
       strongThinkingActive: false,
     }, { barConfirmCycles: 3, minStableMs: 1_200, quietStableMs: 8_000 });
     if (decision.terminal) {
-      throw new Error("content changes bypassed the quiet terminal window");
+      throw new Error("content changes bypassed the terminal gate");
     }
   })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/actions/assistantResponse.js"
@@ -319,7 +337,7 @@ node -e '
     const thinking = await import(`${pathToFileURL(process.argv[1]).href}?thinking-evidence-test=${Date.now()}`);
     const index = await import(`${pathToFileURL(process.argv[2]).href}?thinking-model-evidence-test=${Date.now()}`);
     const evidence = await thinking.ensureThinkingTime({
-      evaluate: async () => ({ result: { value: {
+      evaluate: async ({ expression }) => ({ result: { value: expression.includes("positionPattern") ? false : {
         status: "already-selected",
         label: "Pro，第 5 项，共 5 项",
       } } }),
@@ -338,6 +356,337 @@ node -e '
   })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/actions/thinkingTime.js" \
   "$test_root/package/dist/src/browser/index.js"
+
+node --input-type=module - "$test_root/package/dist/src/browser/actions/thinkingTime.js" <<'NODE'
+import { pathToFileURL } from "node:url";
+
+const thinking = await import(`${pathToFileURL(process.argv[2]).href}?thinking-control-drift=${Date.now()}`);
+class FakeEvent extends Event {}
+class FakeButton extends EventTarget {
+  constructor(kind, text) {
+    super();
+    this.kind = kind;
+    this.textContent = text;
+    this.tabIndex = 0;
+    this.parentElement = null;
+  }
+  getAttribute(name) {
+    const attrs = {
+      "aria-label": this.kind === "current" ? "选择 ChatGPT 模型" : null,
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      "data-testid": this.kind === "legacy" ? "model-switcher-dropdown-button" : null,
+      "aria-hidden": null,
+    };
+    return attrs[name] ?? null;
+  }
+  getBoundingClientRect() {
+    return { left: 100, right: 260, top: 80, bottom: 116, width: 160, height: 36 };
+  }
+  contains(node) { return node === this; }
+  matches(selector) {
+    return this.kind === "legacy" && selector.includes("model-switcher-dropdown-button");
+  }
+  closest() { return null; }
+}
+
+async function probe(kind, text) {
+  const button = new FakeButton(kind, text);
+  let clock = 0;
+  const document = {
+    activeElement: null,
+    body: {},
+    querySelector(selector) {
+      return kind === "legacy" && selector.includes("model-switcher-dropdown-button")
+        ? button
+        : null;
+    },
+    querySelectorAll(selector) {
+      return kind === "current" && selector === 'form button[aria-haspopup="menu"][aria-label]'
+        ? [button]
+        : [];
+    },
+    elementFromPoint() { return button; },
+    dispatchEvent() { return true; },
+    getElementById() { return null; },
+  };
+  const window = {
+    innerWidth: 1280,
+    innerHeight: 720,
+    visualViewport: { width: 1280, height: 720, offsetLeft: 0, offsetTop: 0 },
+    getComputedStyle: () => ({
+      display: "flex", visibility: "visible", opacity: "1", pointerEvents: "auto",
+    }),
+  };
+  const run = new Function(
+    "document", "window", "HTMLElement", "EventTarget", "MouseEvent", "KeyboardEvent",
+    "performance", "setTimeout",
+    `return ${thinking.buildThinkingTimeExpressionForTest("max")};`,
+  );
+  const result = await run(
+    document,
+    window,
+    FakeButton,
+    EventTarget,
+    FakeEvent,
+    FakeEvent,
+    { now: () => (clock += 1000) },
+    (callback) => { callback(); return 1; },
+  );
+  if (result?.status !== "slider-click-required" || result?.purpose !== "open-effort-picker") {
+    throw new Error(`${kind} thinking control was not located: ${JSON.stringify(result)}`);
+  }
+}
+
+async function probeCombinedPicker() {
+  class FakeNode extends EventTarget {
+    constructor(attrs = {}, text = "") {
+      super();
+      this.attrs = attrs;
+      this.textContent = text;
+      this.tabIndex = attrs.tabindex ?? -1;
+      this.parentElement = null;
+      this.children = [];
+    }
+    getAttribute(name) { return this.attrs[name] ?? null; }
+    getBoundingClientRect() {
+      return { left: 100, right: 346, top: 80, bottom: 116, width: 246, height: 36 };
+    }
+    contains(node) { return node === this || this.children.includes(node); }
+    matches() { return false; }
+    closest() { return null; }
+    querySelector(selector) {
+      if (selector === '[data-testid="composer-model-picker-slider-simple-view"]') {
+        return this.children.find(
+          (node) => node.attrs["data-testid"] === "composer-model-picker-slider-simple-view",
+        ) ?? null;
+      }
+      if (selector.includes('[role="slider"]')) {
+        return this.children.find((node) => node.attrs.role === "slider")
+          ?? this.children.find((node) => node.attrs.role === "menuitem")
+          ?? null;
+      }
+      return null;
+    }
+    querySelectorAll(selector) {
+      return selector.includes('[role="slider"]') || selector.includes('[role="menuitem"]')
+        ? this.children
+        : [];
+    }
+  }
+
+  const control = new FakeNode({ role: "menuitem", "aria-label": "强度" });
+  const view = new FakeNode(
+    { "data-testid": "composer-model-picker-slider-simple-view" },
+    "中即时，第 1 项，共 5 项。使用左右方向键调整强度",
+  );
+  const menu = new FakeNode(
+    { role: "menu", "data-state": "open" },
+    "中即时，第 1 项，共 5 项。最新GPT-5.6 Sol",
+  );
+  const button = new FakeNode({
+    "aria-label": "选择 ChatGPT 模型",
+    "aria-haspopup": "menu",
+    "aria-expanded": "true",
+    "aria-controls": "combined-menu",
+  }, "思考强度");
+  view.children = [control];
+  menu.children = [view, control];
+  view.parentElement = menu;
+  control.parentElement = menu;
+
+  let clock = 0;
+  const document = {
+    activeElement: control,
+    body: {},
+    querySelector(selector) {
+      return selector === '[data-testid="composer-model-picker-slider-simple-view"]'
+        ? view
+        : null;
+    },
+    querySelectorAll(selector) {
+      if (selector === 'form button[aria-haspopup="menu"][aria-label]') return [button];
+      if (selector.includes('[role="menu"]') || selector.includes("[data-radix-collection-root]")) {
+        return [menu];
+      }
+      return [];
+    },
+    getElementById(id) { return id === "combined-menu" ? menu : null; },
+    elementFromPoint() { return control; },
+    dispatchEvent() { return true; },
+  };
+  const window = {
+    innerWidth: 1280,
+    innerHeight: 720,
+    visualViewport: { width: 1280, height: 720, offsetLeft: 0, offsetTop: 0 },
+    getComputedStyle: () => ({
+      display: "flex", visibility: "visible", opacity: "1", pointerEvents: "auto",
+    }),
+  };
+  const run = new Function(
+    "document", "window", "HTMLElement", "EventTarget", "MouseEvent", "KeyboardEvent",
+    "performance", "setTimeout",
+    `return ${thinking.buildThinkingTimeExpressionForTest("max")};`,
+  );
+  const result = await run(
+    document,
+    window,
+    FakeNode,
+    EventTarget,
+    FakeEvent,
+    FakeEvent,
+    { now: () => (clock += 1000) },
+    (callback) => { callback(); return 1; },
+  );
+  if (result?.status !== "slider-key-required" || result?.key !== "ArrowRight") {
+    throw new Error(`combined picker did not reach its five-position slider: ${JSON.stringify(result)}`);
+  }
+
+  const targetControl = new FakeNode({ role: "menuitem", "aria-label": "强度" });
+  const targetThumb = new FakeNode({ role: "slider" });
+  const targetView = new FakeNode(
+    { "data-testid": "composer-model-picker-slider-simple-view" },
+    "6Pro",
+  );
+  const targetMenu = new FakeNode(
+    { role: "menu", "data-state": "open" },
+    "6Pro更快消耗使用额度Pro，第 5 项，共 5 项。使用左右方向键调整强度已锁定，打开访问权限选项最新GPT-5.6 SolGPT-5.5",
+  );
+  const targetButton = new FakeNode({
+    "aria-label": "选择 ChatGPT 模型",
+    "aria-haspopup": "menu",
+    "aria-expanded": "true",
+    "aria-controls": "combined-menu-at-target",
+  }, "思考强度");
+  targetMenu.children = [targetView, targetControl, targetThumb];
+  targetView.parentElement = targetMenu;
+  targetControl.parentElement = targetMenu;
+  targetThumb.parentElement = targetMenu;
+
+  const targetDocument = {
+    activeElement: targetThumb,
+    body: {},
+    querySelector(selector) {
+      return selector === '[data-testid="composer-model-picker-slider-simple-view"]'
+        ? targetView
+        : null;
+    },
+    querySelectorAll(selector) {
+      if (selector === 'form button[aria-haspopup="menu"][aria-label]') return [targetButton];
+      if (selector.includes('[role="menu"]') || selector.includes("[data-radix-collection-root]")) {
+        return [targetMenu];
+      }
+      return [];
+    },
+    getElementById(id) { return id === "combined-menu-at-target" ? targetMenu : null; },
+    elementFromPoint() { return targetThumb; },
+    dispatchEvent() { return true; },
+  };
+  const targetResult = await run(
+    targetDocument,
+    window,
+    FakeNode,
+    EventTarget,
+    FakeEvent,
+    FakeEvent,
+    { now: () => (clock += 1000) },
+    (callback) => { callback(); return 1; },
+  );
+  if (
+    targetResult?.status !== "already-selected" ||
+    !targetResult?.label?.includes("第 5 项，共 5 项")
+  ) {
+    throw new Error(
+      `combined picker did not verify its menu-level position text: ${JSON.stringify(targetResult)}`,
+    );
+  }
+
+  const menuOnlyControl = new FakeNode({ role: "menuitem", "aria-label": "强度" });
+  const menuOnlyMenu = new FakeNode(
+    { role: "menu", "data-state": "open" },
+    "6Pro更快消耗使用额度Pro，第 5 项，共 5 项。使用左右方向键调整强度已锁定，打开访问权限选项最新GPT-5.6 SolGPT-5.5",
+  );
+  const menuOnlyButton = new FakeNode({
+    "aria-label": "选择 ChatGPT 模型",
+    "aria-haspopup": "menu",
+    "aria-expanded": "true",
+    "aria-controls": "combined-menu-without-view",
+  }, "思考强度");
+  menuOnlyMenu.children = [menuOnlyControl];
+  menuOnlyControl.parentElement = menuOnlyMenu;
+  const menuOnlyDocument = {
+    activeElement: menuOnlyMenu,
+    body: {},
+    querySelector() { return null; },
+    querySelectorAll(selector) {
+      if (selector === 'form button[aria-haspopup="menu"][aria-label]') return [menuOnlyButton];
+      if (selector.includes('[role="menu"]') || selector.includes("[data-radix-collection-root]")) {
+        return [menuOnlyMenu];
+      }
+      return [];
+    },
+    getElementById(id) { return id === "combined-menu-without-view" ? menuOnlyMenu : null; },
+    elementFromPoint() { return menuOnlyControl; },
+    dispatchEvent() { return true; },
+  };
+  const menuOnlyResult = await run(
+    menuOnlyDocument,
+    window,
+    FakeNode,
+    EventTarget,
+    FakeEvent,
+    FakeEvent,
+    { now: () => (clock += 1000) },
+    (callback) => { callback(); return 1; },
+  );
+  if (
+    menuOnlyResult?.status !== "already-selected" ||
+    !menuOnlyResult?.label?.includes("第 5 项，共 5 项")
+  ) {
+    throw new Error(
+      `combined picker did not trust its visible five-position menu state: ${JSON.stringify(menuOnlyResult)}`,
+    );
+  }
+
+  let delayedMenuScans = 0;
+  const delayedDocument = {
+    ...targetDocument,
+    getElementById() { return null; },
+    querySelectorAll(selector) {
+      if (selector === 'form button[aria-haspopup="menu"][aria-label]') return [targetButton];
+      if (selector.includes('[role="menu"]') || selector.includes("[data-radix-collection-root]")) {
+        delayedMenuScans += 1;
+        return delayedMenuScans > 1 ? [targetMenu] : [];
+      }
+      return [];
+    },
+  };
+  const delayedResult = await run(
+    delayedDocument,
+    window,
+    FakeNode,
+    EventTarget,
+    FakeEvent,
+    FakeEvent,
+    { now: () => (clock += 1000) },
+    (callback) => { callback(); return 1; },
+  );
+  if (
+    delayedResult?.status !== "already-selected" ||
+    !delayedResult?.label?.includes("第 5 项，共 5 项")
+  ) {
+    throw new Error(
+      `combined picker did not retry a late-mounted slider: ${JSON.stringify(delayedResult)}`,
+    );
+  }
+}
+
+await probe("legacy", "GPT-6 Astra");
+await probe("current", "思考强度中");
+await probe("current", "选择模型GPT-6 Astra中无极低轻度中高极高最高Ultra持续");
+await probeCombinedPicker();
+console.log("thinking control DOM drift fixtures ok");
+NODE
 
 node -e '
   const fs = require("node:fs");
@@ -518,6 +867,7 @@ node -e '
           reloaded = true;
           return { result: { value: true } };
         }
+        if (expression.includes("positionPattern")) return { result: { value: false } };
         return {
           result: {
             value: reloaded
@@ -530,8 +880,63 @@ node -e '
     const logger = () => {};
     logger.verbose = false;
     await module.ensureThinkingTime(runtime, "max", logger, null, {});
-    if (!reloaded || evaluations !== 3) {
+    if (!reloaded || evaluations !== 4) {
       throw new Error(`missing picker was not recovered by one bounded reload: reloaded=${reloaded}, evaluations=${evaluations}`);
+    }
+  })().catch((error) => { console.error(error.message); process.exit(1); });
+' "$test_root/package/dist/src/browser/actions/thinkingTime.js"
+
+node -e '
+  const { pathToFileURL } = require("node:url");
+  (async () => {
+    const module = await import(`${pathToFileURL(process.argv[1]).href}?picker-dismiss-test=${Date.now()}`);
+    const events = [];
+    let pickerProbes = 0;
+    const runtime = {
+      evaluate: async ({ expression }) => {
+        if (expression.includes("positionPattern")) {
+          pickerProbes += 1;
+          return { result: { value: false } };
+        }
+        return { result: { value: { status: "already-selected", label: "Pro, item 5 of 5" } } };
+      },
+    };
+    const logger = () => {};
+    logger.verbose = false;
+    const evidence = await module.ensureThinkingTime(runtime, "max", logger, null, {
+      dispatchKeyEvent: async (event) => events.push(event),
+    });
+    if (!evidence.verified || pickerProbes !== 1 || events.length !== 2) {
+      throw new Error(`verified picker was not dismissed with trusted Escape: probes=${pickerProbes}, events=${events.length}`);
+    }
+
+    let stickyPickerProbes = 0;
+    const stickyRuntime = {
+      evaluate: async ({ expression }) => {
+        if (expression.includes("positionPattern")) {
+          stickyPickerProbes += 1;
+          return { result: { value: true } };
+        }
+        return { result: { value: { status: "already-selected", label: "Pro, item 5 of 5" } } };
+      },
+    };
+    let stickyFailure = null;
+    try {
+      await module.ensureThinkingTime(stickyRuntime, "max", logger, null, {
+        dispatchKeyEvent: async () => {},
+      });
+    } catch (error) {
+      stickyFailure = error;
+    }
+    if (!stickyFailure || stickyPickerProbes !== 2 || !/selection unverified/i.test(stickyFailure.message)) {
+      throw new Error(`open picker did not fail closed: probes=${stickyPickerProbes}, error=${stickyFailure?.message ?? "none"}`);
+    }
+    const assert = require("node:assert/strict");
+    for (const probe of [undefined, { result: {} }, { exceptionDetails: { text: "probe failed" } }]) {
+      await assert.rejects(module.ensureThinkingTime({
+        evaluate: async ({ expression }) => expression.includes("positionPattern")
+          ? probe : { result: { value: { status: "already-selected", label: "Pro, item 5 of 5" } } },
+      }, "max", logger, null, { dispatchKeyEvent: async () => {} }), /selection unverified/);
     }
   })().catch((error) => { console.error(error.message); process.exit(1); });
 ' "$test_root/package/dist/src/browser/actions/thinkingTime.js"
@@ -687,8 +1092,9 @@ node -e '
     const implementation = source.slice(start, end);
     const evaluateThinkingTimeSelection = new Function(
       "buildThinkingTimeExpression",
+      "MENU_CONTAINER_SELECTOR",
       `${implementation}; return evaluateThinkingTimeSelection;`,
-    )(() => "probe") ;
+    )(() => "probe", "[role=menu]") ;
     const viewportBefore = {
       width: 1000, height: 700, visualWidth: 1000, visualHeight: 700,
       visualOffsetLeft: 0, visualOffsetTop: 0,
@@ -709,6 +1115,7 @@ node -e '
       pointer(80, viewportAfter),
       pointer(90, viewportAfter),
       { status: "already-selected", label: "第 4 项，共 5 项" },
+      false,
     ];
     const events = [];
     const result = await evaluateThinkingTimeSelection({
@@ -747,6 +1154,7 @@ node -e '
     const keyResponses = [
       { status: "slider-key-required", key: "ArrowRight" },
       { status: "switched", label: "第 5 项，共 5 项" },
+      false,
     ];
     const keyed = await evaluateThinkingTimeSelection({
       evaluate: async () => ({ result: { value: keyResponses.shift() } }),
@@ -754,10 +1162,12 @@ node -e '
       dispatchMouseEvent: async (event) => keyEvents.push(event),
       dispatchKeyEvent: async (event) => keyEvents.push(event),
     });
+    const sliderKeyEvents = keyEvents.filter((event) => event.key === "ArrowRight");
+    const dismissEvents = keyEvents.filter((event) => event.key === "Escape");
     if (
       keyed?.status !== "switched" ||
-      keyEvents.length !== 2 ||
-      keyEvents.some((event) => event.key !== "ArrowRight") ||
+      sliderKeyEvents.length !== 2 ||
+      dismissEvents.length !== 2 ||
       keyEvents.some((event) => event.type !== "keyDown" && event.type !== "keyUp")
     ) {
       throw new Error(`ARIA slider keyboard path was not preserved: ${JSON.stringify(keyEvents)}`);
@@ -1512,7 +1922,7 @@ node -e '
     fs.writeFileSync(`${profileDir}/marker`, "temporary profile");
     const calls = [];
     const cleanup = createRecoveryCleanup({
-      client: { close: async () => calls.push("client.close") },
+      client: { close: () => { calls.push("client.close"); } },
       chrome: { kill: async () => calls.push("chrome.kill") },
       userDataDir: profileDir,
       manualLogin: false,

@@ -16,7 +16,16 @@ fi
 
 state_root="${XDG_STATE_HOME:-$HOME/.local/state}"
 session_dir="${ORACLE_WEB_SESSION_DIR:-$state_root/oracle-web}"
-chrome_user_data_dir="${ORACLE_WEB_CHROME_USER_DATA_DIR:-$HOME/Library/Application Support/Google/Chrome}"
+chrome_user_data_dir="${ORACLE_WEB_CHROME_USER_DATA_DIR:-}"
+chrome_source_config="${XDG_CONFIG_HOME:-$HOME/.config}/oracle-web/chrome-user-data-dir"
+if [[ -z "$chrome_user_data_dir" && -f "$chrome_source_config" ]]; then
+  chrome_user_data_dir="$(<"$chrome_source_config")"
+  if [[ "$chrome_user_data_dir" != /* || "$chrome_user_data_dir" == *$'\n'* ]]; then
+    echo "oracle-web: chrome-user-data-dir must contain one absolute directory path." >&2
+    exit 78
+  fi
+fi
+chrome_user_data_dir="${chrome_user_data_dir:-$HOME/Library/Application Support/Google/Chrome}"
 chrome_profile="${ORACLE_WEB_CHROME_PROFILE:-Default}"
 requested_model="${ORACLE_WEB_REQUEST_MODEL:-gpt-5.6-sol}"
 session_retention_hours="${ORACLE_WEB_SESSION_RETENTION_HOURS:-24}"

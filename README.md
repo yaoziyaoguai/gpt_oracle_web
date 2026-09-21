@@ -9,6 +9,8 @@
 上游 [Oracle](https://github.com/steipete/oracle) 已经提供了把 prompt 和文件送入模型的 CLI。本项目不重写 Oracle，也不提供新的模型；它补的是编程 Agent 与 ChatGPT 网页之间缺少的“可靠工作流”层：
 
 - 根据任务复杂度在网页五档强度中的第 4、5 档之间自动选择。
+- 识别不再携带旧 `data-testid` / `.__composer-pill` 的合并模型与强度按钮，并识别同时容纳强度滑块和模型列表的新菜单结构。
+- 档位确认后用受信任的键盘事件关闭强度菜单，再通过 CDP/DOM 上传附件、写入 prompt 和提交，避免菜单遮挡后续操作。
 - 只相信网页实际显示的标签和位置，不把 CLI 请求值冒充为网页模型证据。
 - 强度无法确认时 fail closed，禁止静默降级后继续发送。
 - 页面首次未进入 ready state 时，只在同一个隔离 tab 内做一次有界 reload；仍不可验证就 fail closed。
@@ -17,12 +19,15 @@
 - 隔离多批咨询，避免把第二批材料串进第一批会话。
 - 修复附件已完成却被误判为仍在上传的问题。
 - 修复网页附件卡片不显示本地文件名时，普通附件和多文件自动合包被误判为附件缺失的问题。
+- 识别新版 `data-composer-attachments` 卡片和中文附件名；文档优先使用文件入口。上传已经发出但未得到确认时停止，不换入口重复上传。
 - 修复附件卡片遮住 composer 采样点时，编辑器已精确聚焦却被误判为目标不匹配的问题。
 - 只在当前可见 editor 持有 `document.activeElement` 时绕过被遮挡的 pointer click；写入后必须回读 Prompt，否则以 `prompt-insertion-unverified` 停止。
 - 在 Prompt 写入和 Enter 提交前重新回读当前焦点，避免页面重绘后继续使用过期的 editor 身份。
 - 修复发送按钮事件未被页面接受、草稿存在却没有真正提交的问题。
 - 用新会话和 committed user turn 验证发送成功，而不是只看 `promptSubmitted`。
-- 完整 assistant turn 没有渲染 action bar 时，以“内容持续稳定、无停止按钮、无强思考状态”的较长静默窗口确认完成，避免页面已有答案而进程仍在等待。
+- 识别新版用户消息气泡和 assistant Markdown 节点；排除消息单元外的思考标题，识别中文停止按钮及正文外、同一轮的完成操作栏。
+- 提取回答时保留整个消息根节点，避免把正文中带 Markdown 类名的行内代码当成完整答案。原生 Markdown 复制不可用时回退到 DOM 全文，公式排版可能出现重复。
+- 回答完成必须有本条 assistant 的完成操作栏证据，并确认正文稳定且没有生成活动。思考标题或正文停留不变不算完成；证据缺失时继续等待，共用 45 分钟截止时间，超时不返回候选文本。
 - 把 45 分钟作为一次 browser run 的共享截止时间；提交、回答捕获和延迟复查不再分别重置计时。
 - 把网页五档控件的可见标签与位置写入 `browser.modelSelection`，运行日志与 session metadata 使用同一份验证证据。
 - 自定义 slug 支持 3–12 个词并保留末尾唯一后缀；超长值会明确报错，不再静默裁切。
@@ -98,6 +103,9 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
 │   ├── oracle-0.17.3-npm.sha256           npm 发行包的原始/修改后校验和
+│   ├── oracle-0.17.3-from-e13ea4c.patch   上一受管版本到当前版本的增量 patch
+│   ├── oracle-0.17.3-e13ea4c.sha256       上一受管版本校验和
+│   ├── oracle-0.17.3-e13ea4c-npm.sha256   上一受管版本的 npm 校验和
 │   ├── oracle-0.17.3-from-f86c4fc.patch   上一受管版本到当前版本的增量 patch
 │   ├── oracle-0.17.3-f86c4fc.sha256        上一受管版本校验和
 │   ├── oracle-0.17.3-from-38f4bff.patch   上一受管版本到当前版本的增量 patch
@@ -221,7 +229,9 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## 运行时配置
 
-wrapper 不写入个人绝对路径。需要时在启动 Codex 的环境中设置：
+wrapper 不写入个人绝对路径。可在 `${XDG_CONFIG_HOME:-$HOME/.config}/oracle-web/chrome-user-data-dir` 文件中保存一行登录源的绝对路径；`ORACLE_WEB_CHROME_USER_DATA_DIR` 环境变量优先于该文件。配置文件不存在时才使用默认日常 Chrome 目录，配置格式错误时停止。每次调用都会读取配置，Codex 和 Claude Code 共用它，不要求重启应用。
+
+专用登录源应放在仓库外，目录权限设为 `700`。它保存登录状态，不能作为临时 Profile 清理；每次运行仍复制它并清理本次副本。不要提交登录源或导出 Cookie。登录可能过期，配置路径不代表登录已验证。
 
 wrapper 默认同时传入 `--timeout 45m` 和 `--browser-timeout 45m`，并传入 `--browser-attachment-timeout 300s` 与 `--retain-hours 24`；调用者显式提供对应参数时，以调用者的值为准且不会重复添加。`--browser-timeout` 才控制 Chrome 内的执行和回答捕获。45 分钟从 Chrome browser run 开始计算，所有阶段共享同一个截止时间；答案提前完成时会立即进入清理。
 
@@ -358,11 +368,11 @@ Codex 输出契约见 [`skill/oracle-web/references/execution-advice.md`](skill/
 3. **Early runtime identity**：Chrome 启动后、首次导航前就持久化 PID、port 和 `userDataDir`，使早期失败也能按精确身份审计。
 4. **Attachment readiness**：在 prompt 尚未写入时，不再把发送按钮因空编辑器而 disabled 误判为附件上传未完成；prompt 写入后，带附件的 disabled 发送按钮会在 300 秒窗口内继续轮询。
 5. **Stable viewport**：本地自动化 Chrome 使用固定窗口尺寸；档位与发送动作在 pointer 输入前重新定位目标、比较 viewport、验证 DOM 命中，resize 后不使用旧坐标。
-6. **Prompt submission**：始终优先真实 `#prompt-textarea`，先用 trusted CDP click 激活编辑器再写入；只有未出现 submission signal 时才单次 Enter 兜底，并要求 committed turn。
+6. **Prompt submission**：优先 `#prompt-textarea`，兼容当前无该 ID 的可编辑 composer；先用 trusted CDP click 激活编辑器再写入，要求 committed turn，并从 assistant 节点读取答案。
 7. **Recovery lifecycle**：新开的 recovery Chrome 在连接失败或后续任意异常时都经幂等 `finally` 清理；附着到已有临时 runtime 后按精确 identity 关闭和删除，不复用或猜测别的窗口。
 8. **Copied Profile reliability**：把临时副本标记为正常退出；`rsync exit 23` 只有在已复制 Cookie 数据库时才允许进入后续登录验证，否则仍然 fail closed。
 
-安装器先检查七个原始文件 SHA-256。只有全部处于已知 pristine 状态时才应用 patch；全部处于已知 patched 状态时幂等退出；mixed 或 unknown 状态一律停止。
+安装器检查 manifest 中每个受管文件的 SHA-256，包括 CLI 的强度参数解析。已知 pristine 状态可以安装，已知旧版可以迁移，当前 patched 状态幂等退出；mixed 或 unknown 状态停止，不覆盖本地修改。
 
 ## 验证与测试
 
@@ -391,6 +401,11 @@ Codex 输出契约见 [`skill/oracle-web/references/execution-advice.md`](skill/
 - 从 npm 发行基线安装、验证、卸载，并确认原始 hash 恢复。
 - 校验 Codex Desktop 与 Claude Code 两个 Skill 入口，并防止共用故障合同发生偏移。
 - 模拟双编辑器 DOM，确认写入和 Enter 始终落在真实 `#prompt-textarea`。
+- 用旧按钮和两种已观测的新按钮 DOM 快照验证五档控件定位，防止网页属性漂移再次退化为 `chip-not-found`。
+- 验证强度菜单必须被真实 `Escape` 关闭；菜单仍打开时 fail closed，不进入附件上传。
+- 用真实 CLI 检查默认 `max` 和 `extra-high`，避免 wrapper 测试通过但实际解析器拒绝参数。
+- 用本地无登录 headless Chrome 的原生 DOM 回归附件入口、中文改名卡片、重复上传保护、新消息节点和双向切档；不连接 ChatGPT。
+- 用实际回答等待函数回归思考标题停留超过 8 秒、正文生成停顿、旧回答按钮干扰、当前回答完成、无完成证据超时，以及 observer 失败后的剩余期限；45 分钟静默边界另由虚拟时间样本检查。这些不替代真实网站长思考测试。
 - 验证窗口尺寸变化后旧坐标不会收到 pointer 事件，重新定位成功后只点击新坐标。
 - 验证 `elementFromPoint` 与预期目标不一致时不点击，且判断不依赖 `document.visibilityState`。
 - 验证 Chrome 窗口尺寸被恢复为 `1280×720`，失败时给出明确错误。
@@ -419,9 +434,12 @@ ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ./scripts/live-smoke.sh
 ```bash
 ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_FIXTURE=bundle ./scripts/live-smoke.sh
 ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ORACLE_WEB_LIVE_FIXTURE=large-bundle ./scripts/live-smoke.sh
+
+# 推导题验证：上传人工路线题，核对最优值、路线、先后约束和完整论证；最长 45 分钟
+ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ORACLE_WEB_LIVE_FIXTURE=reasoning ./scripts/live-smoke.sh
 ```
 
-成功要求同时包含网页 `4/5` 或 `5/5` 证据和精确回复 `ORACLE-WEB-LIVE-OK`。
+所有真实测试都要求：网页 `4/5` 或 `5/5` 证据已落盘，session 为 `completed`，存在 conversation URL，专用 Chrome 和临时 Profile 已清理。普通附件测试核对保存的 assistant 答案与附件内口令一致，口令不放在 prompt 中；`reasoning` 测试核对保存的完整答案、最优费用、路线和先后约束。
 测试会强制上传临时附件，并使用 300 秒附件就绪上限。
 
 ## 故障排查
@@ -454,6 +472,8 @@ git pull --ff-only
 安装器也为受管提交 `209f3ba` 提供精确迁移，用于把已安装的稳定窗口版本升级到当前版本。
 
 安装器为受管提交 `2fe5969` 提供精确迁移，用于升级已经包含无文件名附件修复的安装。
+
+安装器为受管提交 `e13ea4c` 提供精确迁移，用于升级已经包含 copied-profile 生命周期修复的安装。
 
 Skill 安装到 Codex 或 Claude Code home 后，已有任务在下一次调用 `oracle-web` 时读取当前安装版本。正在执行的咨询不会中途热更新；让该次运行结束，再发起一次新调用即可。
 
