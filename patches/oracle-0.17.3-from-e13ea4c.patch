@@ -491,25 +491,35 @@
        if (isVisible(direct)) return direct;
        // In the current Intelligence picker the zero-height Power row is a
        // sibling of the simple view, not its descendant. Search the whole menu
-@@ -1083,12 +1155,17 @@
-           return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
+@@ -1075,16 +1147,21 @@
+       const view = findPowerSliderView(menu);
+       if (!view) return null;
+       const control = findPowerSliderControl(menu, view);
+-      if (control) {
+-        const now = Number(control.getAttribute?.('aria-valuenow') ?? control.value);
+-        const min = Number(control.getAttribute?.('aria-valuemin') ?? control.min);
+-        const max = Number(control.getAttribute?.('aria-valuemax') ?? control.max);
++      // The ARIA thumb may be visually hidden while its menu item handles keys.
++      // Read the thumb's value, but keep the interactive item for input.
++      const valueNode = view.querySelector?.('[role="slider"][aria-valuenow], input[type="range"]') ||
++        menu?.querySelector?.('[role="slider"][aria-valuenow], input[type="range"]') || control;
++      if (valueNode) {
++        const now = Number(valueNode.getAttribute?.('aria-valuenow') ?? valueNode.value);
++        const min = Number(valueNode.getAttribute?.('aria-valuemin') ?? valueNode.min);
++        const max = Number(valueNode.getAttribute?.('aria-valuemax') ?? valueNode.max);
+         if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
+-          return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
++          const index = now - min + 1;
++          const total = max - min + 1;
++          return { index, total, text: (view.textContent?.trim?.() || 'Power') + ', item ' + index + ' of ' + total + ' (slider ARIA)', view, control };
          }
        }
 -      const parsed = parseSliderPosition(view.textContent ?? view.getAttribute?.('aria-label'));
-+      const parsed = parseSliderPosition((view.textContent ?? view.getAttribute?.('aria-label') ?? '') + ' ' + (menu?.textContent ?? ''));
-       return parsed ? { ...parsed, view, control } : null;
+-      return parsed ? { ...parsed, view, control } : null;
++      return null;
      };
      const selectEffortFromPowerSlider = async (menu) => {
        const targetIndex = SLIDER_LEVEL_INDEX[TARGET_LEVEL];
-       if (!targetIndex || !menu) return null;
-+      const visiblePosition = parseSliderPosition(menu.textContent);
-+      if (visiblePosition?.total === 5 && visiblePosition.index === targetIndex) {
-+        closeOpenMenus();
-+        return { status: 'already-selected', label: visiblePosition.text };
-+      }
-       // The simple slider view and its position text render before the keyboard
-       // target becomes visible. Wait for that target instead of treating the
-       // temporarily zero-height Power menu item as an unsupported layout.
 @@ -1645,6 +1722,10 @@
      let trailing = null;
      const trailingDeadline = performance.now() + MAX_WAIT_MS;
@@ -598,3 +608,30 @@
          case "pro":
              return "pro";
          case "heavy":
+--- a/dist/src/browser/index.js
++++ b/dist/src/browser/index.js
+@@ -1237,6 +1237,12 @@
+                     appearanceConfirmed: !inputOnlyAttachments,
+                 });
+                 logger("All attachments uploaded");
++            }
++            if (config.thinkingTime && !deepResearch) {
++                // Attachment UI can remount the composer; confirm effort on the final draft.
++                const selection = await raceWithDisconnect(ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input));
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
+             }
+             if (deepResearch) {
+                 await raceWithDisconnect(withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+@@ -2557,6 +2563,11 @@
+                 await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
+                 logger("All attachments uploaded");
+             }
++            if (config.thinkingTime && !deepResearch) {
++                const selection = await ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input);
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
++            }
+             if (deepResearch) {
+                 await withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+                     retries: 2,

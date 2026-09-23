@@ -12,6 +12,8 @@
 - 识别不再携带旧 `data-testid` / `.__composer-pill` 的合并模型与强度按钮，并识别同时容纳强度滑块和模型列表的新菜单结构。
 - 档位确认后用受信任的键盘事件关闭强度菜单，再通过 CDP/DOM 上传附件、写入 prompt 和提交，避免菜单遮挡后续操作。
 - 只相信网页实际显示的标签和位置，不把 CLI 请求值冒充为网页模型证据。
+- 从当前滑块的 ARIA 值读取档位；菜单列出的 Pro 5/5 不能证明当前档位。附件完成后、发送前再核验一次，防止输入框重建后回到“即时”。
+- 网页在发送后可能把下一条消息的输入框显示为“即时”；它不代表刚提交的请求降档。一次带附件实测的发送请求使用 `model=gpt-6-pro`、`one_off_model_override=true`，随后输入框显示“即时”。
 - 强度无法确认时 fail closed，禁止静默降级后继续发送。
 - 页面首次未进入 ready state 时，只在同一个隔离 tab 内做一次有界 reload；仍不可验证就 fail closed。
 - Oracle Chrome 不再强制 `en-US`，网页语言跟随系统、Profile 与 ChatGPT 账号设置。
@@ -103,6 +105,9 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
 │   ├── oracle-0.17.3-npm.sha256           npm 发行包的原始/修改后校验和
+│   ├── oracle-0.17.3-from-da31c46.patch  上一受管版本到当前版本的增量 patch
+│   ├── oracle-0.17.3-da31c46.sha256      上一受管版本校验和
+│   ├── oracle-0.17.3-da31c46-npm.sha256  上一受管版本的 npm 校验和
 │   ├── oracle-0.17.3-from-e13ea4c.patch   上一受管版本到当前版本的增量 patch
 │   ├── oracle-0.17.3-e13ea4c.sha256       上一受管版本校验和
 │   ├── oracle-0.17.3-e13ea4c-npm.sha256   上一受管版本的 npm 校验和

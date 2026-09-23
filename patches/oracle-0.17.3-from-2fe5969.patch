@@ -588,25 +588,35 @@
        if (isVisible(direct)) return direct;
        // In the current Intelligence picker the zero-height Power row is a
        // sibling of the simple view, not its descendant. Search the whole menu
-@@ -1073,12 +1155,17 @@
-           return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
+@@ -1065,16 +1147,21 @@
+       const view = findPowerSliderView(menu);
+       if (!view) return null;
+       const control = findPowerSliderControl(menu, view);
+-      if (control) {
+-        const now = Number(control.getAttribute?.('aria-valuenow') ?? control.value);
+-        const min = Number(control.getAttribute?.('aria-valuemin') ?? control.min);
+-        const max = Number(control.getAttribute?.('aria-valuemax') ?? control.max);
++      // The ARIA thumb may be visually hidden while its menu item handles keys.
++      // Read the thumb's value, but keep the interactive item for input.
++      const valueNode = view.querySelector?.('[role="slider"][aria-valuenow], input[type="range"]') ||
++        menu?.querySelector?.('[role="slider"][aria-valuenow], input[type="range"]') || control;
++      if (valueNode) {
++        const now = Number(valueNode.getAttribute?.('aria-valuenow') ?? valueNode.value);
++        const min = Number(valueNode.getAttribute?.('aria-valuemin') ?? valueNode.min);
++        const max = Number(valueNode.getAttribute?.('aria-valuemax') ?? valueNode.max);
+         if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
+-          return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
++          const index = now - min + 1;
++          const total = max - min + 1;
++          return { index, total, text: (view.textContent?.trim?.() || 'Power') + ', item ' + index + ' of ' + total + ' (slider ARIA)', view, control };
          }
        }
 -      const parsed = parseSliderPosition(view.textContent ?? view.getAttribute?.('aria-label'));
-+      const parsed = parseSliderPosition((view.textContent ?? view.getAttribute?.('aria-label') ?? '') + ' ' + (menu?.textContent ?? ''));
-       return parsed ? { ...parsed, view, control } : null;
+-      return parsed ? { ...parsed, view, control } : null;
++      return null;
      };
      const selectEffortFromPowerSlider = async (menu) => {
        const targetIndex = SLIDER_LEVEL_INDEX[TARGET_LEVEL];
-       if (!targetIndex || !menu) return null;
-+      const visiblePosition = parseSliderPosition(menu.textContent);
-+      if (visiblePosition?.total === 5 && visiblePosition.index === targetIndex) {
-+        closeOpenMenus();
-+        return { status: 'already-selected', label: visiblePosition.text };
-+      }
-       // The simple slider view and its position text render before the keyboard
-       // target becomes visible. Wait for that target instead of treating the
-       // temporarily zero-height Power menu item as an unsupported layout.
 @@ -1635,6 +1722,10 @@
      let trailing = null;
      const trailingDeadline = performance.now() + MAX_WAIT_MS;
@@ -823,7 +833,20 @@
          }
          const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
          let profileLock = null;
-@@ -1759,7 +1825,23 @@
+@@ -1171,6 +1237,12 @@
+                     appearanceConfirmed: !inputOnlyAttachments,
+                 });
+                 logger("All attachments uploaded");
++            }
++            if (config.thinkingTime && !deepResearch) {
++                // Attachment UI can remount the composer; confirm effort on the final draft.
++                const selection = await raceWithDisconnect(ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input));
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
+             }
+             if (deepResearch) {
+                 await raceWithDisconnect(withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+@@ -1759,7 +1831,23 @@
          };
      }
      catch (error) {
@@ -848,7 +871,7 @@
          const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
          connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
          const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
-@@ -1845,6 +1927,7 @@
+@@ -1845,6 +1933,7 @@
          }, normalizedError);
      }
      finally {
@@ -856,7 +879,7 @@
          await conversationUrlMonitor?.stop();
          try {
              if (!connectionClosedUnexpectedly) {
-@@ -1950,15 +2033,16 @@
+@@ -1950,16 +2039,17 @@
          removeDialogHandler?.();
          removeTerminationHooks?.();
          if (!keepBrowserOpen) {
@@ -876,13 +899,14 @@
 +                    terminatedRecordedChrome,
 +                    chrome,
 +                });
-+            }
+             }
 +            catch {
 +                // ignore kill failures
-             }
++            }
              if (manualLogin) {
                  const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
-@@ -2033,9 +2117,9 @@
+                     connectionClosedUnexpectedly,
+@@ -2033,9 +2123,9 @@
          });
      });
  }
@@ -894,7 +918,7 @@
          return;
      }
      const waitMs = resolveManualLoginWaitMs(timeoutMs, Boolean(keepBrowser));
-@@ -2043,7 +2127,7 @@
+@@ -2043,7 +2133,7 @@
      let lastNotice = 0;
      while (Date.now() < deadline) {
          try {
@@ -903,7 +927,7 @@
              return;
          }
          catch (error) {
-@@ -2372,7 +2456,7 @@
+@@ -2372,7 +2462,7 @@
          }
          await ensureNotBlocked(Runtime, config.headless, logger);
          await ensureLoggedIn(Runtime, logger, { remoteSession: true });
@@ -912,7 +936,7 @@
          if (config.resumeConversationUrl) {
              await waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
                  requirePriorTurns: true,
-@@ -2430,7 +2514,7 @@
+@@ -2430,7 +2520,7 @@
          const thinkingTime = config.thinkingTime;
          if (thinkingTime && !deepResearch) {
              const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
@@ -921,7 +945,7 @@
                  retries: 2,
                  delayMs: 300,
                  onRetry: (attempt, error) => {
-@@ -2439,6 +2523,10 @@
+@@ -2439,6 +2529,10 @@
                      }
                  },
              });
@@ -932,6 +956,18 @@
          }
          const submitOnce = async (prompt, submissionAttachments) => {
              const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+@@ -2469,6 +2563,11 @@
+                 await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
+                 logger("All attachments uploaded");
+             }
++            if (config.thinkingTime && !deepResearch) {
++                const selection = await ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input);
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
++            }
+             if (deepResearch) {
+                 await withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+                     retries: 2,
 --- a/dist/src/browser/profileCopy.js
 +++ b/dist/src/browser/profileCopy.js
 @@ -16,6 +16,14 @@

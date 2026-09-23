@@ -132,9 +132,15 @@ grep -Eq "$expected_position" <<< "$output" || {
   echo "Live test did not verify the expected five-position control" >&2
   exit 1
 }
-node --input-type=module - "$meta_file" "$expected_position" "$fixture" "${probe_files[0]}" <<'NODE'
+node --input-type=module - "$meta_file" "$expected_position" "$fixture" "${probe_files[0]}" "$test_root/oracle-output.log" <<'NODE'
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+const log = readFileSync(process.argv[6], 'utf8');
+const uploadDone = log.indexOf('All attachments uploaded');
+const effortRechecked = log.indexOf('[browser] Thinking time:', uploadDone + 1);
+const sent = log.indexOf('Clicked send button', effortRechecked + 1);
+assert.ok(uploadDone >= 0 && effortRechecked > uploadDone && sent > effortRechecked,
+  'Effort was not reverified between attachment completion and send');
 const meta = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 assert.equal(meta.status, 'completed', 'Session did not complete');
 assert.equal(meta.browser?.modelSelection?.verified, true, 'Effort evidence was not persisted');

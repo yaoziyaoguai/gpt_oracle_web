@@ -1662,25 +1662,25 @@
 +      const view = findPowerSliderView(menu);
 +      if (!view) return null;
 +      const control = findPowerSliderControl(menu, view);
-+      if (control) {
-+        const now = Number(control.getAttribute?.('aria-valuenow') ?? control.value);
-+        const min = Number(control.getAttribute?.('aria-valuemin') ?? control.min);
-+        const max = Number(control.getAttribute?.('aria-valuemax') ?? control.max);
++      // The ARIA thumb may be visually hidden while its menu item handles keys.
++      // Read the thumb's value, but keep the interactive item for input.
++      const valueNode = view.querySelector?.('[role="slider"][aria-valuenow], input[type="range"]') ||
++        menu?.querySelector?.('[role="slider"][aria-valuenow], input[type="range"]') || control;
++      if (valueNode) {
++        const now = Number(valueNode.getAttribute?.('aria-valuenow') ?? valueNode.value);
++        const min = Number(valueNode.getAttribute?.('aria-valuemin') ?? valueNode.min);
++        const max = Number(valueNode.getAttribute?.('aria-valuemax') ?? valueNode.max);
 +        if (Number.isFinite(now) && Number.isFinite(min) && Number.isFinite(max) && max > min) {
-+          return { index: now - min + 1, total: max - min + 1, text: view.textContent?.trim?.() || null, view, control };
++          const index = now - min + 1;
++          const total = max - min + 1;
++          return { index, total, text: (view.textContent?.trim?.() || 'Power') + ', item ' + index + ' of ' + total + ' (slider ARIA)', view, control };
 +        }
 +      }
-+      const parsed = parseSliderPosition((view.textContent ?? view.getAttribute?.('aria-label') ?? '') + ' ' + (menu?.textContent ?? ''));
-+      return parsed ? { ...parsed, view, control } : null;
++      return null;
 +    };
 +    const selectEffortFromPowerSlider = async (menu) => {
 +      const targetIndex = SLIDER_LEVEL_INDEX[TARGET_LEVEL];
 +      if (!targetIndex || !menu) return null;
-+      const visiblePosition = parseSliderPosition(menu.textContent);
-+      if (visiblePosition?.total === 5 && visiblePosition.index === targetIndex) {
-+        closeOpenMenus();
-+        return { status: 'already-selected', label: visiblePosition.text };
-+      }
 +      // The simple slider view and its position text render before the keyboard
 +      // target becomes visible. Wait for that target instead of treating the
 +      // temporarily zero-height Power menu item as an unsupported layout.
@@ -1995,11 +1995,10 @@
  function redactBrowserConfigForDebugLog(config) {
      const redacted = { ...config };
      if (Array.isArray(config.inlineCookies)) {
-@@ -79,6 +122,19 @@
-     if (options.usingCopiedProfile)
+@@ -80,6 +123,19 @@
          return false;
      return options.effectiveKeepBrowser || options.preserveBrowserOnError;
-+}
+ }
 +async function terminateLocalChromeAfterRun(options) {
 +    if (options.connectionClosedUnexpectedly && !options.usingCopiedProfile) {
 +        return false;
@@ -2012,9 +2011,10 @@
 +}
 +export async function terminateLocalChromeAfterRunForTest(options) {
 +    return terminateLocalChromeAfterRun(options);
- }
++}
  export function shouldPreserveBrowserOnErrorForTest(error, headless) {
      return shouldPreserveBrowserOnError(error, headless);
+ }
 @@ -296,6 +352,31 @@
   * window swallows the click while the automation still believes it clicked.
   * Soft-fails: focus emulation is an optimization, never a hard requirement.
@@ -2165,7 +2165,7 @@
              const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
              const baselineAssistantText = typeof baselineSnapshot?.text === "string" ? baselineSnapshot.text.trim() : "";
              const attachmentNames = submissionAttachments.map((a) => path.basename(a.path));
-@@ -1136,7 +1233,9 @@
+@@ -1136,8 +1233,16 @@
                  const perFileTimeout = 20_000;
                  const waitBudget = Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
                  const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
@@ -2174,9 +2174,16 @@
 +                    appearanceConfirmed: !inputOnlyAttachments,
 +                });
                  logger("All attachments uploaded");
++            }
++            if (config.thinkingTime && !deepResearch) {
++                // Attachment UI can remount the composer; confirm effort on the final draft.
++                const selection = await raceWithDisconnect(ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input));
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
              }
              if (deepResearch) {
-@@ -1726,7 +1825,23 @@
+                 await raceWithDisconnect(withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+@@ -1726,7 +1831,23 @@
          };
      }
      catch (error) {
@@ -2201,7 +2208,7 @@
          const socketClosed = connectionClosedUnexpectedly || isWebSocketClosureError(normalizedError);
          connectionClosedUnexpectedly = connectionClosedUnexpectedly || socketClosed;
          const preservedErrorKind = classifyPreservedBrowserError(normalizedError, config.headless);
-@@ -1812,6 +1927,7 @@
+@@ -1812,6 +1933,7 @@
          }, normalizedError);
      }
      finally {
@@ -2209,7 +2216,7 @@
          await conversationUrlMonitor?.stop();
          try {
              if (!connectionClosedUnexpectedly) {
-@@ -1917,16 +2033,17 @@
+@@ -1917,15 +2039,16 @@
          removeDialogHandler?.();
          removeTerminationHooks?.();
          if (!keepBrowserOpen) {
@@ -2229,14 +2236,13 @@
 +                    terminatedRecordedChrome,
 +                    chrome,
 +                });
-             }
++            }
 +            catch {
 +                // ignore kill failures
-+            }
+             }
              if (manualLogin) {
                  const shouldCleanup = await shouldCleanupManualLoginProfileState(userDataDir, logger.verbose ? logger : undefined, {
-                     connectionClosedUnexpectedly,
-@@ -2000,9 +2117,9 @@
+@@ -2000,9 +2123,9 @@
          });
      });
  }
@@ -2248,7 +2254,7 @@
          return;
      }
      const waitMs = resolveManualLoginWaitMs(timeoutMs, Boolean(keepBrowser));
-@@ -2010,7 +2127,7 @@
+@@ -2010,7 +2133,7 @@
      let lastNotice = 0;
      while (Date.now() < deadline) {
          try {
@@ -2257,7 +2263,7 @@
              return;
          }
          catch (error) {
-@@ -2339,7 +2456,7 @@
+@@ -2339,7 +2462,7 @@
          }
          await ensureNotBlocked(Runtime, config.headless, logger);
          await ensureLoggedIn(Runtime, logger, { remoteSession: true });
@@ -2266,7 +2272,7 @@
          if (config.resumeConversationUrl) {
              await waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
                  requirePriorTurns: true,
-@@ -2397,7 +2514,7 @@
+@@ -2397,7 +2520,7 @@
          const thinkingTime = config.thinkingTime;
          if (thinkingTime && !deepResearch) {
              const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
@@ -2275,7 +2281,7 @@
                  retries: 2,
                  delayMs: 300,
                  onRetry: (attempt, error) => {
-@@ -2406,6 +2523,10 @@
+@@ -2406,6 +2529,10 @@
                      }
                  },
              });
@@ -2286,6 +2292,18 @@
          }
          const submitOnce = async (prompt, submissionAttachments) => {
              const baselineSnapshot = await readAssistantSnapshot(Runtime).catch(() => null);
+@@ -2436,6 +2563,11 @@
+                 await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
+                 logger("All attachments uploaded");
+             }
++            if (config.thinkingTime && !deepResearch) {
++                const selection = await ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input);
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
++            }
+             if (deepResearch) {
+                 await withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+                     retries: 2,
 --- a/dist/src/browser/profileCopy.js
 +++ b/dist/src/browser/profileCopy.js
 @@ -1,5 +1,5 @@

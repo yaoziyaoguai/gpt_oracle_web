@@ -31,6 +31,17 @@ export XDG_CONFIG_HOME="$test_root/config"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_DA31C46_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_DA31C46_UPGRADE_PATCH" >/dev/null
+[[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
+  oracle_web_die "da31c46 runtime unexpectedly matched the current manifest"
+if [[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_DA31C46_HASH_MANIFEST")" != "patched" && \
+      "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_DA31C46_NPM_HASH_MANIFEST")" != "patched" ]]; then
+  oracle_web_die "legacy runtime did not match either da31c46 manifest"
+fi
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 node "$script_dir/test-cli.mjs" "$test_root/package" "$test_root/bin/oracle-web"
 node "$script_dir/test-browser-source.mjs" "$test_root/bin/oracle-web"
 node "$script_dir/test-attachments.mjs" "$test_root/package"
@@ -475,7 +486,7 @@ async function probeCombinedPicker() {
     }
   }
 
-  const control = new FakeNode({ role: "menuitem", "aria-label": "强度" });
+  const control = new FakeNode({ role: "menuitem", "aria-label": "强度", "aria-valuenow": "0", "aria-valuemin": "0", "aria-valuemax": "4" });
   const view = new FakeNode(
     { "data-testid": "composer-model-picker-slider-simple-view" },
     "中即时，第 1 项，共 5 项。使用左右方向键调整强度",
@@ -543,7 +554,7 @@ async function probeCombinedPicker() {
   }
 
   const targetControl = new FakeNode({ role: "menuitem", "aria-label": "强度" });
-  const targetThumb = new FakeNode({ role: "slider" });
+  const targetThumb = new FakeNode({ role: "slider", "aria-valuenow": "4", "aria-valuemin": "0", "aria-valuemax": "4" });
   const targetView = new FakeNode(
     { "data-testid": "composer-model-picker-slider-simple-view" },
     "6Pro",
@@ -592,12 +603,9 @@ async function probeCombinedPicker() {
     { now: () => (clock += 1000) },
     (callback) => { callback(); return 1; },
   );
-  if (
-    targetResult?.status !== "already-selected" ||
-    !targetResult?.label?.includes("第 5 项，共 5 项")
-  ) {
+  if (targetResult?.status !== "already-selected") {
     throw new Error(
-      `combined picker did not verify its menu-level position text: ${JSON.stringify(targetResult)}`,
+      `combined picker did not verify its current slider value: ${JSON.stringify(targetResult)}`,
     );
   }
 
@@ -639,12 +647,9 @@ async function probeCombinedPicker() {
     { now: () => (clock += 1000) },
     (callback) => { callback(); return 1; },
   );
-  if (
-    menuOnlyResult?.status !== "already-selected" ||
-    !menuOnlyResult?.label?.includes("第 5 项，共 5 项")
-  ) {
+  if (menuOnlyResult?.status === "already-selected" || menuOnlyResult?.status === "switched") {
     throw new Error(
-      `combined picker did not trust its visible five-position menu state: ${JSON.stringify(menuOnlyResult)}`,
+      `combined picker trusted menu text without a current-position control: ${JSON.stringify(menuOnlyResult)}`,
     );
   }
 
@@ -671,10 +676,7 @@ async function probeCombinedPicker() {
     { now: () => (clock += 1000) },
     (callback) => { callback(); return 1; },
   );
-  if (
-    delayedResult?.status !== "already-selected" ||
-    !delayedResult?.label?.includes("第 5 项，共 5 项")
-  ) {
+  if (delayedResult?.status !== "already-selected") {
     throw new Error(
       `combined picker did not retry a late-mounted slider: ${JSON.stringify(delayedResult)}`,
     );

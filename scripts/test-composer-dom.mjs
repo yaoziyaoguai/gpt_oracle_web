@@ -110,6 +110,11 @@ try {
   const higher = await evaluate({ expression: buildThinkingTimeExpressionForTest('max'), awaitPromise: true });
   assert.equal(higher.result.value?.status, 'slider-key-required');
   assert.equal(higher.result.value.key, 'ArrowRight');
+  // 菜单可能列出 Pro 5/5，但当前按钮和滑块仍是即时 1/5。
+  await evaluate({ expression: `document.querySelector('form button').textContent = '思考强度即时'; document.querySelector('#position').textContent = 'Pro，第 5 项，共 5 项'; document.querySelector('[role=slider]').setAttribute('aria-valuenow', '0')` });
+  const misleading = await evaluate({ expression: buildThinkingTimeExpressionForTest('max'), awaitPromise: true });
+  assert.notEqual(misleading.result.value?.status, 'already-selected', 'Menu option text was mistaken for the current effort');
+  assert.equal(misleading.result.value?.requestedSliderPosition, '5/5');
   console.log('Native composer DOM regression passed (no ChatGPT connection)');
 } finally {
   if (client) await client.close();
