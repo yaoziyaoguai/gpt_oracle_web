@@ -13,7 +13,7 @@ const { uploadAttachmentFile, waitForAttachmentCompletion } = await import(pathT
 const { buildAttachmentReadyExpressionForTest } = await import(pathToFileURL(path.join(runtimeRoot, 'dist/src/browser/actions/promptComposer.js')));
 const { buildConversationTurnListExpression } = await import(pathToFileURL(path.join(runtimeRoot, 'dist/src/browser/conversationTurns.js')));
 const { readAssistantSnapshot } = await import(pathToFileURL(path.join(runtimeRoot, 'dist/src/browser/actions/assistantResponse.js')));
-const { buildThinkingTimeExpressionForTest } = await import(pathToFileURL(path.join(runtimeRoot, 'dist/src/browser/actions/thinkingTime.js')));
+const { buildThinkingTimeExpressionForTest, dismissThinkingPickerForTest } = await import(pathToFileURL(path.join(runtimeRoot, 'dist/src/browser/actions/thinkingTime.js')));
 const profile = mkdtempSync(path.join(tmpdir(), 'oracle-web-dom-test-'));
 let chrome;
 let client;
@@ -95,7 +95,7 @@ try {
   await evaluate({ expression: `document.querySelector('[data-markdown-text-style]').remove()` });
   assert.equal(await readAssistantSnapshot({ evaluate }), null, 'User prompt was captured as an assistant answer');
   // 新菜单保留可聚焦的强度行和 ARIA thumb，但移除了旧 simple-view testid。
-  const picker = `<form><button aria-haspopup="menu" aria-expanded="true" aria-controls="picker" aria-label="选择 ChatGPT 模型">思考强度</button></form>
+  const picker = `<form><button type="button" aria-haspopup="menu" aria-expanded="true" aria-controls="picker" aria-label="选择 ChatGPT 模型">思考强度</button></form>
     <div role="menu" id="picker" data-state="open" tabindex="-1">
       <span id="position">Pro，第 5 项，共 5 项</span>
       <div role="menuitem" aria-label="强度" tabindex="-1" style="width:246px;height:32px">
@@ -115,6 +115,19 @@ try {
   const misleading = await evaluate({ expression: buildThinkingTimeExpressionForTest('max'), awaitPromise: true });
   assert.notEqual(misleading.result.value?.status, 'already-selected', 'Menu option text was mistaken for the current effort');
   assert.equal(misleading.result.value?.requestedSliderPosition, '5/5');
+  // Escape 被网页忽略时，只点击命中当前 editor 的点，并回读菜单已关闭。
+  const editor = '<div class="ProseMirror" contenteditable="true" role="textbox" style="position:absolute;left:10px;top:200px;width:320px;height:48px"></div>';
+  const mounted = await evaluate({ expression: `document.body.innerHTML=${JSON.stringify(picker.replace('</form>', editor + '</form>'))}; document.querySelector('[role=menuitem]').focus(); window.composerClicks=0; document.querySelector('[contenteditable]').addEventListener('click',()=>{window.composerClicks++;document.querySelector('[role=menu]').remove()})` });
+  assert.equal(mounted.exceptionDetails, undefined, 'Picker fixture did not mount');
+  const mountedState = await evaluate({ expression: '({clicks:window.composerClicks,menu:!!document.querySelector("[role=menu]"),url:location.href})' });
+  assert.equal(mountedState.result.value.clicks, 0, JSON.stringify(mountedState));
+  const ignoredEscapeInput = {
+    dispatchKeyEvent: async () => {},
+    dispatchMouseEvent: event => client.Input.dispatchMouseEvent(event),
+  };
+  assert.equal(await dismissThinkingPickerForTest({ evaluate }, ignoredEscapeInput), true, 'A verified composer click did not dismiss an Escape-resistant picker');
+  const dismissed = await evaluate({ expression: '({clicks:window.composerClicks,menu:!!document.querySelector("[role=menu]")})' });
+  assert.deepEqual(dismissed.result.value, { clicks: 1, menu: false }, JSON.stringify({mounted:mountedState.result.value,after:dismissed.result.value}));
   console.log('Native composer DOM regression passed (no ChatGPT connection)');
 } finally {
   if (client) await client.close();

@@ -31,6 +31,15 @@ export XDG_CONFIG_HOME="$test_root/config"
 "$script_dir/verify.sh"
 "$script_dir/install.sh"
 
+patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_FA204C9_UPGRADE_PATCH" >/dev/null
+patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_FA204C9_UPGRADE_PATCH" >/dev/null
+if [[ "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_FA204C9_HASH_MANIFEST")" != "patched" && \
+      "$(oracle_web_patch_state "$test_root/package" "$ORACLE_WEB_FA204C9_NPM_HASH_MANIFEST")" != "patched" ]]; then
+  oracle_web_die "legacy runtime did not match either fa204c9 manifest"
+fi
+"$script_dir/install.sh"
+"$script_dir/verify.sh"
+
 patch -C -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_DA31C46_UPGRADE_PATCH" >/dev/null
 patch -f -R -p1 -d "$test_root/package" -i "$ORACLE_WEB_DA31C46_UPGRADE_PATCH" >/dev/null
 [[ "$(oracle_web_patch_state "$test_root/package")" == "unknown" ]] || \
@@ -44,6 +53,7 @@ fi
 
 node "$script_dir/test-cli.mjs" "$test_root/package" "$test_root/bin/oracle-web"
 node "$script_dir/test-browser-source.mjs" "$test_root/bin/oracle-web"
+node "$script_dir/test-auth-readiness.mjs" "$test_root/package"
 node "$script_dir/test-attachments.mjs" "$test_root/package"
 node "$script_dir/test-composer-dom.mjs" "$test_root/package"
 node "$script_dir/test-answer-wait.mjs" "$test_root/package"

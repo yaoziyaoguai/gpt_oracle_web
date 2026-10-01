@@ -352,6 +352,81 @@
        '[data-testid*="chip"]',
        '[data-testid*="attachment"]',
        '[data-testid*="upload"]',
+--- a/dist/src/browser/actions/navigation.js
++++ b/dist/src/browser/actions/navigation.js
+@@ -495,6 +495,14 @@
+     if (!ready) {
+         const authUrl = await currentUrl(Runtime);
+         if (authUrl && isAuthLoginUrl(authUrl)) {
++            if (options.requireFreshConversation) {
++                const pageUrl = authUrl.split(/[?#]/)[0];
++                throw new BrowserAutomationError(`ChatGPT navigated to an authentication page before the prompt composer became ready (${pageUrl}); refresh the configured signed-in source Profile.`, {
++                    stage: "prompt-ready",
++                    pageUrl,
++                    onAuthPage: true,
++                });
++            }
+             // Learned: auth.openai.com/login can appear after cookies are copied; allow manual login window.
+             logger("Auth login page detected; waiting for manual login to complete...");
+             const extended = Math.min(Math.max(timeoutMs, 60_000), 20 * 60_000);
+@@ -504,7 +512,11 @@
+             }
+         }
+         await logDomFailure(Runtime, logger, "prompt-textarea");
+-        throw new Error("Prompt textarea did not appear before timeout");
++        throw new BrowserAutomationError("Prompt textarea did not appear before timeout", {
++            stage: "prompt-ready",
++            pageUrl: authUrl?.split(/[?#]/)[0] ?? null,
++            onAuthPage: Boolean(authUrl && isAuthLoginUrl(authUrl)),
++        });
+     }
+     if (options.requireFreshConversation) {
+         await assertFreshConversation(Runtime, logger);
+@@ -649,7 +661,7 @@
+         if (parsed.hostname.includes("auth.openai.com")) {
+             return true;
+         }
+-        return /^\/log-?in/i.test(parsed.pathname);
++        return /^\/(?:auth\/)?(?:log-?in|sign-?in)(?:\/|$)/i.test(parsed.pathname);
+     }
+     catch {
+         return false;
+@@ -770,12 +782,6 @@
+     return `(async () => {
+     // /api/auth/session remains cookie-authenticated and exposes user presence without
+     // requiring the bearer token used by /backend-api/*. Never return or log its token.
+-    const pageUrl = typeof location === 'object' && location?.href ? location.href : null;
+-    const onAuthPage =
+-      typeof location === 'object' &&
+-      typeof location.pathname === 'string' &&
+-      /^\\/(auth|login|signin)/i.test(location.pathname);
+-
+     const hasLoginCta = () => {
+       const candidates = Array.from(
+         document.querySelectorAll(
+@@ -796,7 +802,8 @@
+         if (!text) return false;
+         const normalized = text.toLowerCase().trim();
+         return (
+-          ['log in', 'login', 'sign in', 'signin', 'sign up for free'].includes(normalized) ||
++          ['log in', 'login', 'sign in', 'signin', 'sign up for free', '登录', '登入', '登录或注册', '登入或註冊'].includes(normalized) ||
++          /^(?:使用|透過).*(?:google|apple).*(?:继续|繼續)$/i.test(normalized) ||
+           normalized.startsWith('continue with') ||
+           normalized.includes('get responses tailored to you') ||
+           normalized.includes('log in to get answers')
+@@ -1005,6 +1012,12 @@
+       classification = classifyAuth(auth, appAuthenticated);
+     }
+ 
++    // 认证请求期间页面可能重定向；最终判断必须使用请求完成后的 URL。
++    const pageUrl = typeof location === 'object' && location?.href ? location.href : null;
++    const onAuthPage =
++      typeof location === 'object' &&
++      typeof location.pathname === 'string' &&
++      /^\\/(auth|login|signin)/i.test(location.pathname);
+     const loginSignals = domLoginCta || onAuthPage;
+     const backendStatus = auth.backend ? auth.backend.status : null;
+     const cfBlocked = auth.session.cfBlocked || Boolean(auth.backend?.cfBlocked);
 --- a/dist/src/browser/actions/promptComposer.js
 +++ b/dist/src/browser/actions/promptComposer.js
 @@ -558,6 +558,7 @@
@@ -364,7 +439,13 @@
        '[data-testid*="chip"]',
 --- a/dist/src/browser/actions/thinkingTime.js
 +++ b/dist/src/browser/actions/thinkingTime.js
-@@ -191,6 +191,51 @@
+@@ -1,4 +1,4 @@
+-import { MENU_CONTAINER_SELECTOR, MENU_ITEM_SELECTOR, MODEL_BUTTON_SELECTOR, } from "../constants.js";
++import { INPUT_SELECTORS, MENU_CONTAINER_SELECTOR, MENU_ITEM_SELECTOR, MODEL_BUTTON_SELECTOR, } from "../constants.js";
+ import { logDomFailure } from "../domDebug.js";
+ import { buildClickDispatcher } from "./domEvents.js";
+ const BROWSER_THINKING_LOG_PREFIX = "[browser] Thinking time:";
+@@ -191,6 +191,80 @@
      }
      return { status: "ready", result: current };
  }
@@ -411,12 +492,41 @@
 +            return true;
 +        }
 +    }
++    // The current picker can ignore Escape after the slider reports its final
++    // position. A trusted click on the visible composer safely dismisses it.
++    if (typeof Input?.dispatchMouseEvent === "function") {
++        const targetProbe = await Runtime.evaluate({
++            expression: `(() => {
++              const selectors = ${JSON.stringify(INPUT_SELECTORS)};
++              for (const selector of selectors) {
++                for (const editor of document.querySelectorAll(selector)) {
++                  const rect = editor.getBoundingClientRect();
++                  if (rect.width < 40 || rect.height < 10) continue;
++                  const x = rect.left + Math.min(48, rect.width * 0.15);
++                  const y = rect.top + rect.height / 2;
++                  const hit = document.elementFromPoint(x, y);
++                  if (hit === editor || editor.contains(hit)) return { x, y };
++                }
++              }
++              return null;
++            })()`,
++            returnByValue: true,
++        }).catch(() => undefined);
++        const target = targetProbe?.result?.value;
++        if (!targetProbe?.exceptionDetails && Number.isFinite(target?.x) && Number.isFinite(target?.y)) {
++            await Input.dispatchMouseEvent({ type: "mousePressed", x: target.x, y: target.y, button: "left", clickCount: 1 });
++            await Input.dispatchMouseEvent({ type: "mouseReleased", x: target.x, y: target.y, button: "left", clickCount: 1 });
++            await new Promise((resolve) => setTimeout(resolve, 200));
++            const probe = await Runtime.evaluate({ expression: pickerVisibleExpression, returnByValue: true }).catch(() => undefined);
++            if (!probe?.exceptionDetails && probe?.result?.value === false) return true;
++        }
++    }
 +    return false;
 +}
  async function evaluateThinkingTimeSelection(Runtime, level, desiredModel, Input) {
      let lastResult;
      for (let attempt = 0; attempt < 16; attempt += 1) {
-@@ -201,6 +246,16 @@
+@@ -201,6 +275,16 @@
          });
          lastResult = outcome.result?.value;
          if (lastResult?.status !== "slider-key-required" && !isThinkingPointerAction(lastResult)) {
@@ -433,7 +543,7 @@
              return lastResult;
          }
          if (!Input || typeof Input.dispatchKeyEvent !== "function") {
-@@ -571,8 +626,21 @@
+@@ -571,8 +655,21 @@
      const TRAILING_SELECTOR = '[data-model-picker-thinking-effort-action="true"]';
      const INTELLIGENCE_MENU_SELECTOR = '[data-testid="composer-intelligence-picker-content"]';
      const PRO_EFFORT_TRIGGER_SELECTOR = '[data-testid="composer-intelligence-pro-thinking-effort-trigger"]';
@@ -456,7 +566,7 @@
      const findTrailingButtons = () => Array.from(document.querySelectorAll(TRAILING_SELECTOR));
      const KIND_NOT_FOUND = { kindNotFound: true };
  
-@@ -815,8 +883,10 @@
+@@ -815,8 +912,10 @@
      };
      const isEffortMenu = (menu) => {
        if (!isVisible(menu)) return false;
@@ -467,7 +577,7 @@
        const label = menu.querySelector?.('.__menu-label, [class*="menu-label"]');
        const labelText = normalize(label?.textContent ?? '');
        return (
-@@ -1014,7 +1084,6 @@
+@@ -1014,7 +1113,6 @@
      // (simple view) plus an "Advanced" view holding two submenu openers: Model and
      // Effort. The tier rows only exist inside the Effort submenu, so the flat scan
      // of the top-level menu finds nothing and we must expand and descend.
@@ -475,7 +585,7 @@
      const ADVANCED_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-advanced-view"]';
      const SUBMENU_OPENER_SELECTOR = '[role="menuitem"][aria-haspopup="menu"]';
      const nodeLabel = (node) =>
-@@ -1051,10 +1120,13 @@
+@@ -1051,10 +1149,13 @@
        const scoped = menu?.querySelector?.(SIMPLE_VIEW_SELECTOR);
        if (isVisible(scoped)) return scoped;
        const global = document.querySelector(SIMPLE_VIEW_SELECTOR);
@@ -491,7 +601,7 @@
        if (isVisible(direct)) return direct;
        // In the current Intelligence picker the zero-height Power row is a
        // sibling of the simple view, not its descendant. Search the whole menu
-@@ -1075,16 +1147,21 @@
+@@ -1075,16 +1176,21 @@
        const view = findPowerSliderView(menu);
        if (!view) return null;
        const control = findPowerSliderControl(menu, view);
@@ -520,7 +630,7 @@
      };
      const selectEffortFromPowerSlider = async (menu) => {
        const targetIndex = SLIDER_LEVEL_INDEX[TARGET_LEVEL];
-@@ -1645,6 +1722,10 @@
+@@ -1645,6 +1751,10 @@
      let trailing = null;
      const trailingDeadline = performance.now() + MAX_WAIT_MS;
      while (performance.now() < trailingDeadline) {
@@ -531,6 +641,70 @@
        trailing = pickTrailingForCurrentModel();
        if (trailing) break;
        await sleep(100);
+@@ -1704,6 +1814,7 @@
+ export function buildThinkingTimeExpressionForTest(level = "extended", desiredModel) {
+     return buildThinkingTimeExpression(level, desiredModel);
+ }
++export { dismissThinkingPicker as dismissThinkingPickerForTest };
+ function inferThinkingTargetModelKind(desiredModel) {
+     const normalized = (desiredModel ?? "")
+         .toLowerCase()
+--- a/dist/src/browser/index.js
++++ b/dist/src/browser/index.js
+@@ -878,8 +878,11 @@
+                 });
+                 client = connection.client;
+                 isolatedTargetId = connection.targetId ?? null;
++                lastTargetId = connection.targetId ?? undefined;
++                lastUrl = "about:blank";
+                 ownsTarget = true;
+             }
++            await emitRuntimeHint();
+             if (tabLease && isolatedTargetId) {
+                 await tabLease.update({
+                     chromeHost,
+@@ -1237,6 +1240,12 @@
+                     appearanceConfirmed: !inputOnlyAttachments,
+                 });
+                 logger("All attachments uploaded");
++            }
++            if (config.thinkingTime && !deepResearch) {
++                // Attachment UI can remount the composer; confirm effort on the final draft.
++                const selection = await raceWithDisconnect(ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input));
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
+             }
+             if (deepResearch) {
+                 await raceWithDisconnect(withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+@@ -2556,6 +2565,11 @@
+                 const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
+                 await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
+                 logger("All attachments uploaded");
++            }
++            if (config.thinkingTime && !deepResearch) {
++                const selection = await ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input);
++                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
++                await emitRuntimeHint();
+             }
+             if (deepResearch) {
+                 await withRetries(() => activateDeepResearch(Runtime, Input, logger), {
+--- a/dist/src/browser/reattach.js
++++ b/dist/src/browser/reattach.js
+@@ -396,12 +396,12 @@
+         cleanupPromise = (async () => {
+             removeTerminationHooks?.();
+             if (client && typeof client.close === "function") {
+-                await client.close().catch(() => undefined);
++                await Promise.resolve().then(() => client.close()).catch(() => undefined);
+             }
+             if (keepBrowser) {
+                 return;
+             }
+-            await chrome.kill().catch(() => undefined);
++            await Promise.resolve().then(() => chrome.kill()).catch(() => undefined);
+             if (manualLogin) {
+                 await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "never" }).catch(() => undefined);
+             }
 --- a/dist/src/browser/constants.js
 +++ b/dist/src/browser/constants.js
 @@ -19,6 +19,7 @@
@@ -561,23 +735,6 @@
      'form button[aria-label*="stop" i]:not([aria-label*="dictat" i]):not([aria-label*="voice" i]):not([aria-label*="read" i])',
  ];
  export const SEND_BUTTON_SELECTORS = [
---- a/dist/src/browser/reattach.js
-+++ b/dist/src/browser/reattach.js
-@@ -396,12 +396,12 @@
-         cleanupPromise = (async () => {
-             removeTerminationHooks?.();
-             if (client && typeof client.close === "function") {
--                await client.close().catch(() => undefined);
-+                await Promise.resolve().then(() => client.close()).catch(() => undefined);
-             }
-             if (keepBrowser) {
-                 return;
-             }
--            await chrome.kill().catch(() => undefined);
-+            await Promise.resolve().then(() => chrome.kill()).catch(() => undefined);
-             if (manualLogin) {
-                 await cleanupStaleProfileState(userDataDir, logger, { lockRemovalMode: "never" }).catch(() => undefined);
-             }
 --- a/dist/src/cli/options.js
 +++ b/dist/src/cli/options.js
 @@ -133,7 +133,7 @@
@@ -608,30 +765,3 @@
          case "pro":
              return "pro";
          case "heavy":
---- a/dist/src/browser/index.js
-+++ b/dist/src/browser/index.js
-@@ -1237,6 +1237,12 @@
-                     appearanceConfirmed: !inputOnlyAttachments,
-                 });
-                 logger("All attachments uploaded");
-+            }
-+            if (config.thinkingTime && !deepResearch) {
-+                // Attachment UI can remount the composer; confirm effort on the final draft.
-+                const selection = await raceWithDisconnect(ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input));
-+                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
-+                await emitRuntimeHint();
-             }
-             if (deepResearch) {
-                 await raceWithDisconnect(withRetries(() => activateDeepResearch(Runtime, Input, logger), {
-@@ -2557,6 +2563,11 @@
-                 await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
-                 logger("All attachments uploaded");
-             }
-+            if (config.thinkingTime && !deepResearch) {
-+                const selection = await ensureThinkingTime(Runtime, config.thinkingTime, logger, null, Input);
-+                modelSelectionEvidence = buildPowerControlModelSelectionEvidence(config.desiredModel, modelStrategy, selection);
-+                await emitRuntimeHint();
-+            }
-             if (deepResearch) {
-                 await withRetries(() => activateDeepResearch(Runtime, Input, logger), {
-                     retries: 2,

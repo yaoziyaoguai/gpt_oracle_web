@@ -10,13 +10,14 @@
 
 - 根据任务复杂度在网页五档强度中的第 4、5 档之间自动选择。
 - 识别不再携带旧 `data-testid` / `.__composer-pill` 的合并模型与强度按钮，并识别同时容纳强度滑块和模型列表的新菜单结构。
-- 档位确认后用受信任的键盘事件关闭强度菜单，再通过 CDP/DOM 上传附件、写入 prompt 和提交，避免菜单遮挡后续操作。
+- 档位确认后用受信任的键盘事件关闭强度菜单；网页忽略 Escape 时，验证当前编辑器的 DOM 命中后点击，并回读菜单已关闭，再上传附件和提交。
 - 只相信网页实际显示的标签和位置，不把 CLI 请求值冒充为网页模型证据。
 - 从当前滑块的 ARIA 值读取档位；菜单列出的 Pro 5/5 不能证明当前档位。附件完成后、发送前再核验一次，防止输入框重建后回到“即时”。
 - 网页在发送后可能把下一条消息的输入框显示为“即时”；它不代表刚提交的请求降档。一次带附件实测的发送请求使用 `model=gpt-6-pro`、`one_off_model_override=true`，随后输入框显示“即时”。
 - 强度无法确认时 fail closed，禁止静默降级后继续发送。
 - 页面首次未进入 ready state 时，只在同一个隔离 tab 内做一次有界 reload；仍不可验证就 fail closed。
 - Oracle Chrome 不再强制 `en-US`，网页语言跟随系统、Profile 与 ChatGPT 账号设置。
+- 登录探针在认证请求完成后回读 URL，识别中文登录操作，避免把跳转前的状态当作已登录。输入框未就绪且页面已进入登录页时，报告 `prompt-ready` 和不含认证参数的 URL。
 - 把网页版限定为 planner/reviewer，把实现、测试和最终判断留给当前 Codex Desktop 或 Claude Code 会话。
 - 隔离多批咨询，避免把第二批材料串进第一批会话。
 - 修复附件已完成却被误判为仍在上传的问题。
@@ -105,6 +106,9 @@ Oracle Chrome 会设置为 `1280×720`，并在档位选择和提交前恢复该
 │   ├── oracle-0.17.3.patch                最小 runtime patch
 │   ├── oracle-0.17.3.sha256               原始/修改后文件校验和
 │   ├── oracle-0.17.3-npm.sha256           npm 发行包的原始/修改后校验和
+│   ├── oracle-0.17.3-from-fa204c9.patch   fa204c9 到当前版本的精确迁移
+│   ├── oracle-0.17.3-fa204c9.sha256       fa204c9 的 Homebrew 校验和
+│   ├── oracle-0.17.3-fa204c9-npm.sha256   fa204c9 的 npm 校验和
 │   ├── oracle-0.17.3-from-da31c46.patch  上一受管版本到当前版本的增量 patch
 │   ├── oracle-0.17.3-da31c46.sha256      上一受管版本校验和
 │   ├── oracle-0.17.3-da31c46-npm.sha256  上一受管版本的 npm 校验和
@@ -369,8 +373,8 @@ Codex 输出契约见 [`skill/oracle-web/references/execution-advice.md`](skill/
 `patches/oracle-0.17.3.patch` 只支持上游 `0.17.3`，覆盖八个明确边界：
 
 1. **Thinking time**：识别当前五档 power slider，通过真实 CDP pointer/keyboard 事件选择第 4、5 档，并对未验证选择 fail closed。
-2. **Page readiness**：首次文档 readiness 超时只 reload 当前隔离 tab 一次；能力控件缺失时也只对当前页做一次 bounded reload，之后仍然 fail closed。
-3. **Early runtime identity**：Chrome 启动后、首次导航前就持久化 PID、port 和 `userDataDir`，使早期失败也能按精确身份审计。
+2. **Page readiness**：首次文档 readiness 超时只 reload 当前隔离 tab 一次；能力控件缺失时也只对当前页做一次 bounded reload。认证探针在异步请求后回读页面身份，识别中文登录操作；输入框就绪前跳到登录页时，报告认证失败位置和不含查询参数的 URL。
+3. **Early runtime identity**：Chrome 启动后持久化 PID、port 和 `userDataDir`，隔离 tab 创建后、首次导航前持久化 target ID，使早期失败也能按精确身份审计。
 4. **Attachment readiness**：在 prompt 尚未写入时，不再把发送按钮因空编辑器而 disabled 误判为附件上传未完成；prompt 写入后，带附件的 disabled 发送按钮会在 300 秒窗口内继续轮询。
 5. **Stable viewport**：本地自动化 Chrome 使用固定窗口尺寸；档位与发送动作在 pointer 输入前重新定位目标、比较 viewport、验证 DOM 命中，resize 后不使用旧坐标。
 6. **Prompt submission**：优先 `#prompt-textarea`，兼容当前无该 ID 的可编辑 composer；先用 trusted CDP click 激活编辑器再写入，要求 committed turn，并从 assistant 节点读取答案。
@@ -407,7 +411,8 @@ Codex 输出契约见 [`skill/oracle-web/references/execution-advice.md`](skill/
 - 校验 Codex Desktop 与 Claude Code 两个 Skill 入口，并防止共用故障合同发生偏移。
 - 模拟双编辑器 DOM，确认写入和 Enter 始终落在真实 `#prompt-textarea`。
 - 用旧按钮和两种已观测的新按钮 DOM 快照验证五档控件定位，防止网页属性漂移再次退化为 `chip-not-found`。
-- 验证强度菜单必须被真实 `Escape` 关闭；菜单仍打开时 fail closed，不进入附件上传。
+- 验证强度菜单由真实 `Escape` 或命中当前编辑器的 CDP 点击关闭；菜单仍打开时 fail closed，不进入附件上传。
+- 验证异步认证期间的登录跳转、中文登录提示，以及失败诊断不会保存认证 URL 的查询参数。
 - 用真实 CLI 检查默认 `max` 和 `extra-high`，避免 wrapper 测试通过但实际解析器拒绝参数。
 - 用本地无登录 headless Chrome 的原生 DOM 回归附件入口、中文改名卡片、重复上传保护、新消息节点和双向切档；不连接 ChatGPT。
 - 用实际回答等待函数回归思考标题停留超过 8 秒、正文生成停顿、旧回答按钮干扰、当前回答完成、无完成证据超时，以及 observer 失败后的剩余期限；45 分钟静默边界另由虚拟时间样本检查。这些不替代真实网站长思考测试。

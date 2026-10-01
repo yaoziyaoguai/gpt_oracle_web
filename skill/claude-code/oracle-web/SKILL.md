@@ -11,6 +11,7 @@ Use the installed `oracle-web` wrapper from Claude Code to send a focused prompt
 
 - Locate the wrapper with `command -v oracle-web`. If it is missing, stop and direct the user to this repository's installer.
 - Before every consultation, run `oracle-web --doctor` and use the reported wrapper, Chrome user-data root, and Profile as the only browser identity. `loginState=not-tested` means the check is local-only; it is not proof that ChatGPT is signed in.
+- A successful auth-session probe can precede a redirect to the login page. Require a ready composer on the fresh ChatGPT page; an authentication redirect means the configured source Profile needs its login refreshed, not that another Profile or lower effort should be tried.
 - Do not pass `--copy-profile`, `--browser-chrome-profile`, manual-login flags, cookie flags, or another browser/profile path. The wrapper owns those arguments. If the selected Chrome Profile must change, use `ORACLE_WEB_CHROME_USER_DATA_DIR` and `ORACLE_WEB_CHROME_PROFILE` in the host environment, then rerun `--doctor`.
 - Use only the repository-supported Oracle runtime version. Do not upgrade or replace it during a consultation.
 - The wrapper also reads `${XDG_CONFIG_HOME:-$HOME/.config}/oracle-web/chrome-user-data-dir`, a local file containing one absolute source directory path. `ORACLE_WEB_CHROME_USER_DATA_DIR` overrides it. A dedicated signed-in source is persistent; only its per-run copies are disposable. Never clean up the source or add it to a repository.
@@ -19,6 +20,7 @@ Use the installed `oracle-web` wrapper from Claude Code to send a focused prompt
 - Every consultation owns one new session, temporary Profile, Chrome process, CDP port, and target. Identify it from that session's recorded `chromePid`, `chromePort`, `chromeTargetId`, and `userDataDir`; never choose a window by title, process name, or creation time.
 - A copied-profile run owns its launched Chrome even if CDP disconnects. The runtime must terminate that exact Chrome and remove the temporary Profile; a disconnect must not leave a recoverable copied-profile browser behind.
 - Runtime identity is persisted immediately after Chrome launch, so navigation failures must still be auditable by the exact recorded PID and temporary Profile.
+- The isolated target ID is also persisted before navigation. Use the structured failure's sanitized `pageUrl` to distinguish a login redirect from a missing editor.
 - Do not pass `--browser-keep-browser`, `--browser-tab`, `--browser-attach-running`, `--followup`, or `--browser-follow-up`. The wrapper rejects them so a new consultation cannot retain or reuse an old page.
 - The wrapper uses `--browser-model-strategy current`. The model already selected in ChatGPT wins; the requested CLI model is not proof of the web model.
 - After submission, the composer may show Instant for the next message. This does not identify the model or effort used by the submitted message; use pre-send slider evidence and, when needed, the submitted request's model field.
