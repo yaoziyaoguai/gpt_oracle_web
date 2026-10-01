@@ -2,3 +2,4 @@
 .oracle-web-state/
 *.log
 *.tmp
+graphify-out/
