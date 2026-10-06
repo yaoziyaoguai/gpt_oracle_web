@@ -6,7 +6,11 @@
 
 ## 为什么有这个项目
 
-上游 [Oracle](https://github.com/steipete/oracle) 已经提供了把 prompt 和文件送入模型的 CLI。本项目不重写 Oracle，也不提供新的模型；它补的是编程 Agent 与 ChatGPT 网页之间缺少的“可靠工作流”层：
+这个项目的目的，是把复杂规划和审查放到 ChatGPT Web，减少 Codex 或 Claude Code 在这些回合里反复推理的 Token 消耗。材料整理、回答读取、实现和验证仍使用编程 Agent 的上下文；ChatGPT Web 也有订阅用量限制。本仓库没有测量 Token 节省比例。
+
+使用背景和实测记录见[《我为什么把 ChatGPT Web 和 Codex 分开用》](https://wangjinkun333.me/blog/gpt-oracle-web-reliable-browser-consultation)。
+
+上游 [Oracle](https://github.com/steipete/oracle) 提供了把 prompt 和文件送入模型的 CLI。本项目不重写 Oracle，也不提供新的模型；它增加档位核验、提交检查和会话管理：
 
 - 根据任务复杂度在网页五档强度中的第 4、5 档之间自动选择。
 - 识别不再携带旧 `data-testid` / `.__composer-pill` 的合并模型与强度按钮，并识别同时容纳强度滑块和模型列表的新菜单结构。
@@ -36,9 +40,9 @@
 - 自定义 slug 支持 3–12 个词并保留末尾唯一后缀；超长值会明确报错，不再静默裁切。
 - 固定自动化 Chrome 的初始窗口尺寸，并在档位选择和提交前恢复该尺寸。
 - 每次 trusted pointer 操作前重新定位元素、核对 viewport 并执行 `elementFromPoint` 命中检查；窗口尺寸变化时丢弃旧坐标。
-- 为每次咨询绑定独立的 session、Chrome PID、CDP port、target ID 和临时 Profile；Chrome 启动后立即记录 identity，无论成功、失败、超时、中断或恢复结束都只清理这组资源。
+- 为每次咨询绑定独立的 session、Chrome PID、CDP port、target ID 和临时 Profile；Chrome 启动后记录 identity，正常收尾或处理可捕获的终止信号时只清理这组资源。`SIGKILL` 不在信号处理器的覆盖范围内。
 - 收到 `SIGINT`、`SIGTERM` 或 `SIGQUIT` 时，先把 session 和 model run 写成已中断，再关闭记录的 Chrome PID 并删除它的临时 Profile。
-- 即使 CDP 意外断开，copy-profile 模式仍会结束本次记录的 Chrome 并删除临时 Profile。
+- CDP 意外断开后，copy-profile 模式会结束本次记录的 Chrome 并删除临时 Profile；当前没有在本轮内恢复原连接的处理。
 - live smoke 会读取本次唯一 slug 的 session metadata，自动确认记录的 Chrome PID 已停止且临时 Profile 已删除。
 - 把本地修改保存为可校验、可回滚的版本化 patch，避免只存在于 Homebrew Cellar。
 
@@ -70,7 +74,7 @@ ChatGPT Web ──返回规划/审查/执行建议──▶ 当前编程 Agent �
   └── finally：关闭本次 Chrome，删除本次临时 Profile
 ```
 
-临时 Chrome 窗口是正常现象。wrapper 不靠窗口标题或创建时间猜测归属，而是使用本次 runtime identity 精确关联。退出后 runtime 会关闭隔离窗口并清理临时 Profile；session 元数据只用于短期恢复和排障，不是仍在运行的网页。
+临时 Chrome 窗口是正常现象。wrapper 不靠窗口标题或创建时间猜测归属，而是使用本次 runtime identity 精确关联。正常收尾时 runtime 会关闭隔离窗口并清理临时 Profile；session 元数据用于短期排障，不能单凭其中的 `running` 状态判断浏览器还在运行。强制结束执行器后的限制见下文。
 
 Prompt 写入使用 `Input.insertText`，附件使用 `DOM.setFileInputFiles`。这两步不依赖屏幕坐标。ChatGPT 的五档 power control 不是标准 `select`，发送按钮也需要网页接受可信输入事件，因此这两类操作仍通过 CDP keyboard/pointer 完成。runtime 优先读取 ARIA slider 并发送键盘事件；需要 pointer 时，点击前会重新定位目标并验证命中，不使用截图坐标或人工补点。
 
@@ -360,7 +364,7 @@ Codex 输出契约见 [`skill/oracle-web/references/execution-advice.md`](skill/
 
 - 本项目不会读取或打印 Cookie 内容。
 - 不要把临时目录加入仓库、压缩包或错误报告。
-- wrapper 正常结束、失败、超时或收到终止信号时都会要求 runtime 清理临时副本；恢复路径同样使用 `finally` 收尾。
+- wrapper 正常结束、失败、超时或收到 `SIGINT`、`SIGTERM`、`SIGQUIT` 时会要求 runtime 清理临时副本；恢复路径使用 `finally` 收尾。执行器遭到 `SIGKILL` 时可能留下浏览器、临时副本和过期的 `running` 状态，不能把这条路径视为已完成清理。
 - 清理优先调用本次 CDP client 的 `Browser.close()`；必要时只向 session 记录的 `chromePid` 发信号。代码不使用按名称批量杀进程的命令，也不操作 `controllerPid`。
 - 删除目录前必须同时确认 copy-profile 模式、系统临时目录边界以及 `oracle-browser-*` / `oracle-reattach-*` 名称。正常 Chrome Profile 和 Codex 进程不在清理范围内。
 
@@ -452,6 +456,29 @@ ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ORACLE_WEB_LIVE_FIXTURE=reasoni
 所有真实测试都要求：网页 `4/5` 或 `5/5` 证据已落盘，session 为 `completed`，存在 conversation URL，专用 Chrome 和临时 Profile 已清理。普通附件测试核对保存的 assistant 答案与附件内口令一致，口令不放在 prompt 中；`reasoning` 测试核对保存的完整答案、最优费用、路线和先后约束。
 测试会强制上传临时附件，并使用 300 秒附件就绪上限。
 
+### 2026-10-06 大附件实测
+
+本轮在 `bf9a5b8` 对应的安装版本上测试两种附件布局。输入是同一批 10,000 条人工生成的 AI 媒体生产任务记录，不含项目代码、账号或用户数据。网页需核对费用、预算、旧观察、网络策略和重复键，并返回逐文件汇总、问题清单及单行 JSON；不是回声口令测试。
+
+| 原始文件数 | 上传附件数 | 上传体积 | 材料 Token 估算 | 浏览器任务用时 |
+| --- | --- | --- | --- | --- |
+| 10 个 CSV | 10 | 834,864 字节 | 352,327 | 11 分 41 秒 |
+| 12 个 CSV | 1 个文本包 | 896,913 字节（源文件共 835,282 字节） | 373,896 | 14 分 21 秒 |
+
+两轮均确认 5/5 档，附件完成后、发送前重验档位，提交新对话，捕获正文并写入 artifact。金额、行数和六类问题清单与本地基准一致。session 为 `completed`，本轮 Chrome 已退出，临时 Profile 已删除；窗口关闭发生在保存答案之后。
+
+这些数字描述输入材料和单次运行，不是服务端实际 Token 用量，也不是节省量。两轮大附件测试使用仓库外的临时诊断脚本，不是上面 `live-smoke.sh` 的默认 fixture。本次结果不能证明所有项目审查或更长运行都不会断开。
+
+### 已确认但尚未修复的限制
+
+- **断线后会结束本轮。** CDP client 断开后，即使探测确认原 Chrome 和 target 仍可达，copy-profile 流程也会关闭自己的 Chrome。纯替身测试已确认这条分支，没有在真实网页上注入断线。尚未实现已提交会话内的有界重连。
+- **探测超时可能被误报为窗口关闭。** 当前不可恢复的连接错误会使用 `Chrome window closed` 文案，缺少进程退出证明。大附件直传测试出现三次独立探测超时，当时 Chrome 和执行器仍存活，随后探测恢复；它们没有触发本轮自然断线。
+- **强制中断后的善后有缺口。** 一次测试的执行器被 `SIGKILL` 结束后，网页完成了答案，但 Chrome、临时 Profile 和 `running` metadata 残留。普通信号处理器不能捕获 `SIGKILL`。
+- **打包目录没有自动回收。** 12 文件测试结束后，dry-run 和实际运行生成的两个打包目录仍存在。本轮只归档了属于这次人工样本的目录，未处理其他历史文件。打包文件可能包含输入材料，不应公开或与 Profile 一起提交。
+- **Markdown 复制入口仍有适配缺口。** 两轮出现 `copy-missing` 重试，随后通过快照和延迟重读保存正文。此路径会增加收尾时间，DOM 全文中的公式排版可能重复。
+
+历史任务在约 15 分钟和 33 分钟后报告过 `connection-lost`，其首次断开的原因仍未确认。本轮没有复现该事件，不声明问题已修复。默认审计保留期为 24 小时，超过保留期的本地记录会被清理；排查长任务时应在过期前保存脱敏后的阶段、探测错误和身份记录，不保存 Cookie 或 Profile 内容。
+
 ## 故障排查
 
 完整决策规则见 [`skill/oracle-web/references/troubleshooting.md`](skill/oracle-web/references/troubleshooting.md)。常见含义：
@@ -462,6 +489,9 @@ ORACLE_WEB_LIVE_TEST=1 ORACLE_WEB_LIVE_LEVEL=max ORACLE_WEB_LIVE_FIXTURE=reasoni
 - `Attachments did not finish uploading before timeout`：附件完成状态没有得到证明。
 - `attachment-send-not-ready`：附件卡片存在，但发送按钮在 300 秒窗口内始终没有变为 enabled；没有提交。
 - `prompt-commit-timeout`：尝试过发送，但没有 committed user turn；`promptSubmitted=true` 仍不能算成功。
+- `connection-lost`：CDP 连接在捕获完成前断开。当前 copy-profile 流程会清理自己的浏览器；`Chrome window closed` 文案本身不能证明窗口先关闭。不要据此切换 Profile 或重发整批材料。
+
+窗口消失时，先核对本次 session 是否已保存答案并进入 `completed`。保存之后关闭窗口是正常收尾；`connection-lost` 或执行器中断需要分别排查。候选正文、孤立 Chrome 和过期的 `running` metadata 都不算成功结果。
 
 不要在 wrapper 运行时人工抢点发送按钮。安全恢复只适用于“已确认提交、但等待回答超时”的同一个 session。
 
